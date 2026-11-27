@@ -25,7 +25,7 @@ import {
 } from "../config/compiler.js";
 import { triggerDocumentName, type CompiledProjectConfiguration } from "../configuration/store.js";
 import { logger as defaultLogger } from "../logger.js";
-import { capturesReply } from "./reply-capture.js";
+import { capturesReply, isReplyCaptureCandidate } from "./reply-capture.js";
 import { reportFailure } from "../failures/index.js";
 import { durableExecutionId } from "../daemons/lifecycle.js";
 import { EntitlementDenied } from "../entitlements/catalog.js";
@@ -1157,7 +1157,30 @@ export class DurableWorkflowEngine {
       return;
     }
     const succeeded = await database.succeedTriggerRun(run.id);
-    if (succeeded?.transitioned === true) await this.notifyWorkflowRunTerminal(succeeded.run);
+    if (succeeded?.transitioned !== true) return;
+    await this.notifyWorkflowRunTerminal(succeeded.run);
+    await this.settleReplyWithoutAgent(run, steps, trigger);
+  }
+
+  /** No agent ran, so no answer can still be captured: settle the reply now, not after recovery. */
+  private async settleReplyWithoutAgent(
+    run: AcceptedWorkflowRun,
+    steps: readonly WorkflowStepRun[],
+    trigger: CompiledProjectConfiguration["triggers"][number],
+  ): Promise<void> {
+    const database = this.options.database;
+    if (database === null || trigger.replyMessage !== true) return;
+    if (steps.some((step) => step.agentExecutionId !== null)) return;
+    try {
+      await database.runReplies.finish({
+        organizationId: run.organizationId,
+        runId: run.id,
+        from: "pending",
+        failure: "no_agent_step",
+      });
+    } catch (error) {
+      this.report(error, "workflow.reply.no-agent-step", { triggerRunId: run.id });
+    }
   }
 
   private async recoverWorkflowDeadlines(now: Date): Promise<void> {
@@ -1602,6 +1625,7 @@ function buildAgentLaunchIntent(
     background: step.background,
     ...(step.completeOnTurnEnd === true ? { completeOnTurnEnd: true } : {}),
     ...(capturesReply(trigger, step) ? { replyMessage: true } : {}),
+    ...(isReplyCaptureCandidate(trigger, step) ? { replyCaptureCandidate: true } : {}),
     triggerContext: run.triggerContext,
     outputContext: run.outputContext,
     configurationRevisionId: run.configurationRevisionId,

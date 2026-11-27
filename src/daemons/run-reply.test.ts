@@ -42,14 +42,20 @@ describe("run reply capture on the daemon stream", () => {
     }
   });
 
-  it.each([null, "Final answer after finish."])(
-    "waits for the turn after explicit finish (%s)",
-    async (text) => {
+  it.each([
+    { text: null, candidate: false },
+    { text: "Final answer after finish.", candidate: false },
+    { text: null, candidate: true },
+    { text: "Final answer after finish.", candidate: true },
+  ])(
+    "waits for the turn after explicit finish (answer $text, candidate only $candidate)",
+    async ({ text, candidate }) => {
       const onRunReplyAnswer = vi.fn();
       const fixture = await turnEndFixture({
         database: createMemoryDatabase(),
         organizationId: "reply-org",
         workflow: true,
+        replyCaptureCandidate: candidate,
         onRunReplyAnswer,
       });
       try {
@@ -80,6 +86,39 @@ describe("run reply capture on the daemon stream", () => {
       }
     },
   );
+
+  it("captures a candidate step's answer and still records its turn-end output", async () => {
+    const database = createMemoryDatabase();
+    const onRunReplyAnswer = vi.fn();
+    const fixture = await turnEndFixture({
+      database,
+      organizationId: "reply-org",
+      workflow: true,
+      completeOnTurnEnd: true,
+      replyCaptureCandidate: true,
+      onRunReplyAnswer,
+    });
+    try {
+      const { execution, step } = await fixture.dispatch();
+      await fixture.endTurn("An earlier step answer.");
+      await fixture.clock.advance(TURN_END_SETTLE_MS);
+      await fixture.deliver(fixture.events.turnCompleted());
+      assert.deepEqual(onRunReplyAnswer.mock.calls, [
+        [
+          { organizationId: "reply-org", runId: execution.launchIntent?.triggerRunId },
+          execution.id,
+          { text: "An earlier step answer.", truncated: false },
+        ],
+      ]);
+      assert.deepEqual((await database.findWorkflowStepRunById(step!.id))?.output, {
+        status: "succeeded",
+        completion: TURN_END_COMPLETION,
+        output: "An earlier step answer.",
+      });
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+  });
 
   it("ignores a repeated turn start while waiting for the explicit finish tail", async () => {
     const onRunReplyAnswer = vi.fn();

@@ -121,8 +121,9 @@ export function withAutomaticReply(trigger: CompiledTrigger): CompiledTrigger {
  * Agent steps that continue the same conversation share one session, and a session only accepts
  * steps with the same agent, env, github grant, background setting, output schema and allowed
  * outputs. Refuse that at save time instead of failing the second step when it dispatches. Each
- * event is checked on its own; the reply tool an event adds, and a key that reads inputs or event
- * data, are only known when the step dispatches and are checked there.
+ * event is checked on its own, after the reply output a chat event adds to its last agent step is
+ * applied. A key that reads inputs or event data is only known when the step dispatches and is
+ * checked there.
  */
 export function continuationIssues(triggers: readonly CompiledTrigger[]): TriggerDocumentIssue[] {
   return triggers.flatMap(eventContinuationIssues);

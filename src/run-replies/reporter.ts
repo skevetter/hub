@@ -2,7 +2,7 @@ import type { OnRunReplyAnswer } from "../daemons/reply-capture.js";
 import type { AcceptedTriggerRunRecord, Database, WorkflowStepRunRecord } from "../db/types.js";
 import type { FinalReplyAnswer } from "./format.js";
 import type { LinearRunReplyWriter } from "./linear.js";
-import type { RunReplyRecord, RunReplyScope } from "./store.js";
+import type { RunReplyFailure, RunReplyRecord, RunReplyScope } from "./store.js";
 
 const POLL_MS = 2_000;
 // Recovery only handles rows older than the grace period, so idle checks can be rare.
@@ -143,12 +143,20 @@ export class RunReplyReporter {
           organizationId,
           runId,
           from: "pending",
-          failure: run.status === "succeeded" ? "answer_unavailable" : "run_unsuccessful",
+          failure: await this.pendingFailure(run),
         });
       } else if (delivery.state === "sending") {
         await this.repair(run, delivery, now);
       }
     }
+  }
+
+  private async pendingFailure(run: AcceptedTriggerRunRecord): Promise<RunReplyFailure> {
+    if (run.status !== "succeeded") return "run_unsuccessful";
+    const steps = await this.options.database.listWorkflowStepRunsForTriggerRun(run.id);
+    return steps.some((step) => step.agentExecutionId !== null)
+      ? "answer_unavailable"
+      : "no_agent_step";
   }
 
   private async repair(run: AcceptedTriggerRunRecord, delivery: RunReplyRecord, now: number) {

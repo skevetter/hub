@@ -7,6 +7,7 @@ export const replyFailureLabels = {
   run_unsuccessful: "The run did not succeed.",
   empty_answer: "The agent did not send a final answer.",
   answer_unavailable: "Hub could not recover the final answer.",
+  no_agent_step: "No agent step ran, so there was no reply.",
   target_mismatch: "The original Linear issue or comment could not be verified.",
   connection_unavailable: "The original Linear connection is unavailable.",
   scope_missing: "The Linear connection cannot create comments.",
