@@ -23,7 +23,8 @@ export function timingEntries(report, root) {
     const { startTime, endTime } = file;
     if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || endTime < startTime)
       return null;
-    entries.push([relative(root, file.name), Math.round(endTime - startTime)]);
+    const path = isAbsolute(file.name) ? relative(root, file.name) : file.name;
+    entries.push([path, Math.round(endTime - startTime)]);
   }
   return entries;
 }

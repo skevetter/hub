@@ -17,6 +17,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { git } from "./test-context.mjs";
 import { combinePaths, resolveBase, selectTests } from "./test-changed.mjs";
 
+for (const name of ["TEST_SHARD_INDEX", "TEST_SHARD_TOTAL", "TEST_SHARD_REPORT_DIR"]) {
+  delete process.env[name];
+}
+
 test("combines tracked and untracked paths without splitting names on whitespace", () => {
   assert.deepEqual(
     combinePaths("src/a.ts\0src/name with spaces.ts\0", "src/a.ts\0src/new\nfile.ts\0"),

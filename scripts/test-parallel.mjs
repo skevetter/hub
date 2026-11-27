@@ -12,15 +12,29 @@ import {
 } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
 import baselineTimings from "./test-timings.json" with { type: "json" };
+import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
+import {
+  BUILT_SERVER_KEY,
+  UsageError,
+  coverageProblems,
+  runShardJob,
+  selectMode,
+  splitBuiltOnly,
+} from "./test-shard.mjs";
 import { timingEntries } from "./generate-test-timings.mjs";
 import { runWorkerGroup, takeFullSuiteLock, watchTestSignals } from "./test-worker-group.mjs";
 
 const failedListVersion = 1;
 
+function comparePaths(a, b) {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}
+
 export function partitionFiles(files, count) {
   const shardCount = Math.min(count, files.length);
   const ideal = files.reduce((sum, file) => sum + file.weight, 0) / shardCount;
-  const sorted = [...files].sort((a, b) => b.weight - a.weight || a.path.localeCompare(b.path));
+  const sorted = [...files].sort((a, b) => b.weight - a.weight || comparePaths(a.path, b.path));
   const pinned = sorted.filter((file) => file.cached !== false && file.weight > ideal);
   const pinnedPaths = new Set(pinned.map((file) => file.path));
   const shards = Array.from({ length: shardCount - pinned.length }, () => ({
@@ -170,8 +184,8 @@ async function readFullTimings(cacheRoot) {
   }
 }
 
-async function loadTimings(cacheRoot) {
-  const full = await readFullTimings(cacheRoot);
+async function loadTimings(cacheRoot, baselineOnly) {
+  const full = baselineOnly ? null : await readFullTimings(cacheRoot);
   if (!full) return new Map(Object.entries(baselineTimings));
   const cached = new Map();
   for (const [key, result] of full) {
@@ -182,8 +196,8 @@ async function loadTimings(cacheRoot) {
   return cached;
 }
 
-export async function weighFiles(root, cacheRoot, paths) {
-  const cached = await loadTimings(cacheRoot);
+export async function weighFiles(root, cacheRoot, paths, { baselineOnly = false } = {}) {
+  const cached = await loadTimings(cacheRoot, baselineOnly);
   const files = await Promise.all(
     paths.map(async (path) => ({
       path,
@@ -261,6 +275,7 @@ function unreportedRun({ run, files, durationMs, signal, log }) {
   return {
     exitCode: 1,
     durationMs,
+    log,
     failedFiles: files,
     incompleteFiles: files.length,
     interruptedFiles: signal.aborted ? files.length : 0,
@@ -299,6 +314,8 @@ export async function executeFiles({
   const report = await readVitestReport(reportPath);
   if (!report) return unreportedRun({ run, files, durationMs, signal, log });
   const result = summarizeReport(report, { root, files, run, durationMs, signal, log, reportPath });
+  Object.assign(result, { report, log, processError: run.processError, runExit: run.exitCode });
+  if (result.exitCode) result.cleanLog = await logHasNoUnhandledErrors(log);
   if (collectTiming && !signal.aborted) {
     result.timings = await completedTimings(report, { root, files, run, log });
   }
@@ -550,19 +567,109 @@ function parseShardOverride(requested) {
   return count;
 }
 
-async function main(signal) {
-  const { values } = parseArgs({
-    options: { root: { type: "string" }, "rerun-failed": { type: "boolean" } },
-  });
-  const root = repositoryFor(import.meta.url, values.root);
-  const { head } = printRunContext(
-    root,
-    values["rerun-failed"] ? "rerun failed Vitest files" : "run the sharded Vitest suite",
+const ACTIONS = {
+  full: "run the sharded Vitest suite",
+  rerun: "rerun failed Vitest files",
+  shard: "run one shard of the Vitest suite",
+  "built-only": "run the Vitest files that need the built server",
+  coverage: "check that shards cover every Vitest file",
+};
+
+function parseCommandLine(argv = process.argv.slice(2), env = process.env) {
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args: argv,
+      options: {
+        root: { type: "string" },
+        shard: { type: "string" },
+        "rerun-failed": { type: "boolean" },
+        "built-only": { type: "boolean" },
+        "check-coverage": { type: "boolean" },
+      },
+    }));
+  } catch (error) {
+    if (String(error.code).startsWith("ERR_PARSE_ARGS")) throw new UsageError(error.message);
+    throw error;
+  }
+  return { values, mode: selectMode(values, env) };
+}
+
+async function splitFiles(root, cacheRoot, files) {
+  const { shardable, builtOnly } = splitBuiltOnly(files, runtimeFiles[BUILT_SERVER_KEY]);
+  const weighted = await weighFiles(root, cacheRoot, shardable, { baselineOnly: true });
+  return { shardable, builtOnly, weighted };
+}
+
+async function checkCoverage({ root, cacheRoot, files, total }) {
+  const { builtOnly, weighted } = await splitFiles(root, cacheRoot, files);
+  const groups = partitionFiles(weighted, total);
+  const problems = coverageProblems(files, { groups, builtOnly, total });
+  const untimed = weighted.filter(({ cached }) => !cached).length;
+  if (untimed > 0)
+    console.log(`::warning::${untimed} of ${files.length} files have no recorded timing.`);
+  for (const problem of problems) console.log(`::error::${problem}`);
+  console.log(
+    `Coverage: ${files.length} files, ${groups.length} shards, ${builtOnly.length} built-only. ${problems.length ? "FAIL" : "OK"}`,
   );
+  return problems.length ? 1 : 0;
+}
+
+async function selectedJob(mode, { root, cacheRoot, files }) {
+  const { builtOnly, weighted } = await splitFiles(root, cacheRoot, files);
+  if (mode.kind === "built-only") {
+    return { title: "Built-only", label: "built-only", files: builtOnly };
+  }
+  const { index, total } = mode.selection;
+  const group = partitionFiles(weighted, total)[index - 1];
+  if (!group?.length) throw new Error(`Shard ${index}/${total} has no files.`);
+  return { title: `Shard ${index}/${total}`, label: `shard-${index}`, files: group };
+}
+
+async function runSelected(mode, { root, cacheRoot, files, execute }) {
+  const job = await selectedJob(mode, { root, cacheRoot, files });
+  console.log(`${job.title}: ${job.files.length} of ${files.length} files.`);
+  return runShardJob({
+    ...job,
+    root,
+    execute,
+    env: process.env,
+    reportDir: process.env.TEST_SHARD_REPORT_DIR,
+    summaryPath: process.env.GITHUB_STEP_SUMMARY,
+  });
+}
+
+async function runMode(mode, context) {
+  const { root, cacheRoot, files, execute } = context;
+  if (mode.kind === "coverage") return checkCoverage({ root, cacheRoot, files, total: mode.total });
+  if (mode.kind === "shard" || mode.kind === "built-only") {
+    return runSelected(mode, { root, cacheRoot, files, execute });
+  }
+  const { failedFileList, signal, publishSuccess } = context;
+  if (mode.kind === "rerun") {
+    const failed = await readFailedFiles(failedFileList, files);
+    return runSerialRetry(failed, { execute, signal, publishSuccess });
+  }
+  return runFullSuite(context);
+}
+
+/** Colors split the project label in FAIL lines, so shard runs print plain text. */
+export function usePlainOutput(env = process.env) {
+  delete env.FORCE_COLOR;
+  env.NO_COLOR = "1";
+}
+
+async function main(signal) {
+  const { values, mode } = parseCommandLine();
+  const root = repositoryFor(import.meta.url, values.root);
+  const { head } = printRunContext(root, ACTIONS[mode.kind]);
+  if (mode.kind === "shard" || mode.kind === "built-only") usePlainOutput();
   const cacheRoot = join(root, "node_modules/.vite/vitest");
-  const parallelCache = join(cacheRoot, "test-parallel");
-  const failedFileList = join(parallelCache, "failed.json");
-  const shardOverride = parseShardOverride(process.env.TEST_SHARDS);
+  const failedFileList = join(cacheRoot, "test-parallel", "failed.json");
+  const shardOverride =
+    mode.kind === "full" || mode.kind === "rerun"
+      ? parseShardOverride(process.env.TEST_SHARDS)
+      : undefined;
   let lock;
   let runDirectory;
   try {
@@ -579,28 +686,25 @@ async function main(signal) {
       publishTestMetrics(runs, [], root, { signal, expectedHead: head });
     };
     const execution = { root, runDirectory, signal, invoke };
-    const execute = async (name, files, options) => {
-      const result = await executeFiles({ ...execution, name, files, ...options });
-      runs.push({ files, counts: result.counts });
+    const execute = async (name, selected, options) => {
+      const result = await executeFiles({ ...execution, name, files: selected, ...options });
+      runs.push({ files: selected, counts: result.counts });
       return result;
     };
-    if (values["rerun-failed"]) {
-      const failed = await readFailedFiles(failedFileList, files);
-      return await runSerialRetry(failed, { execute, signal, publishSuccess });
-    }
-    return await runFullSuite({
+    return await runMode(mode, {
       root,
       head,
       cacheRoot,
       files,
-      shardOverride,
       failedFileList,
+      shardOverride,
       execute,
       signal,
       publishSuccess,
     });
   } finally {
-    if (runDirectory && !values["rerun-failed"]) console.log(`Run logs: ${runDirectory}`);
+    if (runDirectory && mode.kind === "coverage") await rm(runDirectory, { recursive: true });
+    else if (runDirectory && mode.kind !== "rerun") console.log(`Run logs: ${runDirectory}`);
     lock?.release();
   }
 }
@@ -614,7 +718,7 @@ if (isEntrypoint(import.meta.url)) {
       },
       (error) => {
         if (error !== signal.reason && error instanceof Error) console.error(error.message);
-        process.exitCode = 1;
+        process.exitCode = error instanceof UsageError ? 2 : 1;
       },
     )
     .finally(() => {
