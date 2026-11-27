@@ -155,9 +155,10 @@ function arrivals(database: Database) {
       replies.push(input.outputContext);
     },
   });
-  const sessions = new AgentSessions(database, "fixture-secret", "https://hub.test", outputs, () =>
-    OLD.getTime(),
-  );
+  const sessions = new AgentSessions(database, "fixture-secret", "https://hub.test", {
+    outputs,
+    now: () => OLD.getTime(),
+  });
   const mcp = createExecutionCapabilityServer({
     database,
     outputs,

@@ -20,27 +20,42 @@ import {
 import type { AgentSessionRecord } from "./types.js";
 export type { AgentSessionRecord, AgentSessionAction } from "./types.js";
 
+interface DispatchInput {
+  executionId: string;
+  intent: LaunchMachineIntent;
+  connection: AgentConnection;
+  createOptions: () => Promise<DaemonCreateAgentOptions>;
+  onEvent: (event: AgentEvent) => void;
+  /** Called just before the prompt is sent to the daemon, the one step that is not repeatable. */
+  beforePromptSend?: () => void;
+}
+
+interface DispatchScope {
+  policy: LaunchMachineIntent["continuation"];
+  startupTimeoutMs: number;
+  projectId: string;
+  continuationKey: string | null;
+  findSession: () => Promise<AgentSessionRecord | undefined>;
+}
+
 export class AgentSessionError extends Error {}
 
 /** Owns session selection, delivery, and cleanup under the same existing database lock. */
 export class AgentSessions {
+  private readonly outputs: OutputExecutorRegistry;
+  private readonly now: () => number;
+
   constructor(
     private readonly database: Database,
     private readonly secret: string,
     private readonly publicBaseUrl: string,
-    private readonly outputs: OutputExecutorRegistry,
-    private readonly now: () => number = Date.now,
-  ) {}
+    { outputs, now = Date.now }: { outputs: OutputExecutorRegistry; now?: () => number },
+  ) {
+    this.outputs = outputs;
+    this.now = now;
+  }
 
-  async dispatch(input: {
-    executionId: string;
-    intent: LaunchMachineIntent;
-    connection: AgentConnection;
-    createOptions: () => Promise<DaemonCreateAgentOptions>;
-    onEvent: (event: AgentEvent) => void;
-    /** Called just before the prompt is sent to the daemon, the one step that is not repeatable. */
-    beforePromptSend?: () => void;
-  }): Promise<{
+  async dispatch(input: DispatchInput): Promise<{
     agentId: string;
     unsubscribe: () => void;
     action: "created" | "continued" | "restored";
@@ -61,115 +76,143 @@ export class AgentSessions {
           )
         : this.database.findAgentSessionByKey(projectId, continuationKey);
     };
-    const shouldRotateFinishedSession = async (session: AgentSessionRecord) => {
-      const executions = await this.database.listAgentSessionExecutions(session.id);
-      if (executions.some(isActive)) return false;
-      let rotate = false;
-      for (const { usedTemporaryCredentials, launchIntent } of executions) {
-        const fact = usedTemporaryCredentials ?? temporaryCredentialFact(launchIntent);
-        if (fact !== false) rotate = true;
-      }
-      return rotate;
-    };
     // External credential minting must not hold a database connection open during shutdown.
     const storedSession = await findSession();
     const options =
-      !storedSession || (await shouldRotateFinishedSession(storedSession))
+      !storedSession || (await this.shouldRotateFinishedSession(storedSession))
         ? await input.createOptions()
         : undefined;
-    const dispatched = await this.database.withAdvisoryLock(`agent-session:${lockId}`, async () => {
-      await this.requireActiveExecution(input.executionId);
-      const tools = executionToolDefinitions(
-        input.intent.outputSchema,
-        this.outputs.materialize(input.intent.allowOutputs, input.intent.outputContext),
-      );
-      const compatibility = fingerprint({ settings: policy?.compatibility, tools });
-      let session = await findSession();
-      if (session && (await shouldRotateFinishedSession(session))) {
-        // Completion may have raced credential preparation. Retry outside the lock.
-        if (!options) return undefined;
-        await this.database.saveAgentSession({ ...session, continuationKey: null });
-        session = undefined;
-      }
-      const id = session?.id ?? deriveSessionId(projectId, `execution:${input.executionId}`);
-      if (session && session.compatibility !== compatibility) {
+    const scope = { policy, startupTimeoutMs, projectId, continuationKey, findSession };
+    const dispatched = await this.database.withAdvisoryLock(`agent-session:${lockId}`, () =>
+      this.dispatchLocked(input, scope, options),
+    );
+    return dispatched ?? this.dispatch(input);
+  }
+
+  private async shouldRotateFinishedSession(session: AgentSessionRecord) {
+    const executions = await this.database.listAgentSessionExecutions(session.id);
+    if (executions.some(isActive)) return false;
+    let rotate = false;
+    for (const { usedTemporaryCredentials, launchIntent } of executions) {
+      const fact = usedTemporaryCredentials ?? temporaryCredentialFact(launchIntent);
+      if (fact !== false) rotate = true;
+    }
+    return rotate;
+  }
+
+  private async selectDispatchSession(
+    input: DispatchInput,
+    { policy, projectId, continuationKey, findSession }: DispatchScope,
+    options: DaemonCreateAgentOptions | undefined,
+  ) {
+    const tools = executionToolDefinitions(
+      input.intent.outputSchema,
+      this.outputs.materialize(input.intent.allowOutputs, input.intent.outputContext),
+    );
+    const compatibility = fingerprint({ settings: policy?.compatibility, tools });
+    let session = await findSession();
+    if (session && (await this.shouldRotateFinishedSession(session))) {
+      // Completion may have raced credential preparation. Retry outside the lock.
+      if (!options) return undefined;
+      await this.database.saveAgentSession({ ...session, continuationKey: null });
+      session = undefined;
+    }
+    const id = session?.id ?? deriveSessionId(projectId, `execution:${input.executionId}`);
+    if (session) {
+      if (session.compatibility !== compatibility) {
         throw new AgentSessionError(
           "Continuation settings differ from the existing agent; use a different key or choose a new agent",
         );
       }
-      if (!session) {
-        if (!options) return undefined;
-        const token = deriveAgentExecutionCompletionToken(this.secret, `session:${id}`);
-        session = {
-          id,
-          projectId: input.intent.projectId,
-          organizationId: input.intent.organizationId,
-          continuationKey,
-          daemonId: input.intent.environment.daemonId,
-          agentId: null,
-          workspaceId: null,
-          compatibility,
-          tools,
-          capabilityTokenHash: hashAgentExecutionCompletionToken(token),
-          creationOptions: {
-            ...options,
-            ...(policy === undefined
-              ? {}
-              : {
-                  mcpServers: {
-                    hub: {
-                      type: "http",
-                      url: new URL(`/agent-sessions/${id}/mcp`, this.publicBaseUrl).toString(),
-                      headers: { Authorization: `Bearer ${token}` },
-                    },
-                  },
-                }),
-          },
-        };
-        await this.database.saveAgentSession(session);
-      }
-      const activeExecutions = (await this.database.listAgentSessionExecutions(id)).filter(
-        (execution) => execution.status === "spawning" || execution.status === "running",
-      );
-      const deadline = activeExecutions.reduce<number>(
-        (earliest, execution) =>
-          Math.min(earliest, execution.deadlineAt?.getTime() ?? Number.POSITIVE_INFINITY),
-        Number.POSITIVE_INFINITY,
-      );
-      if (Number.isFinite(deadline))
-        await this.database.limitAgentExecutionDeadline(input.executionId, new Date(deadline));
-      await this.database.attachExecutionToSession(input.executionId, id);
-      let action: "created" | "continued" | "restored" = "continued";
-      if (session.agentId === null) {
-        const agent = await input.connection.create(
-          id,
-          bootstrapOptions(session),
-          startupTimeoutMs,
-        );
-        session = { ...session, agentId: agent.id, workspaceId: agent.workspaceId };
-        await this.database.saveAgentSession(session);
-        action = "created";
-      }
-      if (session.agentId === null || session.workspaceId === null)
-        throw new Error("Session agent is missing");
-      await this.database.attachAgentToExecution(
-        input.executionId,
-        session.daemonId,
-        session.agentId,
-      );
-      const agent = await input.connection.get(session.agentId);
-      if (!agent.archivedAt && (agent.status === "closed" || agent.status === "error")) {
-        throw new AgentSessionError("agent_interrupted");
-      }
-      if (agent.archivedAt) {
-        await input.connection.restore(session.workspaceId, startupTimeoutMs);
-        action = "restored";
-      }
-      await this.database.attachExecutionToSession(input.executionId, id, action);
-      const unsubscribe = await this.deliver(input, session.agentId, startupTimeoutMs);
-      return { agentId: session.agentId, unsubscribe, action };
-    });
-    return dispatched ?? this.dispatch(input);
+      return { id, session };
+    }
+    if (!options) return undefined;
+    const token = deriveAgentExecutionCompletionToken(this.secret, `session:${id}`);
+    session = {
+      id,
+      projectId: input.intent.projectId,
+      organizationId: input.intent.organizationId,
+      continuationKey,
+      daemonId: input.intent.environment.daemonId,
+      agentId: null,
+      workspaceId: null,
+      compatibility,
+      tools,
+      capabilityTokenHash: hashAgentExecutionCompletionToken(token),
+      creationOptions: this.sessionCreationOptions(options, policy, { id, token }),
+    };
+    await this.database.saveAgentSession(session);
+    return { id, session };
+  }
+
+  private sessionCreationOptions(
+    options: DaemonCreateAgentOptions,
+    policy: DispatchScope["policy"],
+    { id, token }: { id: string; token: string },
+  ): DaemonCreateAgentOptions {
+    return {
+      ...options,
+      ...(policy === undefined
+        ? {}
+        : {
+            mcpServers: {
+              hub: {
+                type: "http",
+                url: new URL(`/agent-sessions/${id}/mcp`, this.publicBaseUrl).toString(),
+                headers: { Authorization: `Bearer ${token}` },
+              },
+            },
+          }),
+    };
+  }
+
+  private async dispatchLocked(
+    input: DispatchInput,
+    scope: DispatchScope,
+    options: DaemonCreateAgentOptions | undefined,
+  ) {
+    await this.requireActiveExecution(input.executionId);
+    const selection = await this.selectDispatchSession(input, scope, options);
+    if (selection === undefined) return undefined;
+    const { id } = selection;
+    let { session } = selection;
+    const { startupTimeoutMs } = scope;
+    const activeExecutions = (await this.database.listAgentSessionExecutions(id)).filter(
+      (execution) => execution.status === "spawning" || execution.status === "running",
+    );
+    const deadline = activeExecutions.reduce<number>(
+      (earliest, execution) =>
+        Math.min(earliest, execution.deadlineAt?.getTime() ?? Number.POSITIVE_INFINITY),
+      Number.POSITIVE_INFINITY,
+    );
+    if (Number.isFinite(deadline))
+      await this.database.limitAgentExecutionDeadline(input.executionId, new Date(deadline));
+    await this.database.attachExecutionToSession(input.executionId, id);
+    let action: "created" | "continued" | "restored" = "continued";
+    if (session.agentId === null) {
+      const agent = await input.connection.create(id, bootstrapOptions(session), startupTimeoutMs);
+      session = { ...session, agentId: agent.id, workspaceId: agent.workspaceId };
+      await this.database.saveAgentSession(session);
+      action = "created";
+    }
+    if (session.agentId === null || session.workspaceId === null)
+      throw new Error("Session agent is missing");
+    await this.database.attachAgentToExecution(
+      input.executionId,
+      session.daemonId,
+      session.agentId,
+    );
+    const agent = await input.connection.get(session.agentId);
+    if (!agent.archivedAt && (agent.status === "closed" || agent.status === "error")) {
+      throw new AgentSessionError("agent_interrupted");
+    }
+    if (agent.archivedAt) {
+      await input.connection.restore(session.workspaceId, startupTimeoutMs);
+      action = "restored";
+    }
+    await this.database.attachExecutionToSession(input.executionId, id, action);
+    const unsubscribe = await this.deliver(input, session.agentId, startupTimeoutMs);
+    return { agentId: session.agentId, unsubscribe, action };
   }
 
   private async requireActiveExecution(executionId: string) {
@@ -249,29 +292,64 @@ export class AgentSessions {
         current.agentSessionId !== id
       )
         return undefined;
-      const refreshed = id === null ? undefined : await this.database.findAgentSession(id);
-      const agentId = current.daemonAgentId ?? refreshed?.agentId;
-      if (agentId == null) return connection === undefined ? undefined : "target_gone";
-      const store = this.database.stopInterrupts;
-      const covered = await store.coverage(execution.id, agentId);
-      if (covered !== undefined) return covered;
-      if (connection === undefined) return undefined;
-
-      const arrivals = id === null ? [] : await this.database.listAgentSessionExecutions(id);
-      const peerIds = arrivals.filter(isActive).map((arrival) => arrival.id);
-      if (peerIds.some((peer) => !approvedPeerIds.includes(peer))) return "delivery_unconfirmed";
-
-      return this.sendStopInterruptFrame(execution.id, agentId, connection, token, peerIds);
+      return this.interruptCurrentExecution(execution, current, {
+        sessionId: id,
+        connection,
+        token,
+        approvedPeerIds,
+      });
     });
   }
 
-  private async sendStopInterruptFrame(
-    executionId: string,
-    agentId: string,
-    connection: AgentConnection,
-    token: string,
-    peerIds: string[],
-  ): Promise<"target_gone" | "delivery_unconfirmed" | string[] | undefined> {
+  private async interruptCurrentExecution(
+    execution: AgentExecutionRecord,
+    current: AgentExecutionRecord,
+    {
+      sessionId: id,
+      connection,
+      token,
+      approvedPeerIds,
+    }: {
+      sessionId: string | null;
+      connection: AgentConnection | undefined;
+      token: string;
+      approvedPeerIds: readonly string[];
+    },
+  ) {
+    const refreshed = id === null ? undefined : await this.database.findAgentSession(id);
+    const agentId = current.daemonAgentId ?? refreshed?.agentId;
+    if (agentId == null) return connection === undefined ? undefined : "target_gone";
+    const store = this.database.stopInterrupts;
+    const covered = await store.coverage(execution.id, agentId);
+    if (covered !== undefined) return covered;
+    if (connection === undefined) return undefined;
+
+    const arrivals = id === null ? [] : await this.database.listAgentSessionExecutions(id);
+    const peerIds = arrivals.filter(isActive).map((arrival) => arrival.id);
+    if (peerIds.some((peer) => !approvedPeerIds.includes(peer))) return "delivery_unconfirmed";
+
+    return this.sendStopInterruptFrame({
+      executionId: execution.id,
+      agentId,
+      connection,
+      token,
+      peerIds,
+    });
+  }
+
+  private async sendStopInterruptFrame({
+    executionId,
+    agentId,
+    connection,
+    token,
+    peerIds,
+  }: {
+    executionId: string;
+    agentId: string;
+    connection: AgentConnection;
+    token: string;
+    peerIds: string[];
+  }): Promise<"target_gone" | "delivery_unconfirmed" | string[] | undefined> {
     const store = this.database.stopInterrupts;
     let agent;
     try {
