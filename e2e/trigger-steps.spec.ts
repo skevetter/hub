@@ -213,6 +213,7 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
     await page.getByRole("radio", { name: "Form" }).click();
     await steps.chooseAction(1, "Prompt");
     await steps.fillAgent(1, { agent: AGENT, mode: "full-access", prompt: "Review the request." });
+    await steps.setOutputSchema(1, SCHEMA);
   });
 
   await test.step("a step is removed after confirming, and the last one cannot be", async () => {

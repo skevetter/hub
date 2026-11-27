@@ -346,6 +346,16 @@ steps:
     expect(scripted.steps).toBeUndefined();
   });
 
+  it("keeps a run a run when a schema typed on it is carried into a script", () => {
+    const typed = withStep(form(RUN), 0, { outputSchema: '{"type":"object"}' });
+    const scripted = parseTriggerDocument(
+      patched(RUN, withStep(changeStepAction(typed, 0, "script"), 0, { script: "make" })),
+    );
+    expect(scripted.run).toMatchObject({ script: "make" });
+    expect(scripted.run).not.toHaveProperty("output");
+    expect(scripted.steps).toBeUndefined();
+  });
+
   it("keeps a run's existing output schema on the run, and moves to steps for a new one", () => {
     const withSchema = RUN.replace(
       "  prompt: Review it.\n",
