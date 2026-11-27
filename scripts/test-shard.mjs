@@ -187,6 +187,14 @@ function isStartTimeoutHeader(text) {
   );
 }
 
+/** Vitest prints one cause for a group of failures, so a shared connection timeout cannot be vouched for. */
+function sharedHeader(line, fileCount) {
+  const hidden = fileCount > 1 && CONNECTION_TIMEOUT.test(line);
+  return hidden
+    ? `${line}\n[shared by ${fileCount} failures, causes are not shown for each]`
+    : line;
+}
+
 function addHeader(headers, files, line) {
   for (const file of files) headers.set(file, [...(headers.get(file) ?? []), line]);
 }
@@ -238,7 +246,7 @@ export function logFailureHeaders(logText) {
     } else if (kind === "continuation") {
       extendHeader(headers, state.files, line);
     } else if (kind === "header") {
-      addHeader(headers, state.files, line);
+      addHeader(headers, state.files, sharedHeader(line, state.files.length));
       Object.assign(state, { inErrors: true, mode: "message" });
     } else if (kind === "frame") {
       state.mode = "frames";

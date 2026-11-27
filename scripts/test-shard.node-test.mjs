@@ -537,6 +537,26 @@ test("only Vitest's own frame and excerpt formats are skipped", () => {
   assert.deepEqual(noLocation, [`Error: ${message}\n \u276F Configuration error: wrong endpoint`]);
 });
 
+test("a connection timeout shared by several failures is not retried", () => {
+  const block = (...names) =>
+    [
+      ...names.map((name) => ` FAIL  ${name}.test.ts > ${name}`),
+      "Error: Connection terminated due to connection timeout",
+      " \u276F a.test.ts:7:11",
+      "",
+      "Caused by: Error: Connection terminated unexpectedly",
+      " \u276F a.test.ts:5:17",
+      "",
+    ].join("\n");
+  const entry = (name) =>
+    suiteFailure(`${name}.test.ts`, "", [{ status: "skipped", failureMessages: [] }]);
+  const report = reportOf(entry("a"), entry("b"));
+  const retry = (text, files) =>
+    retryableFiles(report, files, { root, headers: logFailureHeaders(text) });
+  assert.deepEqual(retry(block("a"), ["a.test.ts"]), ["a.test.ts"]);
+  assert.deepEqual(retry(block("a", "b"), ["a.test.ts", "b.test.ts"]), []);
+});
+
 test("only a one-line serialized error summary is skipped", () => {
   const rule = "\u23AF".repeat(14);
   const log = (...after) =>

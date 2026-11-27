@@ -85,7 +85,9 @@ skipped. The log cannot tell message text
 that copies those formats exactly from the real thing, so a message whose only extra text is one
 such frame line still retries. A bare message counts only when the log names the
 same timeout. The `Caused by: Error: Connection terminated unexpectedly` line that follows
-a connection timeout belongs to it; any other cause blocks the retry. Each such file runs alone in its own
+a connection timeout belongs to it; any other cause blocks the retry. A connection timeout that
+Vitest prints once for several failures is not retried, because the cause shown may belong to only
+one of them. Each such file runs alone in its own
 Vitest process. Each retry prints a `::warning::` line (or `::error::` if it fails again) and shows
 in the step summary. Nothing is retried when the shard has any other failure, a process error, an
 incomplete report or an unhandled error. More than 5 candidate files in one shard fails the shard
