@@ -95,39 +95,11 @@ export function createGitHubNotificationsSource(
   poller?: GitHubNotificationPoller,
 ): TriggerSource {
   const time = options.clock ?? clock;
-  const client: GitHubNotificationsClient = createGitHubNotificationsClient({
-    token: options.token,
-    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-  });
-  const active =
-    poller ??
-    createGitHubNotificationPoller({
-      client,
-      store,
-      pollIntervalMs: options.pollIntervalMs,
-      ...(options.onProgressRequested === undefined
-        ? {}
-        : { onProgressRequested: options.onProgressRequested }),
-      ...(options.maxThreadsPerPoll === undefined
-        ? {}
-        : { maxThreadsPerPoll: options.maxThreadsPerPoll }),
-    });
+  const active = createActivePoller(store, options, poller);
   let cancel: (() => void) | undefined;
   let processing: Promise<unknown> | undefined;
   let controller: AbortController | undefined;
   let notBefore = 0;
-  // Status is for the UI. A store error here must not look like a failed poll.
-  const remember = async (operation: () => Promise<void>): Promise<void> => {
-    try {
-      await operation();
-    } catch (error) {
-      reportFailure(
-        error,
-        { operation: "github.notifications.status", component: "triggers", provider: "github" },
-        { scrubValues: [options.token] },
-      );
-    }
-  };
   const run = async (now: Date, signal: AbortSignal): Promise<void> => {
     let result: PollResult;
     try {
@@ -142,11 +114,12 @@ export function createGitHubNotificationsSource(
         { scrubValues: [options.token] },
       );
       const message = storedFailureMessage(error, options.token);
-      await remember(() => store.recordFailure(time.now(), message));
+      await rememberPollStatus(options, () => store.recordFailure(time.now(), message));
       return;
     }
     notBefore = result.nextPollAt.getTime();
-    if (result.skipped !== true) await remember(() => store.recordSuccess(time.now()));
+    if (result.skipped !== true)
+      await rememberPollStatus(options, () => store.recordSuccess(time.now()));
   };
   const tick = () => {
     if (processing !== undefined) return;
@@ -170,6 +143,47 @@ export function createGitHubNotificationsSource(
       await processing;
     },
   };
+}
+
+function createActivePoller(
+  store: GitHubNotificationStore,
+  options: GitHubNotificationsOptions,
+  poller: GitHubNotificationPoller | undefined,
+): GitHubNotificationPoller {
+  const client: GitHubNotificationsClient = createGitHubNotificationsClient({
+    token: options.token,
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+  });
+  return (
+    poller ??
+    createGitHubNotificationPoller({
+      client,
+      store,
+      pollIntervalMs: options.pollIntervalMs,
+      ...(options.onProgressRequested === undefined
+        ? {}
+        : { onProgressRequested: options.onProgressRequested }),
+      ...(options.maxThreadsPerPoll === undefined
+        ? {}
+        : { maxThreadsPerPoll: options.maxThreadsPerPoll }),
+    })
+  );
+}
+
+// Status is for the UI. A store error here must not look like a failed poll.
+async function rememberPollStatus(
+  options: GitHubNotificationsOptions,
+  operation: () => Promise<void>,
+): Promise<void> {
+  try {
+    await operation();
+  } catch (error) {
+    reportFailure(
+      error,
+      { operation: "github.notifications.status", component: "triggers", provider: "github" },
+      { scrubValues: [options.token] },
+    );
+  }
 }
 
 export interface NotificationRunContext {

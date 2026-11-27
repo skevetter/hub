@@ -445,28 +445,7 @@ interface DiscordMentionOptions {
 function buildDiscordMention(
   options: DiscordMentionOptions,
 ): Parameters<typeof normalizeMessage>[0] {
-  const isThread = options.isThread ?? false;
-  const channel = {
-    isThread(): boolean {
-      return isThread;
-    },
-    parentId: options.parentId ?? null,
-    messages: {
-      fetch: () => {
-        options.onThreadContextFetch?.();
-        if (options.threadContextFetchError !== undefined) {
-          return Promise.reject(options.threadContextFetchError);
-        }
-        const page = options.threadMessages ?? [];
-        return Promise.resolve({
-          size: page.length,
-          values: () => page.values(),
-          last: () => page.at(-1),
-        });
-      },
-    },
-  };
-
+  const channel = discordMentionChannel(options);
   const fake: unknown = {
     guildId: options.guildId,
     channelId: options.channelId,
@@ -491,6 +470,30 @@ function buildDiscordMention(
   };
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion
   return fake as Parameters<typeof normalizeMessage>[0];
+}
+
+function discordMentionChannel(options: DiscordMentionOptions) {
+  const isThread = options.isThread ?? false;
+  return {
+    isThread(): boolean {
+      return isThread;
+    },
+    parentId: options.parentId ?? null,
+    messages: {
+      fetch: () => {
+        options.onThreadContextFetch?.();
+        if (options.threadContextFetchError !== undefined) {
+          return Promise.reject(options.threadContextFetchError);
+        }
+        const page = options.threadMessages ?? [];
+        return Promise.resolve({
+          size: page.length,
+          values: () => page.values(),
+          last: () => page.at(-1),
+        });
+      },
+    },
+  };
 }
 
 function contextMessage(

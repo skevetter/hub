@@ -64,7 +64,12 @@ describe("Slack Socket Mode source", () => {
     assert.equal(slack.openCount, 1);
     const status = source.status();
     assert.equal(status.state === "actionNeeded" ? status.reason : undefined, "appTokenRejected");
-    assertSlackFailure(stream, "slack.socket.authenticate", "authentication", token, 40);
+    assertSlackFailure(stream, {
+      operation: "slack.socket.authenticate",
+      failureKind: "authentication",
+      canary: token,
+      level: 40,
+    });
     assert.equal(stream.text().includes(bodyCanary), false);
     await source.stop();
   });
@@ -89,13 +94,12 @@ describe("Slack Socket Mode source", () => {
     await source.retry();
     await waitFor(() => source.status().state === "connected");
     assert.equal(slack.openCount, 2);
-    assertSlackFailure(
-      stream,
-      "slack.socket.authenticate",
-      "authentication",
-      "xapp-fixture-secret",
-      40,
-    );
+    assertSlackFailure(stream, {
+      operation: "slack.socket.authenticate",
+      failureKind: "authentication",
+      canary: "xapp-fixture-secret",
+      level: 40,
+    });
     await source.stop();
   });
 
@@ -112,7 +116,11 @@ describe("Slack Socket Mode source", () => {
     await waitFor(() => source.status().state === "connected");
 
     assert.equal(slack.openCount, 2);
-    assertSlackFailure(stream, "slack.socket.connect", "network", "xapp-fixture-secret");
+    assertSlackFailure(stream, {
+      operation: "slack.socket.connect",
+      failureKind: "network",
+      canary: "xapp-fixture-secret",
+    });
     await source.stop();
   });
 
@@ -130,7 +138,11 @@ describe("Slack Socket Mode source", () => {
 
     slack.terminateCurrent();
     await waitFor(() => slack.openCount === 3 && source.status().state === "connected");
-    assertSlackFailure(cleanLogs, "slack.socket.connect", "network", "xapp-fixture-secret");
+    assertSlackFailure(cleanLogs, {
+      operation: "slack.socket.connect",
+      failureKind: "network",
+      canary: "xapp-fixture-secret",
+    });
     await source.stop();
   });
 
@@ -147,7 +159,12 @@ describe("Slack Socket Mode source", () => {
     await waitFor(() => slack.acks.length === 1);
 
     assert.deepEqual(slack.acks, [{ envelope_id: "poison-1" }]);
-    assertSlackFailure(stream, "slack.socket.envelope.parse", "validation", payloadCanary, 40);
+    assertSlackFailure(stream, {
+      operation: "slack.socket.envelope.parse",
+      failureKind: "validation",
+      canary: payloadCanary,
+      level: 40,
+    });
     await source.stop();
   });
 
@@ -185,10 +202,17 @@ const ignoreTrigger = () => Promise.resolve();
 
 function assertSlackFailure(
   stream: FailureLogStream,
-  operation: string,
-  failureKind: string,
-  canary: string,
-  level?: number,
+  {
+    operation,
+    failureKind,
+    canary,
+    level,
+  }: {
+    operation: string;
+    failureKind: string;
+    canary: string;
+    level?: number;
+  },
 ) {
   assertOneFailure(stream, {
     operation,
