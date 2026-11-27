@@ -295,8 +295,9 @@ function proposedStepOrder(
 
 /**
  * Moving between a prompt and a script keeps what the two share and resets what the other
- * action's defaults would get wrong: the run limit, an output schema a script cannot have, and an
- * open audience a script may not have. Values only the other action uses stay in the form.
+ * action's defaults would get wrong: the run limit and an open audience a script may not have.
+ * Values only the other action uses stay in the form, the output schema included. A script step
+ * ignores them when it is validated and written, so switching back loses nothing.
  */
 export function changeStepAction<T extends { steps: TriggerStepFormValue[]; allowedUsers: string }>(
   value: T,
@@ -310,7 +311,6 @@ export function changeStepAction<T extends { steps: TriggerStepFormValue[]; allo
       ? {
           ...step,
           action,
-          outputSchema: "",
           maxRuntime:
             step.maxRuntime === DEFAULT_AGENT_MAX_RUNTIME
               ? DEFAULT_SCRIPT_MAX_RUNTIME
@@ -492,11 +492,7 @@ export function parseOutputSchema(text: string): Record<string, unknown> | undef
 }
 
 function outputSchemaErrors(step: TriggerStepFormValue): Partial<Record<TriggerStepField, string>> {
-  if (step.action === "script") {
-    return step.outputSchema.trim().length === 0
-      ? {}
-      : { outputSchema: "A script has no agent output, so it has no output schema." };
-  }
+  if (step.action === "script") return {};
   const error = refused(() => parseOutputSchema(step.outputSchema));
   return error === undefined ? {} : { outputSchema: error };
 }
@@ -659,11 +655,12 @@ function staysShorthand(
   const [only] = next;
   if (only === undefined) return false;
   const existingSchema = previous !== undefined && previous.outputSchema.trim() !== "";
+  const addsSchema = only.action === "prompt" && only.outputSchema.trim() !== "";
   return (
     next.length === 1 &&
     only.id === SHORTHAND_STEP_ID &&
     conditionText(only.runIf) === undefined &&
-    (existingSchema || only.outputSchema.trim() === "")
+    (existingSchema || !addsSchema)
   );
 }
 

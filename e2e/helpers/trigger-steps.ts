@@ -83,6 +83,11 @@ export class TriggerSteps {
     await this.step(position).getByLabel("Script", { exact: true }).fill(script);
   }
 
+  async chooseAction(position: number, action: "Prompt" | "Script") {
+    await this.edit(position);
+    await this.step(position).getByRole("radio", { name: action, exact: true }).click();
+  }
+
   async chooseContinuity(position: number, label: string) {
     await this.edit(position);
     await this.step(position).getByRole("radio", { name: label, exact: true }).click();
