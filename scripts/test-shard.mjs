@@ -159,16 +159,21 @@ const FAIL_LINE =
   /^\s*FAIL\s+(?:(?:\[[^\]]*\]|\|[^|]*\|)\s*)?(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+(?:>|\[).*)?\s*$/u;
 const SEPARATOR_LINE = /^\s*\u23AF{3,}/u;
 const HINT_LINE = /^If this is a long-running (?:test|hook)/u;
-const FRAME_LINE = /^\s+at\s.+:\d+:\d+\)?\s*$/u;
+const FRAME_LINE = /^\s+at\s.+(?::\d+:\d+|\(<anonymous>\))\)?\s*$/u;
 const REPORTER_FRAME = /^\s*\u276F/u;
 
-/** The error message without its stack frames and Vitest's timeout hint. */
-function messageLines(text) {
+/** A JSON failure message cut at its first V8 stack frame. Reporter text never goes through this. */
+function withoutStack(text) {
   const lines = String(text).split("\n");
   const stack = lines.findIndex((line, index) => index > 0 && FRAME_LINE.test(line));
-  return (stack === -1 ? lines : lines.slice(0, stack)).filter(
-    (line) => line.trim() !== "" && !HINT_LINE.test(line.trim()),
-  );
+  return (stack === -1 ? lines : lines.slice(0, stack)).join("\n");
+}
+
+/** The message lines without blanks and Vitest's timeout hint. */
+function messageLines(text) {
+  return String(text)
+    .split("\n")
+    .filter((line) => line.trim() !== "" && !HINT_LINE.test(line.trim()));
 }
 
 function isStartTimeoutHeader(text) {
@@ -235,9 +240,11 @@ export function logFailureHeaders(logText) {
 function reportedFailures(file) {
   const assertions = file.assertionResults ?? [];
   const failed = assertions.filter(({ status }) => status === "failed");
-  const texts = failed.map(({ failureMessages }) => (failureMessages ?? []).join("\n"));
+  const texts = failed.map(({ failureMessages }) =>
+    (failureMessages ?? []).map(withoutStack).join("\n"),
+  );
   const unexplained = texts.some((text) => text.trim() === "");
-  const fileMessage = typeof file.message === "string" ? file.message : "";
+  const fileMessage = typeof file.message === "string" ? withoutStack(file.message) : "";
   return { texts, fileMessage, unexplained };
 }
 

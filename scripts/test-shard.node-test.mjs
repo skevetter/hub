@@ -413,6 +413,38 @@ test("message text after a blank line or starting with at still blocks the retry
   }
 });
 
+test("reporter text that looks like a stack frame still counts as message text", () => {
+  const message = "timeout exceeded when trying to connect";
+  const extra = ["  at config/startup.yaml:12:7", "  Configuration error: wrong endpoint"];
+  const block = (name) =>
+    [
+      ` FAIL  ${name}.test.ts > ${name}`,
+      `Error: ${message}`,
+      ...extra,
+      ` \u276F ${name}.test.ts:4:11`,
+      "",
+    ].join("\n");
+  const headers = logFailureHeaders([block("hook"), block("body")].join("\n"));
+  const report = reportOf(
+    failedEntry(
+      "body.test.ts",
+      `Error: ${message}\n${extra.join("\n")}\n    at /repo/body.test.ts:3:9`,
+    ),
+    suiteFailure("hook.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  for (const name of ["body.test.ts", "hook.test.ts"]) {
+    assert.deepEqual(retryableFiles(report, [name], { root, headers }), [], name);
+  }
+});
+
+test("an anonymous V8 frame ends a JSON failure message", () => {
+  const message = "timeout exceeded when trying to connect";
+  const stack = `Error: ${message}\n    at new Promise (<anonymous>)\n    at run (/repo/a.test.ts:3:9)`;
+  const report = reportOf(failedEntry("a.test.ts", stack));
+  const headers = logFailureHeaders(failureLog("a.test.ts", `Error: ${message}`));
+  assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root, headers }), ["a.test.ts"]);
+});
+
 test("the cause pg-pool attaches to a connection timeout is part of that failure", () => {
   const timeout = "Error: Connection terminated due to connection timeout";
   const log = (cause) =>
