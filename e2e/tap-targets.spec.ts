@@ -91,3 +91,17 @@ test("breadcrumb and settings tab links have 44 px hit areas on a phone and look
     expect(header?.height).toBe(48);
   });
 });
+
+test("the role Selects on the team page are 44 px on a phone and keep their desktop size above it", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const org = /\/o\/[^/]+\//u.exec(page.url())?.[0] ?? "/";
+  await page.goto(new URL(`${org}settings/team`, page.url()).toString());
+  await expectFieldHeights(page, 1);
+  await page.getByRole("button", { name: "Invite member" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expectFieldHeights(page, 3);
+});

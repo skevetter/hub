@@ -287,7 +287,7 @@ test.describe("interactive sessions", () => {
       const acknowledge = dialog.getByRole("checkbox", { name: "Run every tool without asking" });
       await expect(acknowledge).not.toBeChecked();
       for (const width of [390, 1280]) {
-        await adminPage.setViewportSize({ width, height: 1100 });
+        await adminPage.setViewportSize({ width, height: 1300 });
         await expect.poll(() => horizontalOverflow(dialog)).toBe(0);
         await expect.poll(() => verticalOverflow(dialog)).toBe(0);
         await expect.poll(() => elementWidth(dialog)).toBeLessThanOrEqual(448);

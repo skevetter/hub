@@ -1,7 +1,8 @@
 import { expect, type Locator, type Page } from "@playwright/test";
 
-const FIELDS =
-  "main input:not([type=checkbox]):not([type=radio]):not([type=hidden]), main select, main [role=combobox]";
+const CONTROLS =
+  "input:not([type=checkbox]):not([type=radio]):not([type=hidden]), select, [role=combobox]";
+const FIELDS = `main ${CONTROLS.replaceAll(", ", ", main ")}, [role=dialog] ${CONTROLS.replaceAll(", ", ", [role=dialog] ")}`;
 
 export interface Size {
   name: string;
