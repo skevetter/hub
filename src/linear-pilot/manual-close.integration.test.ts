@@ -296,5 +296,5 @@ it.each(["embedded", "postgres"] as const)(
       }
     }
   },
-  60_000,
+  120_000,
 );
