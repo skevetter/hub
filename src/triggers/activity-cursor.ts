@@ -66,21 +66,32 @@ export function decodeActivityCursor(
     const bytes = Buffer.from(cursor, "base64url");
     if (bytes.toString("base64url") !== cursor) return undefined;
     const parsed: unknown = JSON.parse(bytes.toString("utf8"));
-    if (!Array.isArray(parsed) || (parsed.length !== 4 && parsed.length !== 5)) return undefined;
-    const [direction, createdAt, id, cursorScope, rawOffset] = parsed as unknown[];
-    if (
-      cursorScope !== scope ||
-      (direction !== "before" && direction !== "after") ||
-      typeof createdAt !== "string" ||
-      activityTimestampMicros(createdAt) === undefined ||
-      typeof id !== "string" ||
-      !UUID.test(id)
-    ) {
-      return undefined;
-    }
-    const offset = displayOffset(rawOffset);
-    return { direction, key: { createdAt, id }, ...(offset === undefined ? {} : { offset }) };
+    return parseCursorFields(parsed, scope);
   } catch {
     return undefined;
   }
+}
+
+function parseCursorFields(parsed: unknown, scope: string): ActivityCursor | undefined {
+  if (!Array.isArray(parsed) || (parsed.length !== 4 && parsed.length !== 5)) return undefined;
+  const [direction, createdAt, id, cursorScope, rawOffset] = parsed as unknown[];
+  if (
+    cursorScope !== scope ||
+    !validCursorDirection(direction) ||
+    !validCursorTimestamp(createdAt) ||
+    typeof id !== "string" ||
+    !UUID.test(id)
+  ) {
+    return undefined;
+  }
+  const offset = displayOffset(rawOffset);
+  return { direction, key: { createdAt, id }, ...(offset === undefined ? {} : { offset }) };
+}
+
+function validCursorTimestamp(value: unknown): value is string {
+  return typeof value === "string" && activityTimestampMicros(value) !== undefined;
+}
+
+function validCursorDirection(value: unknown): value is Position["direction"] {
+  return value === "before" || value === "after";
 }

@@ -5,6 +5,17 @@ import { describe, it } from "vitest";
 import { FormField } from "./form-field.js";
 
 describe("a field's wiring", () => {
+  it("renders multiline and input attributes for typed controls", () => {
+    const multiline = renderToStaticMarkup(
+      <FormField id="notes" label="Notes" kind="multiline" name="notes" defaultValue="hello" />,
+    );
+    const text = renderToStaticMarkup(
+      <FormField id="text" label="Text" kind="text" name="text" autoComplete="on" readOnly />,
+    );
+    assert.match(multiline, /<textarea[^>]*rows="4"[^>]*>hello<\/textarea>/u);
+    assert.match(text, /autoComplete="on"/u);
+    assert.match(text, /readOnly=""/u);
+  });
   it("points its label at the control and both notes at it in turn", () => {
     const markup = renderToStaticMarkup(
       <FormField

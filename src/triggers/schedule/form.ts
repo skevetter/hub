@@ -74,37 +74,55 @@ export function ruleFromDraft(draft: RecurrenceDraft): string {
 
 /** Rules the controls cannot faithfully express remain editable as RRULE without conversion. */
 export function projectRecurrence(value: Recurrence): RecurrenceDraft | null {
-  const parts = new Map(
-    value.rule
-      .split(";")
-      .map(
-        (part) => [part.slice(0, part.indexOf("=")), part.slice(part.indexOf("=") + 1)] as const,
-      ),
-  );
+  const parts = ruleParts(value.rule);
   const frequency = parts.get("FREQ");
-  if (!FREQUENCIES.some((item) => item.value === frequency)) return null;
-  if (
-    [...parts.keys()].some(
-      (key) =>
-        !["FREQ", "INTERVAL", "BYDAY", "BYHOUR", "BYMINUTE", "BYSECOND", "BYSETPOS"].includes(key),
-    )
-  )
-    return null;
-  if (parts.has("INTERVAL") && parts.get("INTERVAL") !== "1") return null;
-  const draft = {
-    ...defaultDraft(value.start),
-    frequency: frequency!,
-  };
+  if (frequency === undefined || !FREQUENCIES.some((item) => item.value === frequency)) return null;
+  if (!hasPresetFields(parts)) return null;
+  const draft = { ...defaultDraft(value.start), frequency };
   const byDay = parts.get("BYDAY");
   if (frequency === "WEEKLY") {
-    draft.days = byDay?.split(",") ?? [
-      DAY_CODES[(new Date(`${value.start}Z`).getUTCDay() + 6) % 7]!,
-    ];
-    if (draft.days.some((day) => !DAY_CODES.some((code) => code === day))) return null;
+    const days = projectWeeklyDays(value, byDay);
+    if (days === null) return null;
+    draft.days = days;
   } else if (byDay !== undefined) return null;
-  if (["MINUTELY", "HOURLY"].includes(frequency!))
+  if (["MINUTELY", "HOURLY"].includes(frequency))
     return parts.size <= (parts.has("INTERVAL") ? 2 : 1) ? draft : null;
   return projectTimes(value, parts, draft);
+}
+
+function ruleParts(rule: string): Map<string, string> {
+  return new Map(
+    rule.split(";").map((part) => {
+      const equals = part.indexOf("=");
+      return [part.slice(0, equals), part.slice(equals + 1)];
+    }),
+  );
+}
+
+const PRESET_FIELDS = new Set([
+  "FREQ",
+  "INTERVAL",
+  "BYDAY",
+  "BYHOUR",
+  "BYMINUTE",
+  "BYSECOND",
+  "BYSETPOS",
+]);
+
+function hasPresetFields(parts: Map<string, string>): boolean {
+  return (
+    [...parts.keys()].every((key) => PRESET_FIELDS.has(key)) &&
+    (!parts.has("INTERVAL") || parts.get("INTERVAL") === "1")
+  );
+}
+
+function projectWeeklyDays(value: Recurrence, byDay: string | undefined): string[] | null {
+  if (byDay === undefined) {
+    const day = DAY_CODES[(new Date(`${value.start}Z`).getUTCDay() + 6) % 7];
+    return day === undefined ? null : [day];
+  }
+  const days = byDay.split(",");
+  return days.every((day) => DAY_CODES.some((code) => code === day)) ? days : null;
 }
 
 function projectTimes(
@@ -112,8 +130,24 @@ function projectTimes(
   parts: Map<string, string>,
   draft: RecurrenceDraft,
 ): RecurrenceDraft | null {
-  if (parts.has("BYSECOND") && parts.get("BYSECOND") !== "0") return null;
-  if (!parts.has("BYSECOND") && value.start.slice(17) !== "00") return null;
+  const seconds = parts.get("BYSECOND");
+  if (seconds === undefined ? value.start.slice(17) !== "00" : seconds !== "0") return null;
+  const combinations = timeCombinations(value, parts);
+  const positions = parts.get("BYSETPOS")?.split(",").map(Number);
+  draft.times =
+    positions === undefined
+      ? combinations
+      : combinations.filter((_, index) => positions.includes(index + 1));
+  if (draft.times.length === 0 || draft.times.length > 24) return null;
+  if (
+    positions !== undefined &&
+    ruleParts(ruleFromDraft(draft)).get("BYSETPOS") !== parts.get("BYSETPOS")
+  )
+    return null;
+  return draft;
+}
+
+function timeCombinations(value: Recurrence, parts: Map<string, string>): string[] {
   const hours = (parts.get("BYHOUR") ?? value.start.slice(11, 13))
     .split(",")
     .map(Number)
@@ -122,38 +156,31 @@ function projectTimes(
     .split(",")
     .map(Number)
     .sort((a, b) => a - b);
-  const combinations = hours.flatMap((hour) =>
+  return hours.flatMap((hour) =>
     minutes.map((minute) => `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`),
   );
-  const positions = parts.get("BYSETPOS")?.split(",").map(Number);
-  draft.times =
-    positions === undefined
-      ? combinations
-      : combinations.filter((_, index) => positions.includes(index + 1));
-  if (draft.times.length === 0 || draft.times.length > 24) return null;
-  if (positions !== undefined) {
-    const generated = new Map(
-      ruleFromDraft(draft)
-        .split(";")
-        .map(
-          (part) => [part.slice(0, part.indexOf("=")), part.slice(part.indexOf("=") + 1)] as const,
-        ),
-    );
-    if (generated.get("BYSETPOS") !== parts.get("BYSETPOS")) return null;
-  }
-  return draft;
 }
 
 export function describeRecurrence(value: Recurrence): string {
   const draft = projectRecurrence(value);
   if (draft === null) return `${value.rule} (${value.timezone})`;
-  let summary = FREQUENCIES.find((frequency) => frequency.value === draft.frequency)!.label;
+  const frequency = FREQUENCIES.find((item) => item.value === draft.frequency);
+  if (frequency === undefined)
+    throw new TypeError("Cannot read properties of undefined (reading 'label')");
+  let summary = frequency.label;
   if (draft.frequency === "WEEKLY")
     summary = `Every ${DAY_CODES.filter((day) => draft.days.includes(day))
-      .map((day) => WEEKDAYS[DAY_CODES.indexOf(day)]!.slice(0, 3))
+      .map(weekdayAbbreviation)
       .map((day) => day.charAt(0).toUpperCase() + day.slice(1))
       .join(", ")}`;
   if (!["MINUTELY", "HOURLY"].includes(draft.frequency))
     summary += ` at ${draft.times.join(" and ")}`;
   return `${summary} (${value.timezone})`;
+}
+
+function weekdayAbbreviation(day: (typeof DAY_CODES)[number]): string {
+  const weekday = WEEKDAYS[DAY_CODES.indexOf(day)];
+  if (weekday === undefined)
+    throw new TypeError("Cannot read properties of undefined (reading 'slice')");
+  return weekday.slice(0, 3);
 }

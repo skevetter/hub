@@ -25,20 +25,22 @@ export function runReadClock(client: QueryClient) {
     const kind = query.queryKey[0];
     if (kind !== "run-detail" && kind !== "run-events") continue;
     const data: unknown = query.state.data;
-    if (
-      typeof data === "object" &&
-      data !== null &&
-      "sequence" in data &&
-      typeof data.sequence === "number" &&
-      Number.isSafeInteger(data.sequence) &&
-      data.sequence >= 0
-    ) {
-      sequence = Math.max(sequence, data.sequence);
-    }
+    if (hasReadSequence(data)) sequence = Math.max(sequence, data.sequence);
   }
   clock = new RunRequestClock(sequence);
   clocks.set(client, clock);
   return clock;
+}
+
+function hasReadSequence(data: unknown): data is { sequence: number } {
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    "sequence" in data &&
+    typeof data.sequence === "number" &&
+    Number.isSafeInteger(data.sequence) &&
+    data.sequence >= 0
+  );
 }
 
 export function runReadResult<T>(sequence: number, result: Result<T>): Result<RunRead<T>> {

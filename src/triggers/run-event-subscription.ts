@@ -121,11 +121,14 @@ export class RunEventSubscription {
     state.droppedCount = Math.max(this.state.droppedCount, page.droppedCount);
     this.update(state);
     if (this.finishIfRead()) return;
-    if (
+    if (this.needsPolling()) this.poll();
+  }
+
+  private needsPolling() {
+    return (
       this.state.connection === null ||
       (!this.state.streamEnabled && this.state.connection !== "Polling")
-    )
-      this.poll();
+    );
   }
 
   private update(state: RunEventState) {
@@ -135,10 +138,7 @@ export class RunEventSubscription {
 
   private mergeMetadata(incoming: TimelineMetadata, sequence?: number) {
     this.historyKnown ||= hasHistory(incoming);
-    if (sequence !== undefined && sequence >= this.configurationSequence) {
-      this.configurationSequence = sequence;
-      this.configurationUnavailable = incoming.timelineUnavailable === true;
-    }
+    this.acceptConfigurationEvidence(incoming, sequence);
     const seal = Math.max(this.state.sealedSeq ?? -1, incoming.sealedSeq ?? -1);
     const state: RunEventState = {
       ...this.state,
@@ -151,18 +151,30 @@ export class RunEventSubscription {
     return state;
   }
 
+  private acceptConfigurationEvidence(incoming: TimelineMetadata, sequence?: number) {
+    if (sequence !== undefined && sequence >= this.configurationSequence) {
+      this.configurationSequence = sequence;
+      this.configurationUnavailable = incoming.timelineUnavailable === true;
+    }
+  }
+
   private acceptStatus(status: TimelineMetadata, connection = this.state.connection) {
     const state = this.mergeMetadata(status);
     state.connection = connection;
     this.update(state);
   }
 
-  private finishIfRead() {
-    const unavailable =
+  private isPersistedUnavailable() {
+    return (
       !this.historyKnown &&
       this.state.timelineUnavailable &&
       this.persistedTerminal &&
-      this.state.status !== "running";
+      this.state.status !== "running"
+    );
+  }
+
+  private finishIfRead() {
+    const unavailable = this.isPersistedUnavailable();
     if (
       !this.state.expired &&
       !timelineRead(this.state.lastSeq, this.state.sealedSeq) &&
@@ -200,26 +212,7 @@ export class RunEventSubscription {
       this.failures = 0;
       this.update({ ...this.state, connection: "Live" });
     });
-    for (const kind of TIMELINE_KINDS)
-      listen(kind, (event) => {
-        const row = this.parse(event.data, runEventSchema);
-        if (row === undefined) return;
-        this.historyKnown = true;
-        const events = mergeRunEvents(this.state.events, [row]);
-        this.update({
-          ...this.state,
-          events,
-          lastSeq: Math.max(this.state.lastSeq, row.seq),
-          timelineUnavailable: false,
-          status:
-            this.state.status === "running" &&
-            row.kind === "run_finished" &&
-            typeof row.data["status"] === "string"
-              ? row.data["status"]
-              : this.state.status,
-        });
-        this.finishIfRead();
-      });
+    for (const kind of TIMELINE_KINDS) listen(kind, (event) => this.receiveRow(event.data));
     listen("status", (event) => {
       const status = this.parse(event.data, runEventStatusSchema);
       if (status === undefined) return;
@@ -241,29 +234,51 @@ export class RunEventSubscription {
     };
     listen("shutdown", reconnect);
     listen("reconnect", reconnect);
-    listen("error", () => {
-      this.failures += 1;
-      if (this.failures >= 3) this.poll();
-      else this.update({ ...this.state, connection: "Reconnecting" });
-      if (this.probe !== undefined) return;
-      const probe = new AbortController();
-      this.probe = probe;
-      void this.options
-        .probe(`${this.options.url}&after=${String(this.state.lastSeq)}`, probe.signal)
-        .then((status) => {
-          if (this.stopped || probe.signal.aborted) return undefined;
-          if (status === 404) this.poll();
-          if (status === 410) {
-            this.update({ ...this.state, expired: true, events: [] });
-            this.finishIfRead();
-          }
-          return undefined;
-        })
-        .catch(() => undefined)
-        .finally(() => {
-          if (this.probe === probe) this.probe = undefined;
-        });
+    listen("error", () => this.handleStreamError());
+  }
+
+  private receiveRow(data: string) {
+    const row = this.parse(data, runEventSchema);
+    if (row === undefined) return;
+    this.historyKnown = true;
+    const events = mergeRunEvents(this.state.events, [row]);
+    this.update({
+      ...this.state,
+      events,
+      lastSeq: Math.max(this.state.lastSeq, row.seq),
+      timelineUnavailable: false,
+      status:
+        this.state.status === "running" &&
+        row.kind === "run_finished" &&
+        typeof row.data["status"] === "string"
+          ? row.data["status"]
+          : this.state.status,
     });
+    this.finishIfRead();
+  }
+
+  private handleStreamError() {
+    this.failures += 1;
+    if (this.failures >= 3) this.poll();
+    else this.update({ ...this.state, connection: "Reconnecting" });
+    if (this.probe !== undefined) return;
+    const probe = new AbortController();
+    this.probe = probe;
+    void this.options
+      .probe(`${this.options.url}&after=${String(this.state.lastSeq)}`, probe.signal)
+      .then((status) => {
+        if (this.stopped || probe.signal.aborted) return undefined;
+        if (status === 404) this.poll();
+        if (status === 410) {
+          this.update({ ...this.state, expired: true, events: [] });
+          this.finishIfRead();
+        }
+        return undefined;
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.probe === probe) this.probe = undefined;
+      });
   }
 
   private parse<T>(
