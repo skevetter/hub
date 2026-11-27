@@ -472,6 +472,23 @@ describe("verifyLinearPilotIntake generated cases", () => {
     return make();
   }
 
+  function expectGeneratedEvent(result: LinearPilotIntakeResult, kind: string, label: string) {
+    if (result.ok) {
+      expect(result.event.humanId, label).toBe(PILOT_CONFIG.allowedHumanId);
+      expect(result.event.workspaceId, label).toBe(PILOT_CONFIG.linearOrganizationId);
+      expect(result.event.kind, label).toBe(kind);
+      expect(
+        Object.keys(result.event).every((k) => KEYS.has(k)),
+        label,
+      ).toBe(true);
+      if (kind === "stop") {
+        expect(result.event.stopCreatedAtMs, label).toBe(Date.UTC(2026, 10, 21, 10));
+      } else {
+        expect(result.event, label).not.toHaveProperty("stopCreatedAtMs");
+      }
+    }
+  }
+
   it(`${CASES} generated payloads: only owner-bound well-formed input yields an event (seed ${REPLAY_SEED})`, () => {
     const next = rng(REPLAY_SEED);
     const outcomes = { accepted: 0, refused: 0 };
@@ -502,20 +519,7 @@ describe("verifyLinearPilotIntake generated cases", () => {
         expect(result.ok, label).toBe(true);
         outcomes.accepted += 1;
       }
-      if (result.ok) {
-        expect(result.event.humanId, label).toBe(PILOT_CONFIG.allowedHumanId);
-        expect(result.event.workspaceId, label).toBe(PILOT_CONFIG.linearOrganizationId);
-        expect(result.event.kind, label).toBe(kind);
-        expect(
-          Object.keys(result.event).every((k) => KEYS.has(k)),
-          label,
-        ).toBe(true);
-        if (kind === "stop") {
-          expect(result.event.stopCreatedAtMs, label).toBe(Date.UTC(2026, 10, 21, 10));
-        } else {
-          expect(result.event, label).not.toHaveProperty("stopCreatedAtMs");
-        }
-      }
+      expectGeneratedEvent(result, kind, label);
     }
     // Controls: the generator exercised both verdicts, not just one.
     expect(outcomes.accepted).toBeGreaterThan(CASES * 0.3);
@@ -771,22 +775,27 @@ describe("classifyLinearPilotCompanionComment", () => {
       "`@paseo` and x@paseo",
     ];
 
+    function generatedComment(next: ReturnType<typeof rng>) {
+      const parts: string[] = [];
+      let expected = false;
+      for (let i = 0, length = 1 + Math.floor(next() * 4); i < length; i += 1) {
+        const roll = next();
+        if (roll < 0.3) {
+          parts.push(pick(next, PROSE_WITH));
+          expected = true;
+        } else if (roll < 0.65) parts.push(pick(next, PROSE_WITHOUT));
+        else parts.push(pick(next, CODE));
+      }
+      const body = parts.join("\n\n");
+      return { body, expected };
+    }
+
     it(`2,000+ generated comments agree with an independent oracle (seed ${REPLAY_SEED})`, async () => {
       const next = rng(REPLAY_SEED + 2);
       const counts = { yes: 0, no: 0 };
       const total = 2_400;
       for (let n = 0; n < total; n += 1) {
-        const parts: string[] = [];
-        let expected = false;
-        for (let i = 0, length = 1 + Math.floor(next() * 4); i < length; i += 1) {
-          const roll = next();
-          if (roll < 0.3) {
-            parts.push(pick(next, PROSE_WITH));
-            expected = true;
-          } else if (roll < 0.65) parts.push(pick(next, PROSE_WITHOUT));
-          else parts.push(pick(next, CODE));
-        }
-        const body = parts.join("\n\n");
+        const { body, expected } = generatedComment(next);
         const label = `comment ${n} seed ${REPLAY_SEED + 2}: ${JSON.stringify(body)}`;
         const resolveHandle = vi.fn(() => "paseo");
         const author = next() < 0.8 ? PILOT_CONFIG.allowedHumanId : "human-other-0001";
@@ -992,6 +1001,13 @@ describe("precheckLinearPilotScope", () => {
     ]);
   });
 
+  function expectScopedOwner(body: JsonObject, label: string) {
+    const holder = body["action"] === "created" ? "agentSession" : "agentActivity";
+    const key = body["action"] === "created" ? "creatorId" : "userId";
+    expect(body["organizationId"], label).toBe(PILOT_CONFIG.linearOrganizationId);
+    expect(objectAtPath(body, holder)[key], label).toBe(PILOT_CONFIG.allowedHumanId);
+  }
+
   it(`never refuses what full intake accepts and never admits another human (seed ${REPLAY_SEED})`, () => {
     const next = rng(REPLAY_SEED + 4);
     const paths: string[][] = [
@@ -1017,12 +1033,7 @@ describe("precheckLinearPilotScope", () => {
         expect(pre, label).toEqual({ ok: true });
         admitted += 1;
       }
-      if (pre.ok) {
-        const holder = body["action"] === "created" ? "agentSession" : "agentActivity";
-        const key = body["action"] === "created" ? "creatorId" : "userId";
-        expect(body["organizationId"], label).toBe(PILOT_CONFIG.linearOrganizationId);
-        expect(objectAtPath(body, holder)[key], label).toBe(PILOT_CONFIG.allowedHumanId);
-      }
+      if (pre.ok) expectScopedOwner(body, label);
     }
     expect(admitted).toBeGreaterThan(300);
   });

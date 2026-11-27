@@ -277,11 +277,12 @@ describe("tools that read a document with steps", () => {
     expect(describeTriggerYaml(SHORTHAND)).toContain("run codex on host devbox");
   });
 
-  it("leaves the form to YAML", () => {
-    expect(projectTriggerForm(MIXED)).toEqual({
-      status: "yaml_only",
-      reason: "Triggers with several steps can only be edited in YAML.",
-    });
+  it("opens a step list in the form", () => {
+    const projection = projectTriggerForm(MIXED);
+    expect(projection.status).toBe("editable");
+    if (projection.status === "editable") {
+      expect(projection.value.steps.map(({ id }) => id)).toEqual(["build", "review", "fix"]);
+    }
   });
 
   it("reads stored revisions with each step's own continuation", () => {

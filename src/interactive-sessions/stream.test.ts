@@ -98,6 +98,18 @@ function read(response: Response) {
   };
 }
 
+function publishLastFrame(last: string, bus: SessionEventBus, rows: SessionEventRecord[]) {
+  if (last.startsWith("Hub")) {
+    const event = state(1);
+    rows.push(event);
+    bus.publish(sessionId, { kind: "hub", event });
+  }
+  if (last === "connection") bus.publish(sessionId, { kind: "connection", online: false });
+  if (last === "disconnect gap")
+    bus.publish(sessionId, { kind: "gap", reason: "daemon_disconnected" });
+  if (last === "epoch gap") bus.publish(sessionId, { kind: "gap", reason: "epoch_changed" });
+}
+
 describe("interactive session stream", () => {
   it("replays the remaining text of a daemon chunk after a partial live cursor", async () => {
     const { bus, open, source } = setup();
@@ -180,15 +192,7 @@ describe("interactive session stream", () => {
       bus.publish(sessionId, agent(3));
       frame = await first.next();
     }
-    if (last.startsWith("Hub")) {
-      const event = state(1);
-      rows.push(event);
-      bus.publish(sessionId, { kind: "hub", event });
-    }
-    if (last === "connection") bus.publish(sessionId, { kind: "connection", online: false });
-    if (last === "disconnect gap")
-      bus.publish(sessionId, { kind: "gap", reason: "daemon_disconnected" });
-    if (last === "epoch gap") bus.publish(sessionId, { kind: "gap", reason: "epoch_changed" });
+    publishLastFrame(last, bus, rows);
     if (last !== "agent") frame = await first.next();
     const lastId = frame?.match(/^id: ([^\n]+)/u)?.[1];
     expect(lastId).toBe(expectedId);

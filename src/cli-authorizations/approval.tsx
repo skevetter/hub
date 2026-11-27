@@ -1,7 +1,7 @@
 import { useSnapshotQuery } from "../queries/index.js";
 import { useMutation } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useMemo, useState, type SyntheticEvent, type ReactNode } from "react";
 import { AuthCard } from "../components/app/auth-layout.js";
 import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
 import { FormActions } from "../components/app/form-actions.js";
@@ -23,12 +23,63 @@ export function CliLoginApproval({ accountId, organizationId }: ApprovalIdentity
       ? undefined
       : (new URLSearchParams(window.location.search).get("code") ?? undefined),
   );
-  const inspect = useServerFn(inspectCliAuthorization);
-  const snapshot = useSnapshotQuery({
+  const snapshot = useCliApprovalSnapshot({ accountId, organizationId }, code);
+  const { decide, submitDecision } = useCliApprovalDecision(snapshot, code);
+  const facts = useCliApprovalFacts(snapshot);
+
+  if (code !== undefined && snapshot.status === "pending") return <Loading rows={facts} />;
+  if (snapshot.status === "error") return renderApprovalError(snapshot.error);
+  if (decide.data?.status === "ok") return renderApprovalOutcome(decide.data.data.decision);
+  if (code === undefined || snapshot.data === undefined) return <CodeEntry onCode={setCode} />;
+  const request = snapshot.data;
+  const failed = isDecisionFailure(decide);
+  return (
+    <Centered>
+      <AuthCard
+        titleId="approval-heading"
+        title="Approve CLI login"
+        description="Grant this terminal durable access to one organization."
+      >
+        <SummaryPanel label="CLI login" rows={facts} />
+        {request.canManage ? (
+          renderDecisionForm({ failed, decide, submitDecision })
+        ) : (
+          <WarningAlert title="Approval required">
+            Switch to an organization where you are an owner or admin, then reopen the login URL.
+          </WarningAlert>
+        )}
+      </AuthCard>
+    </Centered>
+  );
+}
+
+function isDecisionFailure(decide: ReturnType<typeof useCliApprovalDecision>["decide"]): boolean {
+  return decide.isError || decide.data?.status === "error";
+}
+
+interface CliInspectionRequest {
+  send(input: {
+    data: { userCode: string | undefined };
+  }): ReturnType<typeof inspectCliAuthorization>;
+}
+
+function useCliApprovalSnapshot(
+  { accountId, organizationId }: ApprovalIdentity,
+  code: string | undefined,
+) {
+  // An explicit refetch of a disabled query still forwards the missing code to server validation.
+  const inspect: CliInspectionRequest["send"] = useServerFn(inspectCliAuthorization);
+  return useSnapshotQuery({
     queryKey: ["cli-authorization", accountId, organizationId, code],
-    queryFn: () => inspect({ data: { userCode: code! } }),
+    queryFn: () => inspect({ data: { userCode: code } }),
     enabled: code !== undefined,
   });
+}
+
+function useCliApprovalDecision(
+  snapshot: ReturnType<typeof useCliApprovalSnapshot>,
+  code: string | undefined,
+) {
   const decide = useMutation({
     mutationKey: ["cli-authorization-decision"],
     mutationFn: useServerFn(decideCliAuthorization) as (
@@ -36,7 +87,7 @@ export function CliLoginApproval({ accountId, organizationId }: ApprovalIdentity
     ) => Promise<Result<{ decision: "approved" | "denied" }>>,
   });
   const submitDecision = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       if (snapshot.status !== "success" || code === undefined) return;
       const submitter = "submitter" in event.nativeEvent ? event.nativeEvent.submitter : undefined;
@@ -52,10 +103,14 @@ export function CliLoginApproval({ accountId, organizationId }: ApprovalIdentity
     },
     [code, decide, snapshot.data, snapshot.status],
   );
+  return { decide, submitDecision };
+}
+
+function useCliApprovalFacts(snapshot: ReturnType<typeof useCliApprovalSnapshot>) {
   const resolved = snapshot.status === "success" ? snapshot.data : undefined;
   const organizationName = resolved?.organization.name;
   const expiresAt = resolved?.expiresAt;
-  const facts = useMemo<SummaryRow[]>(
+  return useMemo<SummaryRow[]>(
     () => [
       { label: RECIPIENT_LABEL, value: organizationName ?? <Skeleton className="h-5 w-40" /> },
       {
@@ -70,78 +125,67 @@ export function CliLoginApproval({ accountId, organizationId }: ApprovalIdentity
     ],
     [expiresAt, organizationName],
   );
+}
 
-  if (code !== undefined && snapshot.status === "pending") return <Loading rows={facts} />;
-  if (snapshot.status === "error") {
-    return (
-      <Centered>
-        <FailureAlert
-          title="CLI login unavailable"
-          error={snapshot.error}
-          fallback="This CLI login request is unavailable or expired."
-        />
-      </Centered>
-    );
-  }
-  if (decide.data?.status === "ok") {
-    return (
-      <Centered>
-        <AuthCard
-          titleId="approval-outcome-heading"
-          title={`CLI login ${decide.data.data.decision}`}
-          description="You can close this window and return to the terminal."
-        >
-          <p role="status">The terminal has received the decision.</p>
-        </AuthCard>
-      </Centered>
-    );
-  }
-  if (code === undefined || snapshot.data === undefined) return <CodeEntry onCode={setCode} />;
-  const request = snapshot.data;
-  const failed = decide.isError || decide.data?.status === "error";
+function renderApprovalError(error: string | null) {
+  return (
+    <Centered>
+      <FailureAlert
+        title="CLI login unavailable"
+        error={error}
+        fallback="This CLI login request is unavailable or expired."
+      />
+    </Centered>
+  );
+}
+
+function renderApprovalOutcome(decision: "approved" | "denied") {
   return (
     <Centered>
       <AuthCard
-        titleId="approval-heading"
-        title="Approve CLI login"
-        description="Grant this terminal durable access to one organization."
+        titleId="approval-outcome-heading"
+        title={`CLI login ${decision}`}
+        description="You can close this window and return to the terminal."
       >
-        <SummaryPanel label="CLI login" rows={facts} />
-        {request.canManage ? (
-          <form className="grid gap-6" onSubmit={submitDecision} aria-label="Approve CLI login">
-            <p className="text-sm text-muted-foreground">
-              The credential can list projects, validate and install configuration, enroll daemons,
-              and dispatch manual runs for this organization until revoked.
-            </p>
-            {failed ? (
-              <FailureAlert
-                title="Decision not recorded"
-                error={decide.data}
-                fallback="Hub did not receive this CLI login decision. Check your connection and confirm the request is still active."
-              />
-            ) : null}
-            <FormActions>
-              <Button
-                type="submit"
-                name="decision"
-                value="deny"
-                variant="outline"
-                disabled={decide.isPending}
-              >
-                Deny
-              </Button>
-              <Button type="submit" name="decision" value="approve" disabled={decide.isPending}>
-                Approve CLI login
-              </Button>
-            </FormActions>
-          </form>
-        ) : (
-          <WarningAlert title="Approval required">
-            Switch to an organization where you are an owner or admin, then reopen the login URL.
-          </WarningAlert>
-        )}
+        <p role="status">The terminal has received the decision.</p>
       </AuthCard>
     </Centered>
+  );
+}
+
+function renderDecisionForm({
+  failed,
+  decide,
+  submitDecision,
+}: ReturnType<typeof useCliApprovalDecision> & { failed: boolean }) {
+  return (
+    <form className="grid gap-6" onSubmit={submitDecision} aria-label="Approve CLI login">
+      <p className="text-sm text-muted-foreground">
+        The credential can list projects, validate and install configuration, enroll daemons, and
+        dispatch manual runs for this organization until revoked.
+      </p>
+      {failed ? (
+        <FailureAlert
+          title="Decision not recorded"
+          error={decide.data}
+          fallback="Hub did not receive this CLI login decision. Check your connection and confirm the request is still active."
+        />
+      ) : null}
+      <FormActions>
+        <Button
+          type="submit"
+          name="decision"
+          value="deny"
+          variant="outline"
+          disabled={decide.isPending}
+        >
+          Deny
+        </Button>
+        <Button type="submit" name="decision" value="approve" disabled={decide.isPending}>
+          Approve CLI login
+        </Button>
+      </FormActions>
+    </form>
   );
 }
 
@@ -152,7 +196,7 @@ interface ApprovalIdentity {
 
 function CodeEntry({ onCode }: { onCode: (code: string) => void }) {
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       const code = new FormData(event.currentTarget).get("code");
       if (typeof code !== "string") return;

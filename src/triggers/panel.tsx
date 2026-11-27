@@ -9,7 +9,6 @@ import {
   useCallback,
   useEffect,
   useId,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -23,7 +22,6 @@ import { Combobox, type ComboboxOption } from "../components/app/combobox.js";
 import { CheckboxField } from "../components/app/checkbox-field.js";
 import { CopyButton } from "../components/app/copy-field.js";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
-import { Disclosure } from "../components/app/disclosure.js";
 import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
 import { FormActions } from "../components/app/form-actions.js";
 import { FieldSkeleton, FormField } from "../components/app/form-field.js";
@@ -42,26 +40,46 @@ import { toast } from "../components/app/toast-store.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { usePageSizePreference } from "../components/app/use-page-size-preference.js";
 import { Button } from "../components/ui/button.js";
-import { Textarea } from "../components/ui/textarea.js";
 import { SiteHeaderActions } from "../shell/site-header-actions.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import { CodeEditor } from "../projects/configuration/code-editor.js";
 import { useRouteTenant } from "../projects/context.js";
 import type { Result } from "../contract/respond.js";
 import {
+  newStepFormValue,
   describeTriggerEvent,
   changeTriggerEvent,
   droppedTriggerRules,
+  firstStep,
   isManualNoCallers,
   sharedYamlField,
   mergeTriggerForm,
-  needsActorFilter,
   projectTriggerForm,
+  needsActorFilter,
   triggerFormErrors,
   type TriggerFieldErrors,
   type TriggerFormValue,
 } from "./configuration/editor.js";
 import { describeTriggerYaml, triggerEventClause } from "./configuration/describe.js";
+import { hasScriptStep, isShorthandSteps } from "./configuration/editor-steps.js";
+import {
+  RunLimitField,
+  StepBody,
+  StepCard,
+  StepListFooter,
+  useStepRows,
+  type StepRows,
+} from "./steps-section.js";
+import { StepLimitFields, agentStepDescription, type StepAgentProps } from "./step-fields.js";
+import {
+  fieldError,
+  reservedStepIdErrors,
+  saveFieldErrors,
+  startsAsList,
+  yamlListsSteps,
+  type TriggerFieldProps,
+} from "./step-form-model.js";
+import { useDaemonProviderCatalog } from "./use-daemon-provider-catalog.js";
 import {
   saveTrigger,
   triggerEditorSnapshot,
@@ -70,10 +88,8 @@ import {
   type TriggerListPage,
 } from "./functions.js";
 import { savedToast } from "./saved-toast.js";
-import { daemonProviderSnapshot } from "../daemons/functions.js";
-import type { HubProviderSnapshotEntry } from "../hub/protocol.js";
 import { EventFields } from "./event-fields.js";
-import { ActionField, ScriptFields, triggerSecondaryLine } from "./script-fields.js";
+import { triggerSecondaryLine } from "./script-fields.js";
 import { NotificationStatusCard } from "./notification-status-card.js";
 import { LastTriggered } from "./last-triggered.js";
 import { hasProgressDestination } from "./progress-events.js";
@@ -93,13 +109,11 @@ import {
   triggerSearchSchema,
   type TriggerSearch,
 } from "./trigger-query.js";
-import {
-  selectedProviderModel,
-  unattendedAgentOptions,
-  unattendedModeOptions,
-} from "./provider-catalog.js";
 
 type BrowserTrigger = TriggerSnapshot["triggers"][number];
+interface SaveFailure {
+  readonly message: string;
+}
 type EditorMode = "form" | "yaml";
 
 /** Every form value the operator types into a control, i.e. everything but the event and the switch. */
@@ -582,7 +596,7 @@ export function TriggerEditorPanel({ triggerId }: { triggerId: string }) {
       trigger={trigger}
       snapshot={data}
       saving={save.isPending}
-      saveError={save.data?.status === "error" ? save.data.error.message : undefined}
+      saveFailure={save.data?.status === "error" ? save.data.error : undefined}
       onCancel={returnToList}
       onSave={(yaml) =>
         save.mutate({
@@ -611,7 +625,7 @@ interface TriggerEditorProps {
   trigger: BrowserTrigger | null;
   snapshot: TriggerSnapshot;
   saving: boolean;
-  saveError: string | undefined;
+  saveFailure: SaveFailure | undefined;
   onCancel: () => void;
   onSave: (yaml: string) => void;
 }
@@ -620,12 +634,12 @@ function TriggerEditor({
   trigger,
   snapshot,
   saving,
-  saveError,
+  saveFailure,
   onCancel,
   onSave,
 }: TriggerEditorProps) {
   const legacy = trigger?.format === "legacy_multistep";
-  const editor = useTriggerEditorState(trigger, snapshot, legacy, onSave);
+  const editor = useTriggerEditorState({ trigger, snapshot, legacy, saveFailure, onSave });
   const webhook = useMemo(
     () => editorWebhook({ mode: editor.mode, form: editor.form, yaml: editor.yaml }),
     [editor.mode, editor.form, editor.yaml],
@@ -645,7 +659,7 @@ function TriggerEditor({
       />
       <TriggerEditorHeading title={title} editor={editor} onCancel={onCancel} />
       <div className="grid gap-6">
-        <TriggerEditorAlerts legacy={legacy} editor={editor} saveError={saveError} />
+        <TriggerEditorAlerts legacy={legacy} editor={editor} saveError={saveFailure?.message} />
         <div className="sm:hidden">{modeSwitch}</div>
         <form id="trigger-editor-form" noValidate className="grid gap-6" onSubmit={editor.submit}>
           <TriggerEditorFields
@@ -835,9 +849,10 @@ function TriggerEditorFields({
   ) : (
     <TriggerForm
       form={editor.form}
-      errors={editor.errors}
+      errors={editor.fieldErrors}
       triggerId={triggerId}
       snapshot={snapshot}
+      yaml={editor.yaml}
       onChange={editor.setForm}
     />
   );
@@ -889,14 +904,23 @@ function triggerSubmitLabel(mode: EditorMode, creating: boolean) {
  * clicks: the unavailable mode is disabled and the reason is on screen, so neither switching nor
  * saving can fail with a surprise.
  */
-function useTriggerEditorState(
-  trigger: BrowserTrigger | null,
-  snapshot: TriggerSnapshot,
-  legacy: boolean,
-  onSave: (yaml: string) => void,
-) {
+function useTriggerEditorState({
+  trigger,
+  snapshot,
+  legacy,
+  saveFailure,
+  onSave,
+}: {
+  trigger: BrowserTrigger | null;
+  snapshot: TriggerSnapshot;
+  legacy: boolean;
+  saveFailure: SaveFailure | undefined;
+  onSave: (yaml: string) => void;
+}) {
   const { mode, setMode, yaml, setYaml, form, setForm, initialProjection } =
     useEditorRepresentations(trigger, snapshot, legacy);
+  const { submitted, save } = useSubmittedForm(form, onSave);
+  const saved = useSavedFieldErrors(saveFailure, form, submitted);
   // What the mode the reader is *not* in would receive. In form mode that is the YAML the form
   // serialises to; in YAML mode it is the form the document projects onto.
   const other = useMemo(
@@ -912,17 +936,22 @@ function useTriggerEditorState(
   // new trigger is not a page of errors, it is a page nobody has filled in. Once they have asked,
   // the marks stay and follow what they type.
   const [refused, setRefused] = useState(false);
-  const errors = useMemo(() => triggerFormErrors(form), [form]);
+  const errors = useMemo(
+    () => ({ ...triggerFormErrors(form), ...reservedStepIdErrors(form.steps) }),
+    [form],
+  );
   const refuse = () => setRefused(true);
   const switchMode = (next: EditorMode) =>
     switchEditorMode(next, { mode, other, setForm, setYaml, setMode, refuse });
-  const submit = editorSubmit({ mode, other, yaml, onSave, refuse });
+  const reservedId = Object.keys(reservedStepIdErrors(form.steps)).length > 0;
+  const submit = editorSubmit({ mode, other, yaml, onSave: save, refuse, reservedId });
   return {
     mode,
     yaml,
     form,
     description,
     errors: refused ? errors : NO_FIELD_ERRORS,
+    fieldErrors: { ...(refused ? errors : NO_FIELD_ERRORS), ...saved },
     invalidDocument: mode === "form" && other.status === "invalid_document",
     documentError: editorDocumentError({ other, refused, errors, blocked }),
     // Legacy workflows are explained by their own alert; repeating the schema error underneath it
@@ -935,6 +964,37 @@ function useTriggerEditorState(
     switchMode,
     submit,
   };
+}
+
+/**
+ * The save check names the step it refuses by its position in the form as it was submitted. That
+ * mark goes as soon as the reader changes anything, including while the save is still in flight,
+ * and comes back if the same refusal does.
+ */
+function useSavedFieldErrors(
+  failure: SaveFailure | undefined,
+  form: TriggerFormValue,
+  submitted: { current: TriggerFormValue },
+) {
+  const [saved, setSaved] = useState<{ errors: TriggerFieldErrors; form: TriggerFormValue }>();
+  useEffect(() => {
+    setSaved(
+      failure === undefined
+        ? undefined
+        : { errors: saveFieldErrors(failure.message), form: submitted.current },
+    );
+  }, [failure, submitted]);
+  return saved?.form === form ? saved.errors : NO_FIELD_ERRORS;
+}
+
+/** The form as it was when Save was pressed, which is what a save refusal speaks about. */
+function useSubmittedForm(form: TriggerFormValue, onSave: (yaml: string) => void) {
+  const submitted = useRef(form);
+  const save = (yaml: string) => {
+    submitted.current = form;
+    onSave(yaml);
+  };
+  return { submitted, save };
 }
 
 function useEditorRepresentations(
@@ -965,17 +1025,19 @@ function editorSubmit({
   yaml,
   onSave,
   refuse,
+  reservedId,
 }: {
   mode: EditorMode;
   other: EditorProjection;
   yaml: string;
   onSave: (yaml: string) => void;
   refuse: () => void;
+  reservedId: boolean;
 }) {
   return (event: ChangeEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (mode === "yaml") onSave(yaml);
-    else if (other.status === "ok") onSave(other.yaml);
+    else if (!reservedId && other.status === "ok") onSave(other.yaml);
     else refuse();
   };
 }
@@ -1007,7 +1069,10 @@ function describeEditor({
 function describeUnprojectedEditor(form: TriggerFormValue, yaml: string) {
   if (yaml !== "") return `When ${triggerEventClause(form.event)}, run the configured action.`;
   const target = form.daemon === "" ? "the selected host" : `host ${form.daemon}`;
-  const action = form.action === "script" ? "a script" : form.agent || "the selected agent";
+  const action =
+    firstStep(form).action === "script"
+      ? "a script"
+      : firstStep(form).agent || "the selected agent";
   return `When ${triggerEventClause(form.event)}, run ${action} on ${target}.`;
 }
 
@@ -1133,12 +1198,6 @@ function TriggerCompatibilityAlert({
 function compatibilityTitle(legacy: boolean, advanced: boolean): string {
   if (legacy) return "Legacy multi-step workflow";
   return advanced ? "Advanced trigger" : "Form editing unavailable";
-}
-
-/** The error slot a field carries, absent while that field is fine. */
-function fieldError(errors: TriggerFieldErrors, key: keyof TriggerFormValue) {
-  const error = errors[key];
-  return error === undefined ? {} : { error };
 }
 
 export function ProgressMessageField({
@@ -1360,28 +1419,34 @@ function TriggerReplyField({ form, errors, onChange }: TriggerFieldProps) {
   ) : null;
 }
 
-interface TriggerFieldProps {
-  form: TriggerFormValue;
-  errors: TriggerFieldErrors;
-  onChange: (value: TriggerFormValue) => void;
-}
-
 type TriggerFormProps = TriggerFieldProps & {
   triggerId: string | undefined;
   snapshot: TriggerSnapshot;
+  yaml: string;
 };
 
-function TriggerForm({ form, errors, triggerId, snapshot, onChange }: TriggerFormProps) {
+function TriggerForm({ form, errors, triggerId, snapshot, yaml, onChange }: TriggerFormProps) {
   const selectedDaemon = snapshot.daemons.find((daemon) => daemon.slug === form.daemon);
-  const script = form.action === "script";
+  const hasAgent = form.steps.some((step) => step.action === "prompt");
   const providerCatalog = useDaemonProviderCatalog(
     snapshot.organization.slug,
-    script ? undefined : selectedDaemon?.id,
+    hasAgent ? selectedDaemon?.id : undefined,
     form.cwd,
   );
-  const [githubExpanded, setGithubExpanded] = useState(form.githubConnection !== "");
-  const [optionsExpanded, setOptionsExpanded] = useState(false);
+  // Once a trigger lists its steps it keeps listing them, so removing down to one step does not
+  // swap the card the reader is editing for a different one.
+  const [listed, setListed] = useState(() =>
+    startsAsList(form.steps, isShorthandSteps(form.steps) && !yamlListsSteps(yaml)),
+  );
+  const showList = listed || form.steps.length > 1;
+  const rows = useStepRows({ form, errors, onChange, onAdd: () => setListed(true) });
   const fields = { form, errors, onChange };
+  const step = {
+    ...fields,
+    providerCatalog,
+    connections: snapshot.connections,
+    hasDaemon: selectedDaemon !== undefined,
+  };
   return (
     <div className="grid gap-6">
       <TriggerIdentityFields {...fields} triggerId={triggerId} />
@@ -1402,46 +1467,62 @@ function TriggerForm({ form, errors, triggerId, snapshot, onChange }: TriggerFor
           {...fields}
           snapshot={snapshot}
           selected={selectedDaemon !== undefined}
+          listed={showList}
         />
-        <Card
-          title={EDITOR_STEPS.agent.title}
-          {...descriptionProp(agentStepDescription(script, selectedDaemon !== undefined))}
-        >
-          <ActionField value={form} onChange={onChange} />
-          {script ? <ScriptFields value={form} errors={errors} onChange={onChange} /> : null}
-          {script || selectedDaemon === undefined ? null : (
-            <>
-              <TriggerProviderFields {...fields} providerCatalog={providerCatalog} />
-              <TriggerContinuityFields {...fields} />
-              <TriggerPromptFields
-                {...fields}
-                optionsExpanded={optionsExpanded}
-                setOptionsExpanded={setOptionsExpanded}
-              />
-              <TriggerGitHubFields
-                {...fields}
-                connections={snapshot.connections}
-                githubExpanded={githubExpanded}
-                setGithubExpanded={setGithubExpanded}
-              />
-            </>
-          )}
-        </Card>
+        {stepCards({ listed: showList, rows, step })}
       </Steps>
-
-      <TriggerExecutionNote script={script} />
+      <StepListFooter rows={rows} count={form.steps.length} />
+      <TriggerExecutionNote steps={form.steps} />
     </div>
   );
 }
 
-function TriggerExecutionNote({ script }: { script: boolean }) {
+/** A plain function, not a component: `Steps` numbers each card it is handed as its own row. */
+function stepCards({
+  listed,
+  rows,
+  step,
+}: {
+  listed: boolean;
+  rows: StepRows;
+  step: Omit<StepAgentProps, "index"> & { hasDaemon: boolean };
+}) {
+  if (listed) {
+    return step.form.steps.map((_, index) => (
+      <StepCard key={rows.keys[index] ?? String(index)} {...step} index={index} rows={rows} />
+    ));
+  }
+  return (
+    <Card
+      title={EDITOR_STEPS.agent.title}
+      {...descriptionProp(
+        agentStepDescription(step.form.steps[0]?.action === "script", step.hasDaemon),
+      )}
+    >
+      <StepBody {...step} index={0} />
+    </Card>
+  );
+}
+
+const SCRIPT_NOTE =
+  "Hub runs the script in a terminal on your daemon, with the daemon's environment. Keys and sandboxing stay on your compute.";
+const AGENT_NOTE =
+  "Hub launches the agent on your daemon. Keys, provider configuration, and sandboxing stay on your compute.";
+const MIXED_NOTE =
+  "Hub runs scripts in a terminal on your daemon and launches agents there. Keys, provider configuration, and sandboxing stay on your compute.";
+
+function executionNote(steps: TriggerFormValue["steps"]): string {
+  const scripts = steps.filter((step) => step.action === "script").length;
+  if (scripts === 0) return AGENT_NOTE;
+  return scripts === steps.length ? SCRIPT_NOTE : MIXED_NOTE;
+}
+
+function TriggerExecutionNote({ steps }: { steps: TriggerFormValue["steps"] }) {
   return (
     <Card>
       <p className="flex items-center gap-2 text-sm text-muted-foreground">
         <LockKeyhole aria-hidden="true" className="size-4 shrink-0 text-link" />
-        {script
-          ? "Hub runs the script in a terminal on your daemon, with the daemon's environment. Keys and sandboxing stay on your compute."
-          : "Hub launches the agent on your daemon. Keys, provider configuration, and sandboxing stay on your compute."}
+        {executionNote(steps)}
       </p>
     </Card>
   );
@@ -1508,7 +1589,8 @@ function TriggerTargetCard({
   snapshot,
   onChange,
   selected,
-}: Omit<TriggerFormProps, "triggerId"> & { selected: boolean }) {
+  listed,
+}: Omit<TriggerFormProps, "triggerId" | "yaml"> & { selected: boolean; listed: boolean }) {
   const daemonOptions = snapshot.daemons.map((daemon) => ({
     value: daemon.slug,
     label: daemon.slug,
@@ -1538,8 +1620,9 @@ function TriggerTargetCard({
             daemonOptions={daemonOptions}
           />
           {selected ? (
-            <TargetRuntimeFields form={form} errors={errors} onChange={onChange} />
+            <TargetRuntimeFields form={form} errors={errors} onChange={onChange} listed={listed} />
           ) : null}
+          {selected ? <RunLimitField form={form} errors={errors} onChange={onChange} /> : null}
         </>
       )}
     </Card>
@@ -1572,10 +1655,13 @@ function TargetDaemonField({
             onChange({
               ...form,
               daemon: option.value,
-              agent: "",
-              mode: "",
-              thinkingOptionId: "",
-              providerOptions: "",
+              steps: form.steps.map((step) => ({
+                ...step,
+                agent: "",
+                mode: "",
+                thinkingOptionId: "",
+                providerOptions: "",
+              })),
             })
           }
         />
@@ -1584,16 +1670,26 @@ function TargetDaemonField({
   );
 }
 
-function TargetRuntimeFields({ form, errors, onChange }: TriggerFieldProps) {
-  const script = form.action === "script";
-  const targetCopy = script ? SCRIPT_TARGET_COPY : AGENT_TARGET_COPY;
+const AGENT_CWD_COPY =
+  "Absolute path of the checkout on the daemon, for example /home/you/repo. The agents you can run are read from there.";
+const SCRIPT_CWD_COPY =
+  "Absolute path on the daemon's host, for example /home/you/repo. It must be an open project in Paseo.";
+
+/** A single step keeps its limits here, with the directory. A list keeps them on each step. */
+function TargetRuntimeFields({
+  form,
+  errors,
+  onChange,
+  listed,
+}: TriggerFieldProps & { listed: boolean }) {
   const text = triggerTextField({ form, onChange });
+  const scriptOnly = form.steps.every((step) => step.action === "script");
   return (
     <div className="grid gap-4 sm:grid-cols-2">
       <FormField
         id="trigger-cwd"
         label="Working directory"
-        description={targetCopy.cwd}
+        description={scriptOnly ? SCRIPT_CWD_COPY : AGENT_CWD_COPY}
         kind="text"
         name="cwd"
         value={form.cwd}
@@ -1602,264 +1698,15 @@ function TargetRuntimeFields({ form, errors, onChange }: TriggerFieldProps) {
         {...sharedYamlField(form, "cwd")}
         {...fieldError(errors, "cwd")}
       />
-      <FormField
-        id="trigger-max-runtime"
-        label="Maximum runtime"
-        description={targetCopy.maxRuntime}
-        kind="text"
-        name="maxRuntime"
-        value={form.maxRuntime}
-        onChange={text("maxRuntime")}
-        required
-        {...sharedYamlField(form, "maxRuntime")}
-        {...fieldError(errors, "maxRuntime")}
-      />
-      {script ? null : (
-        <FormField
-          id="trigger-idle-timeout"
-          label="Idle timeout"
-          description="Stop an unresponsive agent, for example 10m."
-          kind="text"
-          name="idleTimeout"
-          value={form.idleTimeout}
-          onChange={text("idleTimeout")}
-          required
-          {...sharedYamlField(form, "idleTimeout")}
-          {...fieldError(errors, "idleTimeout")}
-        />
+      {listed ? null : (
+        <StepLimitFields form={form} errors={errors} onChange={onChange} index={0} />
       )}
     </div>
   );
 }
 
-function TriggerProviderFields({
-  form,
-  errors,
-  onChange,
-  providerCatalog,
-}: TriggerFieldProps & { providerCatalog: ReturnType<typeof useDaemonProviderCatalog> }) {
-  return (
-    <>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <ProviderCatalogFields
-          form={form}
-          errors={errors}
-          entries={providerCatalog.entries}
-          loading={providerCatalog.loading}
-          onChange={onChange}
-        />
-      </div>
-      {providerCatalog.loading ? (
-        <LoadingLine>{`Loading providers from ${form.daemon}…`}</LoadingLine>
-      ) : null}
-      {providerCatalog.error === undefined ? null : (
-        <FailureAlert
-          title="Providers unavailable"
-          error={providerCatalog.error}
-          fallback="Hub couldn't load this daemon's providers."
-          onRetry={providerCatalog.refresh}
-        />
-      )}
-    </>
-  );
-}
-
-function TriggerContinuityFields({ form, errors, onChange }: TriggerFieldProps) {
-  const text = triggerTextField({ form, onChange });
-  return (
-    <>
-      <fieldset disabled={sharedYamlField(form, "continuationMode").disabled}>
-        <SegmentedControl
-          label="Agent continuity"
-          description={sharedYamlField(form, "continuationMode").description ?? "Agent continuity"}
-          value={form.continuationMode}
-          onChange={text("continuationMode")}
-          options={[
-            {
-              value: "conversation",
-              label: "Same conversation",
-              hint: "Continue the same agent for this conversation. Events without a conversation start a new agent. Archived workspaces are restored.",
-            },
-            {
-              value: "key",
-              label: "Custom key",
-              hint: "Arrivals with the same key in this project share an agent. Agent and workspace settings must match.",
-            },
-            {
-              value: "new",
-              label: "New agent",
-              hint: "Create a separate agent for every request.",
-            },
-          ]}
-        />
-      </fieldset>
-      {form.continuationMode === "key" ? (
-        <FormField
-          id="trigger-continuation-key"
-          label="Continuation key"
-          kind="text"
-          name="continuationKey"
-          value={form.continuationKey}
-          onChange={text("continuationKey")}
-          description="A key or expression, for example ${{ paseo.inputs.ticket }}."
-          required
-          {...sharedYamlField(form, "continuationKey")}
-          {...fieldError(errors, "continuationKey")}
-        />
-      ) : null}
-    </>
-  );
-}
-
-function TriggerPromptFields({
-  form,
-  errors,
-  onChange,
-  optionsExpanded,
-  setOptionsExpanded,
-}: TriggerFieldProps & { optionsExpanded: boolean; setOptionsExpanded: (open: boolean) => void }) {
-  const update = triggerFieldUpdate({ form, onChange });
-  const text = triggerTextField({ form, onChange });
-  return (
-    <>
-      <PromptEditor
-        value={form.prompt}
-        {...sharedYamlField(form, "prompt")}
-        {...fieldError(errors, "prompt")}
-        onChange={(prompt) => update("prompt", prompt)}
-      />
-      <CheckboxField
-        id="trigger-complete-on-turn-end"
-        label="Complete when the agent ends its turn"
-        description="If the agent stops without calling finish_execution, count the run as done instead of failing it at the idle timeout. Not for runs with a structured output or a required output."
-        checked={form.completeOnTurnEnd}
-        {...sharedYamlField(form, "completeOnTurnEnd")}
-        onChange={(checked) => update("completeOnTurnEnd", checked)}
-      />
-      <Disclosure
-        id="trigger-provider-options"
-        open={optionsExpanded}
-        onOpenChange={setOptionsExpanded}
-        title="Advanced provider options"
-        description="Fields the form does not model, passed through to the provider."
-      >
-        <FormField
-          id="trigger-provider-options-json"
-          label="Provider options (JSON)"
-          description="Passed to the provider on your daemon. YAML-only agent fields remain untouched."
-          kind="multiline"
-          name="providerOptions"
-          value={form.providerOptions}
-          onChange={text("providerOptions")}
-          placeholder={'{"sandbox_mode":"workspace-write"}'}
-          {...sharedYamlField(form, "providerOptions")}
-          {...fieldError(errors, "providerOptions")}
-        />
-      </Disclosure>
-    </>
-  );
-}
-
-function TriggerGitHubFields({
-  form,
-  errors,
-  onChange,
-  connections,
-  githubExpanded,
-  setGithubExpanded,
-}: TriggerFieldProps & {
-  connections: TriggerSnapshot["connections"];
-  githubExpanded: boolean;
-  setGithubExpanded: (open: boolean) => void;
-}) {
-  const githubConnections = connections.filter((connection) => connection.provider === "github");
-  const githubConnectionOptions = [
-    { value: "", label: "Do not inject a GitHub token" },
-    ...githubConnections.map((connection) => ({
-      value: connection.slug,
-      label: connection.label,
-    })),
-  ];
-  const githubEnabled = form.githubConnection !== "";
-  const update = triggerFieldUpdate({ form, onChange });
-  return (
-    <Disclosure
-      id="trigger-github"
-      open={githubExpanded}
-      onOpenChange={setGithubExpanded}
-      title="GitHub access"
-      description="Give the run a short-lived token scoped to the repositories you name."
-    >
-      <div className="grid gap-4 sm:grid-cols-2">
-        <FormField
-          id="trigger-github-connection"
-          label="GitHub connection"
-          description="Mints a short-lived, restricted GH_TOKEN for this run."
-          {...sharedYamlField(form, "githubConnection")}
-        >
-          {(control) => (
-            <Combobox
-              {...control}
-              value={form.githubConnection}
-              options={githubConnectionOptions}
-              placeholder="Select a GitHub connection"
-              empty="No GitHub connections found."
-              onChange={(option) => update("githubConnection", option.value)}
-            />
-          )}
-        </FormField>
-        {githubEnabled ? (
-          <TriggerGitHubScopeFields form={form} errors={errors} onChange={onChange} />
-        ) : null}
-      </div>
-    </Disclosure>
-  );
-}
-
-function TriggerGitHubScopeFields({ form, errors, onChange }: TriggerFieldProps) {
-  const text = triggerTextField({ form, onChange });
-  return (
-    <>
-      <FormField
-        id="trigger-github-repositories"
-        label="GitHub repositories"
-        description="Comma-separated owner/repository names."
-        kind="text"
-        name="githubRepositories"
-        value={form.githubRepositories}
-        onChange={text("githubRepositories")}
-        {...sharedYamlField(form, "githubRepositories")}
-        required
-      />
-      <FormField
-        id="trigger-github-duration"
-        label="GitHub token lifetime"
-        description="At most 1h."
-        kind="text"
-        name="githubDuration"
-        value={form.githubDuration}
-        onChange={text("githubDuration")}
-        {...sharedYamlField(form, "githubDuration")}
-        required
-      />
-      <FormField
-        id="trigger-github-permissions"
-        label="GitHub permissions (JSON)"
-        description="Defaults to read-only repository contents when empty."
-        kind="multiline"
-        name="githubPermissions"
-        value={form.githubPermissions}
-        onChange={text("githubPermissions")}
-        placeholder={'{"contents":"write","pull_requests":"write"}'}
-        {...sharedYamlField(form, "githubPermissions")}
-        {...fieldError(errors, "githubPermissions")}
-      />
-    </>
-  );
-}
-
 function AccessCard({ form, errors, onChange }: TriggerFieldProps) {
-  const script = form.action === "script";
+  const script = hasScriptStep(form);
   const { audience } = eventDefinition(form.event);
   const noCallers = isManualNoCallers(form);
   let description: string | undefined;
@@ -1879,7 +1726,7 @@ function AccessCard({ form, errors, onChange }: TriggerFieldProps) {
 }
 
 function TriggerAudienceFields({ form, errors, onChange }: TriggerFieldProps) {
-  const script = form.action === "script";
+  const script = hasScriptStep(form);
   const { audience } = eventDefinition(form.event);
   const manual = form.event === "manual.run";
   const chooseAudience = !script && audience === "wildcard";
@@ -1995,252 +1842,10 @@ const EDITOR_STEPS = {
 /** What the step says while the decision above it is still missing. */
 const NO_DAEMON_DESCRIPTION =
   "No daemon is connected to this organization yet, and a trigger runs on a daemon.";
-function agentStepDescription(script: boolean, hasDaemon: boolean): string | undefined {
-  if (script) return SCRIPT_DESCRIPTION;
-  return hasDaemon ? undefined : NO_AGENT_DESCRIPTION;
-}
+const SCRIPT_ACCESS_DESCRIPTION = "A script runs code on your host, so name who may start it.";
 
 function descriptionProp(description: string | undefined) {
   return description === undefined ? {} : { description };
-}
-
-const AGENT_TARGET_COPY = {
-  cwd: "Absolute path of the checkout on the daemon, for example /home/you/repo. The agents you can run are read from there.",
-  maxRuntime: "Hard deadline for the agent, for example 2h.",
-};
-const SCRIPT_TARGET_COPY = {
-  cwd: "Absolute path on the daemon's host, for example /home/you/repo. It must be an open project in Paseo.",
-  maxRuntime: "Hub stops the script at this deadline, for example 10m.",
-};
-const SCRIPT_DESCRIPTION = "A shell script, run by /bin/sh on the daemon's host.";
-const SCRIPT_ACCESS_DESCRIPTION = "A script runs code on your host, so name who may start it.";
-const NO_AGENT_DESCRIPTION =
-  "Choose a daemon first. The agents you can run are the ones it reports.";
-
-function PromptEditor({
-  value,
-  error,
-  disabled,
-  description,
-  onChange,
-}: {
-  value: string;
-  error?: string;
-  disabled?: boolean;
-  description?: string;
-  onChange: (value: string) => void;
-}) {
-  const textarea = useRef<HTMLTextAreaElement>(null);
-  useLayoutEffect(() => {
-    const element = textarea.current;
-    if (element === null) return;
-    element.style.height = "0px";
-    element.style.height = `${String(element.scrollHeight)}px`;
-  }, [value]);
-  const insert = (mergeTag: string) => {
-    const element = textarea.current;
-    if (element === null) return;
-    const start = element.selectionStart;
-    const end = element.selectionEnd;
-    onChange(`${value.slice(0, start)}${mergeTag}${value.slice(end)}`);
-    requestAnimationFrame(() => {
-      element.focus();
-      element.setSelectionRange(start + mergeTag.length, start + mergeTag.length);
-    });
-  };
-  return (
-    <div className="grid gap-2">
-      <FormField
-        id="trigger-prompt"
-        label="Instructions"
-        {...(disabled === undefined ? {} : { disabled })}
-        {...(description === undefined ? {} : { description })}
-        required
-        {...(error === undefined ? {} : { error })}
-      >
-        {(control) => (
-          <Textarea
-            {...control}
-            ref={textarea}
-            value={value}
-            onChange={(event) => onChange(event.target.value)}
-            rows={8}
-            spellCheck={false}
-            className="min-h-48 resize-none overflow-hidden font-mono text-xs"
-          />
-        )}
-      </FormField>
-      <PromptMergeTags disabled={disabled} insert={insert} />
-    </div>
-  );
-}
-
-function PromptMergeTags({
-  disabled,
-  insert,
-}: {
-  disabled: boolean | undefined;
-  insert: (tag: string) => void;
-}) {
-  return (
-    <div className="flex flex-wrap items-center gap-2">
-      <span className="text-xs text-muted-foreground">Insert merge tag:</span>
-      {MERGE_TAGS.map((mergeTag) => (
-        <Button
-          key={mergeTag}
-          type="button"
-          variant="outline"
-          size="xs"
-          className="font-mono"
-          disabled={disabled}
-          onClick={() => insert(mergeTag)}
-        >
-          {mergeTag}
-        </Button>
-      ))}
-    </div>
-  );
-}
-
-const MERGE_TAGS = ["${{ paseo.prompt }}", "${{ paseo.context }}"] as const;
-
-function ProviderCatalogFields({
-  form,
-  errors,
-  entries,
-  loading,
-  onChange,
-}: ProviderCatalogFieldProps) {
-  const agentOptions = unattendedAgentOptions(entries) satisfies ComboboxOption[];
-  return (
-    <>
-      <FormField
-        id="trigger-agent"
-        label="Agent"
-        description="Models the selected daemon can run unattended: Claude, Codex, OpenCode, or omp."
-        required
-        {...sharedYamlField(form, "agent")}
-        {...fieldError(errors, "agent")}
-      >
-        {(control) => (
-          <Combobox
-            {...control}
-            required
-            loading={loading}
-            value={form.agent}
-            options={agentOptions}
-            placeholder="Select a model"
-            searchPlaceholder="Search models…"
-            empty="No models found."
-            onChange={(option) =>
-              onChange({ ...form, agent: option.value, mode: "", thinkingOptionId: "" })
-            }
-          />
-        )}
-      </FormField>
-      <ProviderExecutionFields
-        form={form}
-        errors={errors}
-        entries={entries}
-        loading={loading}
-        onChange={onChange}
-      />
-    </>
-  );
-}
-
-interface ProviderCatalogFieldProps {
-  form: TriggerFormValue;
-  errors: TriggerFieldErrors;
-  entries: HubProviderSnapshotEntry[] | undefined;
-  loading: boolean;
-  onChange: (value: TriggerFormValue) => void;
-}
-
-function ProviderExecutionFields({ form, errors, entries, onChange }: ProviderCatalogFieldProps) {
-  const selected = selectedProviderModel(entries, form.agent);
-  const modeOptions = unattendedModeOptions(selected.entry);
-  const thinkingOptions = (selected.model?.thinkingOptions ?? []).map((option) => ({
-    value: option.id,
-    label: option.label,
-  }));
-  return (
-    <>
-      <FormField
-        id="trigger-mode"
-        label="Execution mode"
-        description="Modes reported for the selected provider. omp runs unattended only in full."
-        required
-        {...sharedYamlField(form, "mode")}
-        {...fieldError(errors, "mode")}
-      >
-        {(control) => (
-          <Combobox
-            {...control}
-            required
-            value={form.mode}
-            options={modeOptions}
-            placeholder="Select a mode"
-            empty="No modes found."
-            onChange={(option) => onChange({ ...form, mode: option.value })}
-          />
-        )}
-      </FormField>
-      {thinkingOptions.length === 0 ? null : (
-        <FormField
-          id="trigger-thinking"
-          label="Thinking"
-          description="Thinking options reported for the selected model."
-          {...sharedYamlField(form, "thinkingOptionId")}
-          required
-        >
-          {(control) => (
-            <Combobox
-              {...control}
-              required
-              value={form.thinkingOptionId}
-              options={thinkingOptions}
-              placeholder="Select a thinking option"
-              empty="No thinking options found."
-              onChange={(option) => onChange({ ...form, thinkingOptionId: option.value })}
-            />
-          )}
-        </FormField>
-      )}
-    </>
-  );
-}
-
-function useDaemonProviderCatalog(
-  organizationSlug: string,
-  daemonId: string | undefined,
-  cwd: string,
-) {
-  const load = useServerFn(daemonProviderSnapshot);
-  const queryKey = ["daemon-provider-snapshot", organizationSlug, daemonId, cwd] as const;
-  const enabled = daemonId !== undefined && cwd.trim() !== "";
-  const query = useSnapshotQuery({
-    queryKey,
-    enabled,
-    queryFn: () => {
-      if (daemonId === undefined) throw new Error("A daemon is required to load providers.");
-      return load({ data: { organizationSlug, daemonId, cwd: cwd.trim(), refresh: true } });
-    },
-  });
-  const entries = query.data?.entries;
-  const providerErrors = (entries ?? [])
-    .filter((entry) => entry.status === "error")
-    .map((entry) => `${entry.label ?? entry.provider}: ${entry.error ?? "unavailable"}`);
-  const providerError = providerErrors.length > 0 ? providerErrors.join(" ") : undefined;
-  return {
-    entries,
-    loading: query.isFetching,
-    error:
-      query.status === "error"
-        ? (query.error ?? "Hub couldn't load this daemon's providers.")
-        : providerError,
-    refresh: query.refetch,
-  };
 }
 
 /**
@@ -2262,22 +1867,13 @@ function defaultForm(snapshot: TriggerSnapshot): TriggerFormValue {
     qualifiers: {},
     daemon: daemon?.slug ?? "",
     cwd: "",
-    agent: "",
-    mode: "",
-    thinkingOptionId: "",
-    providerOptions: "",
-    continuationMode: "conversation",
-    continuationKey: "",
-    maxRuntime: "2h",
-    idleTimeout: "10m",
-    completeOnTurnEnd: false,
-    githubConnection: "",
-    githubRepositories: "",
-    githubPermissions: "",
-    githubDuration: "1h",
-    action: "prompt",
-    script: "",
-    prompt:
-      "Handle this request in the originating conversation.\n\nWhen hub.reply is available, use it for useful progress updates and your final user-facing response. Call hub.finish_execution once the request is complete.\n\nRequest:\n${{ paseo.prompt }}",
+    runMaxRuntime: "",
+    steps: [
+      newStepFormValue({
+        githubDuration: "1h",
+        prompt:
+          "Handle this request in the originating conversation.\n\nWhen hub.reply is available, use it for useful progress updates and your final user-facing response. Call hub.finish_execution once the request is complete.\n\nRequest:\n${{ paseo.prompt }}",
+      }),
+    ],
   };
 }

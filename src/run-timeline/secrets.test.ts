@@ -63,6 +63,25 @@ function readsEnvironment(node: ts.Node): boolean {
   );
 }
 
+function visitCredentialCall(
+  node: ts.CallExpression,
+  add: (node: ts.Node | undefined) => void,
+): void {
+  if (
+    node.arguments.some(isEnvironment) ||
+    (ts.isIdentifier(node.expression) && /environment/iu.test(node.expression.text))
+  ) {
+    for (const argument of node.arguments) add(argument);
+  }
+  if (
+    ts.isPropertyAccessExpression(node.expression) &&
+    ts.isArrayLiteralExpression(node.expression.expression) &&
+    node.arguments.some(readsEnvironment)
+  ) {
+    for (const element of node.expression.expression.elements) add(element);
+  }
+}
+
 function credentialNames(source: string, fileName = "reader.ts"): string[] {
   const names = new Set<string>();
   const tree = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
@@ -82,19 +101,7 @@ function credentialNames(source: string, fileName = "reader.ts"): string[] {
     } else if (ts.isPropertyAccessExpression(node) && isEnvironment(node.expression)) {
       add(node.name);
     } else if (ts.isCallExpression(node)) {
-      if (
-        node.arguments.some(isEnvironment) ||
-        (ts.isIdentifier(node.expression) && /environment/iu.test(node.expression.text))
-      ) {
-        for (const argument of node.arguments) add(argument);
-      }
-      if (
-        ts.isPropertyAccessExpression(node.expression) &&
-        ts.isArrayLiteralExpression(node.expression.expression) &&
-        node.arguments.some(readsEnvironment)
-      ) {
-        for (const element of node.expression.expression.elements) add(element);
-      }
+      visitCredentialCall(node, add);
     }
     ts.forEachChild(node, visit);
   };
@@ -140,6 +147,17 @@ function expectProtected(
     expect(collected).toContain(value);
     expect(projectedError(value, collected)).not.toContain(value.trim());
   }
+}
+
+function effectiveProviderCredentials(configurations: readonly object[]): string[] {
+  const effective: string[] = [];
+  for (const configuration of configurations) {
+    for (const [name, value] of Object.entries(configuration)) {
+      if (typeof value === "string" && /secret|token|privatekey/iu.test(name))
+        effective.push(value);
+    }
+  }
+  return effective;
 }
 
 describe("startup credential reader coverage", () => {
@@ -253,13 +271,7 @@ describe("startup credential reader coverage", () => {
       const configurations = Object.values(await readProviderApplicationEnvironment(environment));
       expect(configurations).toHaveLength(4);
       const collected = readTimelineScrubValues(environment, configurations);
-      const effective: string[] = [];
-      for (const configuration of configurations) {
-        for (const [name, value] of Object.entries(configuration)) {
-          if (typeof value === "string" && /secret|token|privatekey/iu.test(name))
-            effective.push(value);
-        }
-      }
+      const effective = effectiveProviderCredentials(configurations);
       expect(effective).toContain(privateKey);
       for (const value of effective) {
         expect(collected).toContain(value);
