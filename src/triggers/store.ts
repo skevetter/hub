@@ -15,6 +15,7 @@ import {
   TriggerDocumentError,
   type CompiledTriggerDocument,
   type TriggerDocument,
+  type TriggerDocumentErrorOptions,
   type TriggerDocumentIssue,
 } from "./configuration/index.js";
 import { documentAgents, isScriptStep, type TriggerAgentRun } from "./configuration/schema.js";
@@ -155,12 +156,15 @@ export class OrganizationTriggerStore {
       try {
         verdict = await this.agentValidator.validateAgentConfiguration(target.daemonId, agent);
       } catch (error) {
-        throw new TriggerDocumentError([
-          {
-            path: targetPath(compiled.authored, "daemon"),
-            message: daemonUnavailable(normalizeSteps(compiled.authored).target.daemon, error),
-          },
-        ]);
+        throw new TriggerDocumentError(
+          [
+            {
+              path: targetPath(compiled.authored, "daemon"),
+              message: daemonUnavailable(normalizeSteps(compiled.authored).target.daemon, error),
+            },
+          ],
+          daemonCheckFailure(error),
+        );
       }
       if (!verdict.valid) {
         issues.push(
@@ -216,7 +220,7 @@ function authoredFieldName(segment: string | number): string | number {
 }
 
 function daemonUnavailable(slug: string, error: unknown): string {
-  const reason = error instanceof Error ? error.message : String(error);
+  const reason = daemonFailureReason(error);
   if (reason === "daemon_not_connected") {
     return `"${slug}" is not connected, so Hub cannot check this agent against it. Connect the daemon and save again.`;
   }
@@ -224,6 +228,18 @@ function daemonUnavailable(slug: string, error: unknown): string {
     return `"${slug}" cannot run Hub automations. Run \`paseo hub permissions grant hub.execute\` on it and save again.`;
   }
   return `"${slug}" could not check this agent: ${reason}`;
+}
+
+function daemonFailureReason(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The author can fix a daemon that is not connected or not permitted; any other failure is not theirs. */
+function daemonCheckFailure(error: unknown): TriggerDocumentErrorOptions {
+  const reason = daemonFailureReason(error);
+  const authorCanFix =
+    reason === "daemon_not_connected" || reason === "daemon_execution_not_allowed";
+  return authorCanFix ? {} : { code: "upstreamUnavailable", cause: error };
 }
 
 /** Whether the daemon has anything new to say: the target or an agent differs from what runs now. */

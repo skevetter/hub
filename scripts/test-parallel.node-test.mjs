@@ -42,6 +42,10 @@ import {
 import baselineTimings from "./test-timings.json" with { type: "json" };
 import { fullSuiteLockHeld, runWorkerGroup, takeFullSuiteLock } from "./test-worker-group.mjs";
 
+for (const name of ["TEST_SHARD_INDEX", "TEST_SHARD_TOTAL", "TEST_SHARD_REPORT_DIR"]) {
+  delete process.env[name];
+}
+
 test("partition puts each file in one shard and balances cached durations", () => {
   const files = [
     { path: "small.test.ts", weight: 1 },
