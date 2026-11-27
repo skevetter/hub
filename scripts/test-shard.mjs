@@ -158,6 +158,9 @@ const ANSI_PATTERN = /\u001B\[[0-9;]*m/gu;
 const FAIL_LINE =
   /^\s*FAIL\s+(?:(?:\[[^\]]*\]|\|[^|]*\|)\s*)?(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+(?:>|\[).*)?\s*$/u;
 const SEPARATOR_LINE = /^\s*\u23AF{3,}/u;
+const DIVIDER_LINE = /^\s*\u23AF+$/u;
+const SERIALIZED_LINE = /^Serialized Error:/u;
+const CAUSE_LINE = /^Caused by:/u;
 const HINT_LINE =
   /^If this is a long-running (?:test|hook), pass a timeout value as the last argument or configure it globally with "(?:testTimeout|hookTimeout)"\.$/u;
 const FRAME_LINE = /^\s+at\s.+(?::\d+:\d+|\(<anonymous>\))\)?\s*$/u;
@@ -197,17 +200,25 @@ function extendHeader(headers, files, line) {
 }
 
 function indentedKind(line, mode) {
+  if (mode === "serialized") return "ignored";
   if (REPORTER_FRAME.test(line)) return "frame";
   if (mode === "message") return "continuation";
   if (mode === "frames" && !EXCERPT_LINE.test(line)) return "continuation";
   return "ignored";
 }
 
+function bodyKind(line, mode) {
+  if (SERIALIZED_LINE.test(line)) return "serialized";
+  if (/^\s/u.test(line)) return indentedKind(line, mode);
+  return mode === "serialized" && !CAUSE_LINE.test(line) ? "ignored" : "header";
+}
+
 function lineKind(line, { files, mode }) {
   if (FAIL_LINE.test(line)) return "fail";
+  if (DIVIDER_LINE.test(line)) return "ignored";
   if (SEPARATOR_LINE.test(line)) return "separator";
   if (files.length === 0 || line === "" || HINT_LINE.test(line)) return "ignored";
-  return /^\s/u.test(line) ? indentedKind(line, mode) : "header";
+  return bodyKind(line, mode);
 }
 
 /**
@@ -216,7 +227,8 @@ function lineKind(line, { files, mode }) {
  * to the next rule line, is an error header for all of those files. Indented lines after a
  * header are more of that message. Once a frame line appeared, an indented line that is not
  * another frame or a code excerpt line is treated as message text too, so text that imitates a
- * frame cannot hide what follows it.
+ * frame cannot hide what follows it. A bare rule line before a `Serialized Error:` block does
+ * not end the failure: the block is skipped, and any `Caused by:` after it still counts.
  */
 export function logFailureHeaders(logText) {
   const headers = new Map();
@@ -237,6 +249,8 @@ export function logFailureHeaders(logText) {
       Object.assign(state, { inErrors: true, mode: "message" });
     } else if (kind === "frame") {
       state.mode = "frames";
+    } else if (kind === "serialized") {
+      state.mode = "serialized";
     }
   }
   return headers;

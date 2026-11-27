@@ -537,6 +537,40 @@ test("only Vitest's own frame and excerpt formats are skipped", () => {
   assert.deepEqual(noLocation, [`Error: ${message}\n \u276F Configuration error: wrong endpoint`]);
 });
 
+test("causes after a serialized error block still count", () => {
+  const rule = "\u23AF".repeat(14);
+  const log = (...after) =>
+    [
+      " FAIL  a.test.ts > a",
+      "Error: Connection terminated due to connection timeout",
+      " \u276F a.test.ts:7:11",
+      "      7|   throw new Error(1);",
+      "       |           ^",
+      "",
+      "Caused by: Error: Connection terminated unexpectedly",
+      " \u276F a.test.ts:5:17",
+      "",
+      rule,
+      "Serialized Error: { connectionClosed: true,",
+      "  detail: 'long' }",
+      ...after,
+      `${"\u23AF".repeat(8)}[1/1]${"\u23AF"}`,
+      "",
+    ].join("\n");
+  const report = reportOf(
+    suiteFailure("a.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  const retry = (text) =>
+    retryableFiles(report, ["a.test.ts"], { root, headers: logFailureHeaders(text) });
+  assert.deepEqual(retry(log()), ["a.test.ts"]);
+  const nested = log("Caused by: Error: password authentication failed", " \u276F a.test.ts:4:19");
+  assert.deepEqual(retry(nested), []);
+  assert.equal(
+    logFailureHeaders(nested).get("a.test.ts").at(-1),
+    "Caused by: Error: password authentication failed",
+  );
+});
+
 test("the cause pg-pool attaches to a connection timeout is part of that failure", () => {
   const timeout = "Error: Connection terminated due to connection timeout";
   const log = (cause) =>
