@@ -60,7 +60,7 @@ export function createDiscordRegistration(
   options: CreateDiscordRegistrationOptions,
 ): ProviderRegistration {
   const configuration = options.configuration ?? null;
-  if (configuration === null || options.publicBaseUrl === undefined) {
+  if (configuration === null || !hasDiscordOrigin(options)) {
     return emptyDiscordRegistration(options);
   }
   if (options.database === null) {
@@ -74,29 +74,8 @@ export function createDiscordRegistration(
       token: configuration.botToken,
       clientId: configuration.clientId,
     });
-  const client =
-    options.connectionClient ??
-    createDiscordConnectionClient({
-      publicBaseUrl: options.publicBaseUrl,
-      clientId: configuration.clientId,
-      clientSecret: configuration.clientSecret,
-      botToken: configuration.botToken,
-      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-    });
-  const connection =
-    options.auth === null
-      ? discordConnectionStatus(true)
-      : createDiscordConnection(
-          {
-            database,
-            auth: options.auth,
-            applicationBaseUrl: options.applicationBaseUrl,
-            callbackOrigin: options.publicBaseUrl,
-            configurationVersion: options.configurationVersion ?? 0,
-            configuration,
-          },
-          client,
-        );
+  const client = discordConnectionClientFor(options, configuration);
+  const connection = configuredDiscordConnection(options, configuration, database, client);
   const gateway = createDiscordGatewaySource({
     bot,
     accept: (input) => database.acceptDiscordEvent(input),
@@ -114,7 +93,7 @@ export function createDiscordRegistration(
         createDiscordTriggerProvider({
           configurationStoreForProject,
           billingUrlForOrganization: (organizationId) =>
-            organizationBillingUrl(database, options.publicBaseUrl!, organizationId),
+            organizationBillingUrl(database, options.publicBaseUrl, organizationId),
           ...(attachments === undefined ? {} : { attachments }),
           bot,
         }),
@@ -136,6 +115,51 @@ export function createDiscordRegistration(
       ),
     },
   };
+}
+
+type DiscordRegistrationWithOrigin = CreateDiscordRegistrationOptions & { publicBaseUrl: string };
+
+function hasDiscordOrigin(
+  options: CreateDiscordRegistrationOptions,
+): options is DiscordRegistrationWithOrigin {
+  return options.publicBaseUrl !== undefined;
+}
+
+function discordConnectionClientFor(
+  options: DiscordRegistrationWithOrigin,
+  configuration: DiscordRegistrationConfiguration,
+): DiscordConnectionClient {
+  return (
+    options.connectionClient ??
+    createDiscordConnectionClient({
+      publicBaseUrl: options.publicBaseUrl,
+      clientId: configuration.clientId,
+      clientSecret: configuration.clientSecret,
+      botToken: configuration.botToken,
+      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+    })
+  );
+}
+
+function configuredDiscordConnection(
+  options: DiscordRegistrationWithOrigin,
+  configuration: DiscordRegistrationConfiguration,
+  database: Database,
+  client: DiscordConnectionClient,
+): ProviderConnectionRegistration {
+  return options.auth === null
+    ? discordConnectionStatus(true)
+    : createDiscordConnection(
+        {
+          database,
+          auth: options.auth,
+          applicationBaseUrl: options.applicationBaseUrl,
+          callbackOrigin: options.publicBaseUrl,
+          configurationVersion: options.configurationVersion ?? 0,
+          configuration,
+        },
+        client,
+      );
 }
 
 function emptyDiscordRegistration(
@@ -191,71 +215,79 @@ function createDiscordConnection(
   options: DiscordConnectionOptions,
   client: DiscordConnectionClient | undefined,
 ): ProviderConnectionRegistration {
-  const start = async (request: Request): Promise<Response> => {
-    const rejected = options.auth.rejectCookieMutation(request);
-    if (rejected !== undefined) return rejected;
-    try {
-      const access = await manageConnectionAccess(options.auth, options.database, request);
-      if (client === undefined) {
-        return Response.json({ error: "provider_not_configured" }, { status: 409 });
-      }
-      const state = newConnectionState();
-      await options.database.startConnectionAttempt({
-        provider: "discord",
-        stateVerifier: stateHash(state),
-        access: connectionAccess(access),
-        lifetimeMinutes: CONNECTION_ATTEMPT_LIFETIME_MINUTES,
-        callbackOrigin: options.callbackOrigin,
-        configurationVersion: options.configurationVersion,
-        providerApplicationId: options.configuration.clientId,
-        configurationSnapshot: { provider: "discord", ...options.configuration },
-        expectedConfigurationVersion: null,
-        activateConfiguration: false,
-      });
-      return Response.json({ url: client.authorizationUrl(state) });
-    } catch (error) {
-      return connectionActionFailure(error, "discord", "start");
-    }
-  };
-
-  const disconnect = async (request: Request): Promise<Response> => {
-    const rejected = options.auth.rejectCookieMutation(request);
-    if (rejected !== undefined) return rejected;
-    try {
-      const access = await manageConnectionAccess(options.auth, options.database, request);
-      const disconnected = await options.database.disconnectConnection(
-        "discord",
-        requiredConnectionId(request),
-        connectionAccess(access),
-      );
-      if (disconnected.provider === "discord" && disconnected.guildId !== undefined) {
-        void client?.leaveGuild(disconnected.guildId).catch((error: unknown) => {
-          reportFailure(
-            error,
-            {
-              operation: "connection.disconnect.cleanup",
-              component: "connections",
-              provider: "discord",
-            },
-            { kind: "internal" },
-          );
-        });
-      }
-      return Response.json({ disconnected: true });
-    } catch (error) {
-      return connectionActionFailure(error, "discord", "disconnect");
-    }
-  };
-
   return {
     name: "discord",
     status: (connections) => discordStatus(client !== undefined, connections.discord),
     actions: {
-      start,
-      disconnect,
+      start: (request) => startDiscordConnection(options, client, request),
+      disconnect: (request) => disconnectDiscordConnection(options, client, request),
       callback: (request) => completeAuthorization(options, client, request),
     },
   };
+}
+
+async function startDiscordConnection(
+  options: DiscordConnectionOptions,
+  client: DiscordConnectionClient | undefined,
+  request: Request,
+): Promise<Response> {
+  const rejected = options.auth.rejectCookieMutation(request);
+  if (rejected !== undefined) return rejected;
+  try {
+    const access = await manageConnectionAccess(options.auth, options.database, request);
+    if (client === undefined) {
+      return Response.json({ error: "provider_not_configured" }, { status: 409 });
+    }
+    const state = newConnectionState();
+    await options.database.startConnectionAttempt({
+      provider: "discord",
+      stateVerifier: stateHash(state),
+      access: connectionAccess(access),
+      lifetimeMinutes: CONNECTION_ATTEMPT_LIFETIME_MINUTES,
+      callbackOrigin: options.callbackOrigin,
+      configurationVersion: options.configurationVersion,
+      providerApplicationId: options.configuration.clientId,
+      configurationSnapshot: { provider: "discord", ...options.configuration },
+      expectedConfigurationVersion: null,
+      activateConfiguration: false,
+    });
+    return Response.json({ url: client.authorizationUrl(state) });
+  } catch (error) {
+    return connectionActionFailure(error, "discord", "start");
+  }
+}
+
+async function disconnectDiscordConnection(
+  options: DiscordConnectionOptions,
+  client: DiscordConnectionClient | undefined,
+  request: Request,
+): Promise<Response> {
+  const rejected = options.auth.rejectCookieMutation(request);
+  if (rejected !== undefined) return rejected;
+  try {
+    const access = await manageConnectionAccess(options.auth, options.database, request);
+    const disconnected = await options.database.disconnectConnection(
+      "discord",
+      requiredConnectionId(request),
+      connectionAccess(access),
+    );
+    if (disconnected.provider === "discord" && disconnected.guildId !== undefined) {
+      void client?.leaveGuild(disconnected.guildId).catch((error: unknown) => {
+        reportFailure(
+          error,
+          {
+            operation: "connection.disconnect.cleanup",
+            component: "connections",
+            provider: "discord",
+          },
+          { kind: "internal" },
+        );
+      });
+    }
+    return Response.json({ disconnected: true });
+  } catch (error) {
+    return connectionActionFailure(error, "discord", "disconnect");
+  }
 }
 
 async function completeAuthorization(
@@ -278,67 +310,82 @@ async function completeAuthorization(
     });
   }
   if (state === null || code === null || client === undefined) {
-    return connectionCallbackFailure({
+    return discordAuthorizationFailure(
       request,
-      error: new ProviderCallbackError("invalid_callback"),
-      provider: "discord",
-      phase: "authorization",
-      applicationBaseUrl: options.applicationBaseUrl,
-      returnRoute: CONNECTIONS_RETURN_ROUTE,
-    });
+      new ProviderCallbackError("invalid_callback"),
+      options.applicationBaseUrl,
+      CONNECTIONS_RETURN_ROUTE,
+    );
   }
   let returnRoute: string = CONNECTIONS_RETURN_ROUTE;
   let callbackOrigin = options.applicationBaseUrl;
   try {
     const access = await callbackConnectionAccess(options.auth, request);
-    const attempt = await options.database.readConnectionAttempt({
-      stateVerifier: stateHash(state),
-      phase: "discord_authorization",
-      access,
-    });
+    const attempt = await options.database.readConnectionAttempt(
+      discordAttemptInput(state, access),
+    );
     returnRoute = attempt.returnRoute;
     callbackOrigin = attempt.callbackOrigin;
     const guild = await client.verifyGuild(code);
     if (guild === undefined) {
-      await options.database.consumeConnectionAttempt({
-        stateVerifier: stateHash(state),
-        phase: "discord_authorization",
-        access,
-      });
-      return connectionCallbackFailure({
+      await options.database.consumeConnectionAttempt(discordAttemptInput(state, access));
+      return discordAuthorizationFailure(
         request,
-        error: new ProviderCallbackError("Discord did not verify the selected server"),
-        provider: "discord",
-        phase: "authorization",
-        applicationBaseUrl: callbackOrigin,
-        returnRoute: attempt.returnRoute,
-      });
+        new ProviderCallbackError("Discord did not verify the selected server"),
+        callbackOrigin,
+        attempt.returnRoute,
+      );
     }
-    await bindDiscord(options.database, state, access, guild, options.configuration.clientId);
+    await bindDiscord({
+      database: options.database,
+      state,
+      access,
+      guild,
+      providerApplicationId: options.configuration.clientId,
+    });
     return connectionResult(callbackOrigin, attempt.returnRoute, "discord_connected", "discord");
   } catch (error) {
-    return connectionCallbackFailure({
-      request,
-      error,
-      provider: "discord",
-      phase: "authorization",
-      applicationBaseUrl: callbackOrigin,
-      returnRoute,
-    });
+    return discordAuthorizationFailure(request, error, callbackOrigin, returnRoute);
   }
+}
+
+function discordAttemptInput(
+  state: string,
+  access: Awaited<ReturnType<typeof callbackConnectionAccess>>,
+): Parameters<Database["readConnectionAttempt"]>[0] {
+  return { stateVerifier: stateHash(state), phase: "discord_authorization", access };
+}
+
+function discordAuthorizationFailure(
+  request: Request,
+  error: unknown,
+  callbackOrigin: string,
+  returnRoute: string,
+): Response {
+  return connectionCallbackFailure({
+    request,
+    error,
+    provider: "discord",
+    phase: "authorization",
+    applicationBaseUrl: callbackOrigin,
+    returnRoute,
+  });
 }
 
 class ProviderCallbackError extends Error {
   readonly code = "invalidInput";
 }
 
-async function bindDiscord(
-  database: Database,
-  state: string,
-  access: Awaited<ReturnType<typeof callbackConnectionAccess>>,
-  guild: DiscordGuildIdentity,
-  providerApplicationId: string,
-): Promise<void> {
+interface BindDiscordOptions {
+  database: Database;
+  state: string;
+  access: Awaited<ReturnType<typeof callbackConnectionAccess>>;
+  guild: DiscordGuildIdentity;
+  providerApplicationId: string;
+}
+
+async function bindDiscord(options: BindDiscordOptions): Promise<void> {
+  const { database, state, access, guild, providerApplicationId } = options;
   await database.bindDiscordConnection({
     providerApplicationId,
     stateVerifier: stateHash(state),

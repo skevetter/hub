@@ -10,14 +10,16 @@ const scope = {
   allowedHumanProviderUserId: "owner",
 };
 
-function row(
-  id: string,
-  second: number,
-  type: "prompt" | "response",
-  userId: string,
-  body: string,
-  signal: "continue" | null = null,
-) {
+interface RowOptions {
+  id: string;
+  second: number;
+  type: "prompt" | "response";
+  userId: string;
+  body: string;
+  signal?: "continue" | null;
+}
+
+function row({ id, second, type, userId, body, signal = null }: RowOptions) {
   return {
     id,
     createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString(),
@@ -37,13 +39,44 @@ describe("pilot history transport", () => {
   it("preserves foreign and busy boundaries without forwarding their bodies", async () => {
     const olderRows = [
       {
-        ...row("attributed-response", 5, "response", scope.appUserId, "unproven app body"),
+        ...row({
+          id: "attributed-response",
+          second: 5,
+          type: "response",
+          userId: scope.appUserId,
+          body: "unproven app body",
+        }),
         promptAuthor: { id: "other-human" },
       },
-      row("busy-response", 4, "response", scope.appUserId, "busy body", "continue"),
-      row("app-response", 3, "response", scope.appUserId, "expected response"),
-      row("foreign-prompt", 2, "prompt", "other-human", "foreign prompt body"),
-      row("owner-prompt", 1, "prompt", scope.allowedHumanProviderUserId, "expected prompt"),
+      row({
+        id: "busy-response",
+        second: 4,
+        type: "response",
+        userId: scope.appUserId,
+        body: "busy body",
+        signal: "continue",
+      }),
+      row({
+        id: "app-response",
+        second: 3,
+        type: "response",
+        userId: scope.appUserId,
+        body: "expected response",
+      }),
+      row({
+        id: "foreign-prompt",
+        second: 2,
+        type: "prompt",
+        userId: "other-human",
+        body: "foreign prompt body",
+      }),
+      row({
+        id: "owner-prompt",
+        second: 1,
+        type: "prompt",
+        userId: scope.allowedHumanProviderUserId,
+        body: "expected prompt",
+      }),
     ];
     const before = "2026-01-01T00:00:06.000Z";
     const read = async <T>(

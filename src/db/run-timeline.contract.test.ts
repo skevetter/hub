@@ -344,15 +344,7 @@ describe.each(backends)("run timeline contract (%s)", (_name, open) => {
         "run_finished",
       ],
     );
-    const state = await database.readRunTimelineState(ORGANIZATION, run.id);
-    assert.equal(state?.droppedCount, 3);
-    assert.equal(state?.byteCount, 100);
-    assert.equal(state?.stepEndCount, 1);
-    assert.equal(state?.stepEndBytes, bytes(rows.filter((row) => row.kind === "step_finished")));
-    assert.equal(state?.sealedSeq, 53);
-    assert.equal(state?.eventCount, 53);
-    assert.ok(jsonbBytes(rows[50]!.data) <= 128);
-    assert.ok(jsonbBytes(rows[52]!.data) <= 512);
+    await verifyOrdinaryCapState(database, run, rows);
   });
 
   it("enforces the ordinary row byte bound before storage", async () => {
@@ -426,50 +418,10 @@ describe.each(backends)("run timeline contract (%s)", (_name, open) => {
         },
       }),
     );
-    const rows = await harness.reopen().listRunTimelineEvents(ORGANIZATION, run.id, PAGE);
-    const ordinary = rows.filter(
-      (row) => !["step_finished", "run_finished", "truncated"].includes(row.kind),
+    const { rows, ordinary, ends, finishes } = assertTimelineClassBounds(
+      await harness.reopen().listRunTimelineEvents(ORGANIZATION, run.id, PAGE),
     );
-    const ends = rows.filter((row) => row.kind === "step_finished");
-    const finishes = rows.filter((row) => row.kind === "run_finished");
-    const notices = rows.filter((row) => row.kind === "truncated");
-    assert.equal(ends.length, 100);
-    assert.equal(finishes.length, 1);
-    assert.equal(notices.length, 1);
-    assert.ok(ordinary.length < 5000);
-    assert.ok(bytes(ordinary) <= 196_608);
-    assert.ok(196_608 - bytes(ordinary) < jsonbBytes(ordinary[0]!.data));
-    assert.ok(bytes(ends) <= 51_200);
-    for (const row of rows) {
-      let limit = 1024;
-      if (row.kind === "truncated") limit = 128;
-      else if (row.kind === "step_finished" || row.kind === "run_finished") limit = 512;
-      assert.ok(jsonbBytes(row.data) <= limit, `${row.kind} exceeds its row limit`);
-    }
-    assert.ok(bytes(rows) <= 248_448);
-    const state = await harness.reopen().readRunTimelineState(ORGANIZATION, run.id);
-    assert.equal(state?.byteCount, bytes(ordinary));
-    assert.equal(state?.stepEndBytes, bytes(ends));
-    assert.equal(state?.stepEndCount, 100);
-    assert.equal(state?.stepRowsOmitted, 50);
-    assert.equal(state?.sealedSeq, rows.at(-1)?.seq);
-    assert.ok(state?.sealedAt instanceof Date);
-    assert.equal(state?.eventCount, rows.length);
-    assert.deepEqual(finishes[0]!.data["steps"], {
-      succeeded: 0,
-      failed: 0,
-      timed_out: 0,
-      skipped: 150,
-      not_run: 0,
-      total: 150,
-    });
-    assert.equal(finishes[0]!.data["stepRowsOmitted"], 50);
-    assert.equal(
-      (await database.listWorkflowStepRunsForTriggerRun(run.id)).filter(
-        (step) => step.status === "skipped",
-      ).length,
-      150,
-    );
+    await verifyTerminalClassState(harness, database, { run, rows, ordinary, ends, finishes });
   }, 120_000);
 
   it("keeps the first origin immutable and atomically seals against later appends", async () => {
@@ -500,14 +452,7 @@ describe.each(backends)("run timeline contract (%s)", (_name, open) => {
         { reason: "sealed" },
       );
       assert.deepEqual(await database.readRunTimelineState(ORGANIZATION, run.id), afterOrdinary);
-      assert.equal(
-        (await database.readRunTimelineState(ORGANIZATION, run.id))?.eventCount,
-        finish.seq,
-      );
-      assert.equal(
-        (await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE)).at(-1)?.kind,
-        "run_finished",
-      );
+      await verifySealedTimelineTail(database, run, finish);
     }
   });
 
@@ -1095,5 +1040,95 @@ async function settleProgress(database: Harness["database"], triggerRunId: strin
       version: lease.version,
       patch: { state: "finished" },
     }),
+  );
+}
+
+async function verifyOrdinaryCapState(
+  database: Store,
+  run: Awaited<ReturnType<typeof acceptedRun>>,
+  rows: RunTimelineEvent[],
+) {
+  const state = await database.readRunTimelineState(ORGANIZATION, run.id);
+  assert.equal(state?.droppedCount, 3);
+  assert.equal(state?.byteCount, 100);
+  assert.equal(state?.stepEndCount, 1);
+  assert.equal(state?.stepEndBytes, bytes(rows.filter((row) => row.kind === "step_finished")));
+  assert.equal(state?.sealedSeq, 53);
+  assert.equal(state?.eventCount, 53);
+  assert.ok(jsonbBytes(rows[50]!.data) <= 128);
+  assert.ok(jsonbBytes(rows[52]!.data) <= 512);
+}
+
+function assertTimelineClassBounds(rows: RunTimelineEvent[]) {
+  const ordinary = rows.filter(
+    (row) => !["step_finished", "run_finished", "truncated"].includes(row.kind),
+  );
+  const ends = rows.filter((row) => row.kind === "step_finished");
+  const finishes = rows.filter((row) => row.kind === "run_finished");
+  const notices = rows.filter((row) => row.kind === "truncated");
+  assert.equal(ends.length, 100);
+  assert.equal(finishes.length, 1);
+  assert.equal(notices.length, 1);
+  assert.ok(ordinary.length < 5000);
+  assert.ok(bytes(ordinary) <= 196_608);
+  assert.ok(196_608 - bytes(ordinary) < jsonbBytes(ordinary[0]!.data));
+  assert.ok(bytes(ends) <= 51_200);
+  for (const row of rows) {
+    let limit = 1024;
+    if (row.kind === "truncated") limit = 128;
+    else if (row.kind === "step_finished" || row.kind === "run_finished") limit = 512;
+    assert.ok(jsonbBytes(row.data) <= limit, `${row.kind} exceeds its row limit`);
+  }
+  assert.ok(bytes(rows) <= 248_448);
+  return { rows, ordinary, ends, finishes };
+}
+
+async function verifyTerminalClassState(
+  harness: Harness,
+  database: Store,
+  {
+    run,
+    rows,
+    ordinary,
+    ends,
+    finishes,
+  }: ReturnType<typeof assertTimelineClassBounds> & {
+    run: Awaited<ReturnType<typeof acceptedRun>>;
+  },
+) {
+  const state = await harness.reopen().readRunTimelineState(ORGANIZATION, run.id);
+  assert.equal(state?.byteCount, bytes(ordinary));
+  assert.equal(state?.stepEndBytes, bytes(ends));
+  assert.equal(state?.stepEndCount, 100);
+  assert.equal(state?.stepRowsOmitted, 50);
+  assert.equal(state?.sealedSeq, rows.at(-1)?.seq);
+  assert.ok(state?.sealedAt instanceof Date);
+  assert.equal(state?.eventCount, rows.length);
+  assert.deepEqual(finishes[0]!.data["steps"], {
+    succeeded: 0,
+    failed: 0,
+    timed_out: 0,
+    skipped: 150,
+    not_run: 0,
+    total: 150,
+  });
+  assert.equal(finishes[0]!.data["stepRowsOmitted"], 50);
+  assert.equal(
+    (await database.listWorkflowStepRunsForTriggerRun(run.id)).filter(
+      (step) => step.status === "skipped",
+    ).length,
+    150,
+  );
+}
+
+async function verifySealedTimelineTail(
+  database: Store,
+  run: Awaited<ReturnType<typeof acceptedRun>>,
+  finish: { seq: number },
+) {
+  assert.equal((await database.readRunTimelineState(ORGANIZATION, run.id))?.eventCount, finish.seq);
+  assert.equal(
+    (await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE)).at(-1)?.kind,
+    "run_finished",
   );
 }

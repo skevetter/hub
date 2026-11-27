@@ -223,6 +223,62 @@ describe("webhook key rollback cleanup", () => {
     return { keys: keys.rows, tokens: tokens.rows };
   }
 
+  function assertCleanedKeys(
+    cleaned: Awaited<ReturnType<typeof snapshot>>,
+    revoked: Awaited<ReturnType<typeof snapshot>>,
+    deletedIds: Set<string>,
+  ) {
+    assert.equal(cleaned.keys.length, revoked.keys.length - deletedIds.size);
+    for (const key of revoked.keys) {
+      const current = cleaned.keys.find((row) => row.id === key.id);
+      if (key.id === ids.only || key.id === ids.activeOnly) {
+        assert.equal(current, undefined);
+      } else if (key.id === ids.mixed) {
+        assert.deepEqual(current, {
+          ...key,
+          scopes: ["configuration:validate", "daemons:enroll"],
+        });
+      } else if (key.id === ids.activeMixed) {
+        assert.deepEqual(current, { ...key, scopes: ["runs:dispatch"] });
+      } else {
+        assert.deepEqual(current, key);
+      }
+    }
+  }
+
+  function assertCleanedTokens(
+    cleaned: Awaited<ReturnType<typeof snapshot>>,
+    revoked: Awaited<ReturnType<typeof snapshot>>,
+    deletedIds: Set<string>,
+  ) {
+    assert.equal(cleaned.tokens.length, revoked.tokens.length);
+    for (const token of revoked.tokens) {
+      const current = cleaned.tokens.find((row) => row.id === token.id);
+      assert.ok(current);
+      if (
+        token.issued_by_api_key_id === null ||
+        token.issued_by_api_key_id === ids.oldActive ||
+        token.issued_by_api_key_id === ids.oldRevoked ||
+        token.consumed_at !== null
+      ) {
+        assert.deepEqual(current, token);
+      } else {
+        assert.ok(current.expires_at <= token.expires_at);
+        assert.ok(current.expires_at.getTime() <= Date.now());
+        if (token.expires_at.getTime() === PAST.getTime()) {
+          assert.deepEqual(current.expires_at, token.expires_at);
+        }
+        assert.deepEqual(current, {
+          ...token,
+          expires_at: current.expires_at,
+          issued_by_api_key_id: deletedIds.has(token.issued_by_api_key_id)
+            ? null
+            : token.issued_by_api_key_id,
+        });
+      }
+    }
+  }
+
   it("refuses active keys, atomically cleans revoked keys and restores actual old-binary listing", async () => {
     const original = await snapshot();
     await assert.rejects(cleanup(), /Revoke every events:send API key/u);
@@ -261,48 +317,8 @@ describe("webhook key rollback cleanup", () => {
     await cleanup();
     const cleaned = await snapshot();
     const deletedIds = new Set<string>([ids.only, ids.activeOnly]);
-    assert.equal(cleaned.keys.length, revoked.keys.length - deletedIds.size);
-    for (const key of revoked.keys) {
-      const current = cleaned.keys.find((row) => row.id === key.id);
-      if (key.id === ids.only || key.id === ids.activeOnly) {
-        assert.equal(current, undefined);
-      } else if (key.id === ids.mixed) {
-        assert.deepEqual(current, {
-          ...key,
-          scopes: ["configuration:validate", "daemons:enroll"],
-        });
-      } else if (key.id === ids.activeMixed) {
-        assert.deepEqual(current, { ...key, scopes: ["runs:dispatch"] });
-      } else {
-        assert.deepEqual(current, key);
-      }
-    }
-    assert.equal(cleaned.tokens.length, revoked.tokens.length);
-    for (const token of revoked.tokens) {
-      const current = cleaned.tokens.find((row) => row.id === token.id);
-      assert.ok(current);
-      if (
-        token.issued_by_api_key_id === null ||
-        token.issued_by_api_key_id === ids.oldActive ||
-        token.issued_by_api_key_id === ids.oldRevoked ||
-        token.consumed_at !== null
-      ) {
-        assert.deepEqual(current, token);
-      } else {
-        assert.ok(current.expires_at <= token.expires_at);
-        assert.ok(current.expires_at.getTime() <= Date.now());
-        if (token.expires_at.getTime() === PAST.getTime()) {
-          assert.deepEqual(current.expires_at, token.expires_at);
-        }
-        assert.deepEqual(current, {
-          ...token,
-          expires_at: current.expires_at,
-          issued_by_api_key_id: deletedIds.has(token.issued_by_api_key_id)
-            ? null
-            : token.issued_by_api_key_id,
-        });
-      }
-    }
+    assertCleanedKeys(cleaned, revoked, deletedIds);
+    assertCleanedTokens(cleaned, revoked, deletedIds);
     for (const organizationId of [ORGANIZATION, OTHER_ORGANIZATION]) {
       const listed = await legacyKeys.list(organizationId);
       const expected = cleaned.keys.filter((key) => key.organization_id === organizationId);

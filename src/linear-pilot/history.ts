@@ -153,10 +153,25 @@ function readPreceding(scope: HistoryScope, current: VerifiedPilotPrompt, raw: u
     return undefined;
   const currentTime = Date.parse(current.createdAt);
   if (!Number.isFinite(currentTime)) return undefined;
+  return selectPreceding(scope, page.nodes, current, currentTime);
+}
+
+function invalidHistoryBody(scope: HistoryScope, row: Activity) {
+  return (
+    (isOwnerPrompt(scope, row) || isAppResponse(scope, row)) && typeof row.content.body !== "string"
+  );
+}
+
+function selectPreceding(
+  scope: HistoryScope,
+  nodes: unknown[],
+  current: VerifiedPilotPrompt,
+  currentTime: number,
+) {
   const rows: Activity[] = [];
   const seen = new Set<string>();
   let last = Infinity;
-  for (const rawRow of page.nodes) {
+  for (const rawRow of nodes) {
     const row = readActivity(scope, rawRow);
     if (!row || seen.has(row.id)) return undefined;
     const at = Date.parse(row.createdAt);
@@ -164,21 +179,13 @@ function readPreceding(scope: HistoryScope, current: VerifiedPilotPrompt, raw: u
     last = at;
     seen.add(row.id);
     if (row.id === current.activityId || at >= currentTime) continue;
-    if (
-      (isOwnerPrompt(scope, row) || isAppResponse(scope, row)) &&
-      typeof row.content.body !== "string"
-    )
-      return undefined;
+    if (invalidHistoryBody(scope, row)) return undefined;
     rows.push(row);
   }
   return rows;
 }
 
-function indexActivityIds(
-  scope: HistoryScope,
-  rows: Activity[],
-  idsFor?: (activityId: string) => PilotActivityIds,
-) {
+function indexResponses(scope: HistoryScope, rows: Activity[]) {
   const finalResponses = new Set<string>();
   const busyResponses = new Set<string>();
   for (const row of rows) {
@@ -192,27 +199,36 @@ function indexActivityIds(
       busyResponses.add(row.id);
     }
   }
+  return { finalResponses, busyResponses };
+}
+
+function indexActivityIds(
+  scope: HistoryScope,
+  rows: Activity[],
+  idsFor?: (activityId: string) => PilotActivityIds,
+) {
+  const { finalResponses, busyResponses } = indexResponses(scope, rows);
   const controlIds = new Set<string>();
   const busyPrompts = new Set<string>();
   const exactByPrompt = new Map<string, string>();
   const expectedResponses = new Set<string>();
-  if (idsFor) {
-    // The initial turn uses the native session ID as its interaction key.
-    controlIds.add(idsFor(scope.nativeSessionId).stop);
-    for (const row of rows) {
-      if (row.content.type !== "prompt" || !hasOwner(scope, row)) continue;
-      const ids = idsFor(row.id);
-      controlIds.add(ids.busy);
-      controlIds.add(ids.stop);
-      if (row.signal !== null) continue;
-      if (busyResponses.has(ids.busy)) busyPrompts.add(row.id);
-      if (finalResponses.has(ids.response)) {
-        exactByPrompt.set(row.id, ids.response);
-        expectedResponses.add(ids.response);
-      }
+  const index = { controlIds, busyPrompts, exactByPrompt, expectedResponses };
+  if (!idsFor) return index;
+  // The initial turn uses the native session ID as its interaction key.
+  controlIds.add(idsFor(scope.nativeSessionId).stop);
+  for (const row of rows) {
+    if (row.content.type !== "prompt" || !hasOwner(scope, row)) continue;
+    const ids = idsFor(row.id);
+    controlIds.add(ids.busy);
+    controlIds.add(ids.stop);
+    if (row.signal !== null) continue;
+    if (busyResponses.has(ids.busy)) busyPrompts.add(row.id);
+    if (finalResponses.has(ids.response)) {
+      exactByPrompt.set(row.id, ids.response);
+      expectedResponses.add(ids.response);
     }
   }
-  return { controlIds, busyPrompts, exactByPrompt, expectedResponses };
+  return index;
 }
 
 function collectExchanges(
@@ -227,37 +243,55 @@ function collectExchanges(
   );
   const exchanges: { owner: string; app: string }[] = [];
   const exact = new Map<string, Activity>();
+  const prompts = { busyPrompts, exactByPrompt, exact };
   let pending: Activity | null | undefined;
-  for (let i = rows.length - 1; i >= 0; i -= 1) {
-    const row = rows[i]!;
+  for (const row of rows.toReversed()) {
     if (row.content.type === "prompt") {
-      if (row.signal !== null) continue;
-      if (!isOwnerPrompt(scope, row)) {
-        pending = undefined;
-      } else if (!busyPrompts.has(row.id)) {
-        const responseId = exactByPrompt.get(row.id);
-        if (responseId) {
-          exact.set(responseId, row);
-          pending = undefined;
-        } else {
-          // A legacy response cannot identify which of two overlapping prompts it answered.
-          pending = pending === undefined ? row : null;
-        }
-      }
+      pending = recordOwnerPrompt(scope, row, prompts, pending);
     } else if (isAppResponse(scope, row) && !controlIds.has(row.id)) {
       const answered = expectedResponses.has(row.id) ? exact.get(row.id) : pending;
-      if (
-        answered &&
-        Date.parse(answered.createdAt) < Date.parse(row.createdAt) &&
-        typeof answered.content.body === "string" &&
-        typeof row.content.body === "string"
-      ) {
-        exchanges.push({ owner: answered.content.body, app: row.content.body });
-      }
+      const exchange = verifiedExchange(answered, row);
+      if (exchange) exchanges.push(exchange);
       pending = undefined;
     }
   }
   return exchanges;
+}
+
+interface PromptIndex {
+  busyPrompts: Set<string>;
+  exactByPrompt: Map<string, string>;
+  exact: Map<string, Activity>;
+}
+
+function recordOwnerPrompt(
+  scope: HistoryScope,
+  row: Activity,
+  { busyPrompts, exactByPrompt, exact }: PromptIndex,
+  pending: Activity | null | undefined,
+) {
+  if (row.signal !== null) return pending;
+  if (!isOwnerPrompt(scope, row)) return undefined;
+  if (busyPrompts.has(row.id)) return pending;
+  const responseId = exactByPrompt.get(row.id);
+  if (responseId) {
+    exact.set(responseId, row);
+    return undefined;
+  }
+  // A legacy response cannot identify which of two overlapping prompts it answered.
+  return pending === undefined ? row : null;
+}
+
+function verifiedExchange(answered: Activity | null | undefined, row: Activity) {
+  if (
+    answered &&
+    Date.parse(answered.createdAt) < Date.parse(row.createdAt) &&
+    typeof answered.content.body === "string" &&
+    typeof row.content.body === "string"
+  ) {
+    return { owner: answered.content.body, app: row.content.body };
+  }
+  return undefined;
 }
 
 function quote(text: string) {
@@ -303,21 +337,29 @@ function verifiedHistory(
   return omitId === undefined ? rows : rows.filter((row) => row.id !== omitId);
 }
 
-export function composePilotPrompt(
-  scope: HistoryScope,
-  message: PilotPrompt,
-  current: VerifiedPilotPrompt,
-  page: unknown,
+interface PilotPromptComposition {
+  scope: HistoryScope;
+  message: PilotPrompt;
+  current: VerifiedPilotPrompt;
+  page: unknown;
   context: HistoryProof & {
     secrets: readonly string[];
     idsFor?: (activityId: string) => PilotActivityIds;
-  },
-): string | undefined {
+  };
+}
+
+export function composePilotPrompt({
+  scope,
+  message,
+  current,
+  page,
+  context,
+}: PilotPromptComposition): string | undefined {
   if (current.activityId !== message.activityId || !validMessage(message.body)) return undefined;
   const rows = verifiedHistory(scope, current, page, context);
   if (!rows) return undefined;
   const request = OWNER + quote(message.body);
-  let remaining = Math.min(
+  const remaining = Math.min(
     MAX_HISTORY_BYTES - HISTORY_FRAME_BYTES,
     MAX_COMMAND_BYTES - HISTORY_FRAME_BYTES - Buffer.byteLength(GUIDANCE + request),
   );
@@ -326,34 +368,59 @@ export function composePilotPrompt(
   const exchanges = collectExchanges(scope, rows, context.idsFor);
   const { secrets } = context;
   const redactor = createAssistantTextRedactor(secrets);
-  const render = (source: string, maxQuotedBytes: number) => {
-    const ceiling = Math.min(source.length, MAX_REPLY_INPUT_CHARS);
-    const end = (source.codePointAt(ceiling - 1) ?? 0) > 0xffff ? ceiling - 1 : ceiling;
-    const raw = source.slice(0, end);
-    const truncated = end < source.length;
-    // A history marker can open an HTML block that hides the lines below it.
-    const text =
-      raw.search(HISTORY_MARKER) === -1
-        ? raw
-        : redactor.redact([raw], truncated)[0]!.replace(HISTORY_MARKER, "\\$&");
-    const rendered = formatRunReply({ text, truncated }, secrets);
-    if (!rendered) return undefined;
-    const whole = quote(rendered);
-    const quoted =
-      Buffer.byteLength(whole) <= maxQuotedBytes ? whole : quotedPrefix(rendered, maxQuotedBytes);
-    const decoded: unknown = JSON.parse(quoted);
-    // Formatting and clipping can reshape a credential. Drop the exchange rather than re-escaping it.
-    if (
-      typeof decoded === "string" &&
-      redactor.redact([decoded], false)[0] === decoded &&
-      redactor.redact([quoted], false)[0] === quoted
-    )
-      return quoted;
-    return undefined;
-  };
+  const encoded = encodeHistory(exchanges, remaining, (source, limit) =>
+    renderHistoryText(source, limit, secrets, redactor),
+  );
+  const result = `${GUIDANCE}${OPEN}[${encoded.toReversed().join(",")}]${CLOSE}${request}`;
+  return validMessage(result) ? result : undefined;
+}
+
+type HistoryRedactor = ReturnType<typeof createAssistantTextRedactor>;
+
+function escapeHistoryMarkers(raw: string, truncated: boolean, redactor: HistoryRedactor) {
+  if (raw.search(HISTORY_MARKER) === -1) return raw;
+  const redacted = redactor.redact([raw], truncated)[0];
+  if (redacted === undefined)
+    throw new TypeError("Cannot read properties of undefined (reading 'replace')");
+  return redacted.replace(HISTORY_MARKER, "\\$&");
+}
+
+function renderHistoryText(
+  source: string,
+  maxQuotedBytes: number,
+  secrets: readonly string[],
+  redactor: HistoryRedactor,
+) {
+  const ceiling = Math.min(source.length, MAX_REPLY_INPUT_CHARS);
+  const end = (source.codePointAt(ceiling - 1) ?? 0) > 0xffff ? ceiling - 1 : ceiling;
+  const raw = source.slice(0, end);
+  const truncated = end < source.length;
+  // A history marker can open an HTML block that hides the lines below it.
+  const text = escapeHistoryMarkers(raw, truncated, redactor);
+  const rendered = formatRunReply({ text, truncated }, secrets);
+  if (!rendered) return undefined;
+  const whole = quote(rendered);
+  const quoted =
+    Buffer.byteLength(whole) <= maxQuotedBytes ? whole : quotedPrefix(rendered, maxQuotedBytes);
+  const decoded: unknown = JSON.parse(quoted);
+  // Formatting and clipping can reshape a credential. Drop the exchange rather than re-escaping it.
+  if (
+    typeof decoded === "string" &&
+    redactor.redact([decoded], false)[0] === decoded &&
+    redactor.redact([quoted], false)[0] === quoted
+  )
+    return quoted;
+  return undefined;
+}
+
+function encodeHistory(
+  exchanges: { owner: string; app: string }[],
+  remaining: number,
+  render: (source: string, maxQuotedBytes: number) => string | undefined,
+) {
   const encoded: string[] = [];
-  for (let i = exchanges.length - 1; i >= 0 && encoded.length < MAX_EXCHANGES; i -= 1) {
-    const source = exchanges[i]!;
+  for (const source of exchanges.toReversed()) {
+    if (encoded.length >= MAX_EXCHANGES) break;
     const separator = encoded.length === 0 ? 0 : 1;
     const available = remaining - separator - PAIR_FRAME_BYTES;
     const minimum = Buffer.byteLength(quote(CLIPPED)) + 8;
@@ -368,6 +435,5 @@ export function composePilotPrompt(
     encoded.push(pair);
     remaining -= bytes;
   }
-  const result = `${GUIDANCE}${OPEN}[${encoded.toReversed().join(",")}]${CLOSE}${request}`;
-  return validMessage(result) ? result : undefined;
+  return encoded;
 }

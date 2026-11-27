@@ -6,6 +6,8 @@ import { enrollTestDaemon, TEST_DAEMON_ID } from "../test-utils/project-configur
 import {
   createTimelinePostgresHarness,
   TIMELINE_ORGANIZATION,
+  type TimelinePostgresConnection,
+  type TimelinePostgresHarness,
 } from "./test-utils/run-timeline-postgres.js";
 
 describe("PostgreSQL run cancellation", () => {
@@ -49,11 +51,7 @@ describe("PostgreSQL run cancellation", () => {
     assert.equal(repeat?.run.status, "canceled");
     assert.equal(await pg.database.claimWorkflowWakeup(new Date(), 1000), undefined);
 
-    const finished = await pg.createRun();
-    await finish.database.succeedTriggerRun(finished.id);
-    const afterFinish = await stop.database.cancelTriggerRun(finished.organizationId, finished.id);
-    assert.equal(afterFinish?.transitioned, false);
-    assert.equal(afterFinish?.run.status, "succeeded");
+    await verifyStopAfterFinish(pg, stop, finish);
   });
 
   it("refuses Stop when the confirmed attached run count changed", async () => {
@@ -182,3 +180,15 @@ describe("PostgreSQL run cancellation", () => {
     );
   });
 });
+
+async function verifyStopAfterFinish(
+  pg: TimelinePostgresHarness,
+  stop: TimelinePostgresConnection,
+  finish: TimelinePostgresConnection,
+) {
+  const finished = await pg.createRun();
+  await finish.database.succeedTriggerRun(finished.id);
+  const afterFinish = await stop.database.cancelTriggerRun(finished.organizationId, finished.id);
+  assert.equal(afterFinish?.transitioned, false);
+  assert.equal(afterFinish?.run.status, "succeeded");
+}

@@ -163,16 +163,26 @@ export async function readPilotPriorPage(
     historyPage,
   );
   const cutoff = Date.parse(parsed.data);
+  if (!isOrderedPriorPage(page.activities.nodes, cutoff)) return undefined;
+  if (!matchesSession(page, scope) || page.activities.pageInfo.hasPreviousPage) return undefined;
+  redactForeignBodies(page.activities.nodes, scope);
+  return page;
+}
+
+function isOrderedPriorPage(rows: z.infer<typeof activity>[], cutoff: number) {
   const seen = new Set<string>();
   let previousTime = cutoff;
-  for (const row of page.activities.nodes) {
+  for (const row of rows) {
     const time = Date.parse(row.createdAt);
-    if (time >= cutoff || time > previousTime || seen.has(row.id)) return undefined;
+    if (time >= cutoff || time > previousTime || seen.has(row.id)) return false;
     previousTime = time;
     seen.add(row.id);
   }
-  if (!matchesSession(page, scope) || page.activities.pageInfo.hasPreviousPage) return undefined;
-  for (const row of page.activities.nodes) {
+  return true;
+}
+
+function redactForeignBodies(rows: z.infer<typeof activity>[], scope: PilotHistoryScope) {
+  for (const row of rows) {
     const canUseBody =
       isOwnerPrompt(row, scope) ||
       (row.content.type === "response" &&
@@ -182,5 +192,4 @@ export async function readPilotPriorPage(
     // Other rows still delimit exchanges.
     if (!canUseBody) row.content.body = "";
   }
-  return page;
 }

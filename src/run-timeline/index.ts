@@ -41,6 +41,26 @@ export interface RunTimelineOptions {
   reportFailure?: (error: unknown, operation: string, scope?: TimelineRunScope) => void;
 }
 
+function stepAgentSummary(agent: { provider: string; mode?: string | undefined } | undefined): {
+  agent?: { provider: string; mode?: string };
+} {
+  return agent === undefined
+    ? {}
+    : {
+        agent: {
+          provider: agent.provider,
+          ...(agent.mode === undefined ? {} : { mode: agent.mode }),
+        },
+      };
+}
+
+function earliestStart(steps: readonly WorkflowStepRunRecord[], fallback: () => Date): Date {
+  let at: Date | undefined;
+  for (const step of steps)
+    if (step.startedAt !== null && (at === undefined || step.startedAt < at)) at = step.startedAt;
+  return at ?? fallback();
+}
+
 export class RunTimeline implements TimelineQueue {
   private readonly queue: RunTimelineQueue;
   private readonly executions = new Map<string, ExecutionCapture>();
@@ -97,6 +117,21 @@ export class RunTimeline implements TimelineQueue {
     this.executions.delete(executionId);
   }
 
+  private acceptsAgentEvent(
+    capture: ExecutionCapture | undefined,
+    source: "live" | "snapshot",
+    event: DaemonAgentStreamEvent,
+  ): capture is ExecutionCapture {
+    return (
+      !this.closed &&
+      !this.stopping &&
+      capture !== undefined &&
+      !capture.disabled &&
+      source !== "snapshot" &&
+      event["source"] !== "snapshot"
+    );
+  }
+
   observeAgentEvent(
     executionId: string,
     event: DaemonAgentStreamEvent,
@@ -104,33 +139,29 @@ export class RunTimeline implements TimelineQueue {
     source: "live" | "snapshot" = "live",
   ): void {
     const capture = this.executions.get(executionId);
-    if (
-      this.closed ||
-      this.stopping ||
-      capture === undefined ||
-      capture.disabled ||
-      source === "snapshot" ||
-      event["source"] === "snapshot"
-    )
-      return;
+    if (!this.acceptsAgentEvent(capture, source, event)) return;
     try {
       const projected = projectTimelineEvent({ kind: "agent_event", event }, this.options.scrub);
       if (projected === undefined) return;
       const key = timelineDedupeKey(projected.kind, "", projected.data);
       if (key !== undefined && capture.seen.has(key)) return;
       const item = { event: projected, at: observedAt, key };
-      if (capture.scope === undefined) {
-        if (capture.pending.length >= 200) {
-          capture.dropped += 1;
-          return;
-        }
-        capture.pending.push(item);
-      } else if (!this.queue.enqueue(capture.scope, () => this.appendAgentEvent(capture, item)))
-        return;
+      if (!this.queueAgentEvent(capture, item)) return;
       if (key !== undefined) capture.seen.add(key);
     } catch (error) {
       this.report(error, "run.timeline.capture", capture.scope);
     }
+  }
+
+  private queueAgentEvent(capture: ExecutionCapture, item: PendingAgentEvent): boolean {
+    if (capture.scope !== undefined)
+      return this.queue.enqueue(capture.scope, () => this.appendAgentEvent(capture, item));
+    if (capture.pending.length >= 200) {
+      capture.dropped += 1;
+      return false;
+    }
+    capture.pending.push(item);
+    return true;
   }
 
   recordRunStart(scope: TimelineRunScope): void {
@@ -166,14 +197,7 @@ export class RunTimeline implements TimelineQueue {
       await this.append(scope, stepId, step.startedAt, {
         kind: "step_started",
         type: step.agentExecutionId === null ? "script" : "agent",
-        ...(agent === undefined
-          ? {}
-          : {
-              agent: {
-                provider: agent.provider,
-                ...(agent.mode === undefined ? {} : { mode: agent.mode }),
-              },
-            }),
+        ...stepAgentSummary(agent),
       });
     });
   }
@@ -310,10 +334,7 @@ export class RunTimeline implements TimelineQueue {
     )
       return undefined;
     const steps = await this.database.listWorkflowStepRunsForTriggerRun(scope.triggerRunId);
-    let at: Date | undefined;
-    for (const step of steps)
-      if (step.startedAt !== null && (at === undefined || step.startedAt < at)) at = step.startedAt;
-    return { run, steps, at: at ?? run.createdAt };
+    return { run, steps, at: earliestStart(steps, () => run.createdAt) };
   }
 
   private async append(
