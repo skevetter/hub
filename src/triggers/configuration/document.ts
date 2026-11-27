@@ -7,10 +7,25 @@ export interface TriggerDocumentIssue {
   message: string;
 }
 
+export interface TriggerDocumentErrorOptions {
+  /** "upstreamUnavailable" marks a refusal the author did not cause, such as a daemon check that failed. */
+  code?: "invalidInput" | "upstreamUnavailable";
+  cause?: unknown;
+}
+
 export class TriggerDocumentError extends Error {
-  constructor(readonly issues: readonly TriggerDocumentIssue[]) {
-    super(issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("\n"));
+  readonly code: "invalidInput" | "upstreamUnavailable";
+
+  constructor(
+    readonly issues: readonly TriggerDocumentIssue[],
+    options: TriggerDocumentErrorOptions = {},
+  ) {
+    super(
+      issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("\n"),
+      options.cause === undefined ? undefined : { cause: options.cause },
+    );
     this.name = "TriggerDocumentError";
+    this.code = options.code ?? "invalidInput";
   }
 }
 
