@@ -293,7 +293,7 @@ jobs:
             da35e666827cbb1e6ca98b18b7969657b9f186467bfebfa25e730aac527c36f8 "$zizmor" |
             sha256sum --check --strict
           tar -xzf "$actionlint" actionlint
-          tar -xzf "$zizmor" zizmor
+          tar -xzf "$zizmor" ./zizmor
       - name: Lint workflows
         run: |
           "$RUNNER_TEMP/actionlint"
