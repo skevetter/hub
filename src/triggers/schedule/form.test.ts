@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { defaultDraft, projectRecurrence, ruleFromDraft } from "./form.js";
+import { defaultDraft, describeRecurrence, projectRecurrence, ruleFromDraft } from "./form.js";
 import { DEFAULT_RECURRENCE, nextOccurrence, RecurrenceSchema } from "./recurrence.js";
 
 it("round-trips exact paired times without extra hour/minute combinations", () => {
@@ -13,8 +13,10 @@ it("round-trips exact paired times without extra hour/minute combinations", () =
   expect(projectRecurrence(value)).toEqual(draft);
   let after = new Date("2026-09-07T00:00:00Z");
   const actual = Array.from({ length: 5 }, () => {
-    after = nextOccurrence(RecurrenceSchema.parse(value), after)!;
-    return after.toISOString();
+    const next = nextOccurrence(RecurrenceSchema.parse(value), after);
+    if (next === null) throw new Error("Expected another occurrence.");
+    after = next;
+    return next.toISOString();
   });
   expect(actual).toEqual([
     "2026-09-07T08:15:00.000Z",
@@ -66,40 +68,38 @@ it("rejects incomplete or duplicate controls before saving", () => {
 });
 
 it.each([
-  [
-    "UTC",
-    "2026-09-09T07:00:00Z",
-    "2026-09-09T07:01:00.000Z",
-    "2026-09-09T08:00:00.000Z",
-    "2026-09-09T08:00:00.000Z",
-  ],
-  [
-    "Pacific/Honolulu",
-    "2026-09-09T09:00:00Z",
-    "2026-09-09T09:01:00.000Z",
-    "2026-09-09T10:00:00.000Z",
-    "2026-09-09T18:00:00.000Z",
-  ],
-  [
-    "Asia/Tokyo",
-    "2026-09-08T22:00:00Z",
-    "2026-09-08T22:01:00.000Z",
-    "2026-09-08T23:00:00.000Z",
-    "2026-09-08T23:00:00.000Z",
-  ],
+  {
+    timezone: "UTC",
+    now: "2026-09-09T07:00:00Z",
+    minute: "2026-09-09T07:01:00.000Z",
+    hour: "2026-09-09T08:00:00.000Z",
+    daily: "2026-09-09T08:00:00.000Z",
+  },
+  {
+    timezone: "Pacific/Honolulu",
+    now: "2026-09-09T09:00:00Z",
+    minute: "2026-09-09T09:01:00.000Z",
+    hour: "2026-09-09T10:00:00.000Z",
+    daily: "2026-09-09T18:00:00.000Z",
+  },
+  {
+    timezone: "Asia/Tokyo",
+    now: "2026-09-08T22:00:00Z",
+    minute: "2026-09-08T22:01:00.000Z",
+    hour: "2026-09-08T23:00:00.000Z",
+    daily: "2026-09-08T23:00:00.000Z",
+  },
 ])(
-  "starts new presets at the next matching local time in %s",
-  (timezone, now, minute, hour, daily) => {
+  "starts new presets at the next matching local time in $timezone",
+  ({ timezone, now, minute, hour, daily }) => {
+    const preset = projectRecurrence(DEFAULT_RECURRENCE);
+    if (preset === null) throw new Error("Expected the default preset.");
     for (const [frequency, expected] of [
       ["MINUTELY", minute],
       ["HOURLY", hour],
       ["DAILY", daily],
-    ]) {
-      const draft = {
-        ...projectRecurrence(DEFAULT_RECURRENCE)!,
-        frequency: frequency!,
-        times: ["08:00"],
-      };
+    ] as const) {
+      const draft = { ...preset, frequency, times: ["08:00"] };
       const recurrence = { ...DEFAULT_RECURRENCE, timezone, rule: ruleFromDraft(draft) };
       expect(nextOccurrence(recurrence, new Date(now))?.toISOString()).toBe(expected);
     }
@@ -116,4 +116,35 @@ it("keeps the default daily time and explicitly authored future anchors", () => 
   expect(nextOccurrence(custom, new Date("2026-09-09T07:00:00Z"))?.toISOString()).toBe(
     "2026-09-10T12:00:00.000Z",
   );
+});
+
+it("uses the anchor weekday when BYDAY is missing and orders labels by weekday", () => {
+  const value = { ...DEFAULT_RECURRENCE, start: "2026-09-09T09:00:00", rule: "FREQ=WEEKLY" };
+  expect(projectRecurrence(value)?.days).toEqual(["WE"]);
+  expect(projectRecurrence({ ...value, start: "invalid" })).toBeNull();
+  expect(describeRecurrence({ ...value, rule: `${value.rule};BYDAY=SU,MO,FR` })).toBe(
+    "Every Mon, Fri, Sun at 09:00 (UTC)",
+  );
+});
+
+it.each([
+  "",
+  "INTERVAL=1",
+  "FREQ=DAILY;BYDAY=MO",
+  "FREQ=WEEKLY;BYDAY=WE,\u00e9",
+  "FREQ=DAILY;BYSECOND=30",
+  "FREQ=DAILY;BYHOUR=8,9;BYSETPOS=-1",
+  `FREQ=DAILY;BYHOUR=${Array.from({ length: 25 }, (_, index) => index).join(",")}`,
+])("leaves unrepresentable rule %# unchanged in the description", (rule) => {
+  const value = { ...DEFAULT_RECURRENCE, rule };
+  expect(projectRecurrence(value)).toBeNull();
+  expect(describeRecurrence(value)).toBe(`${rule} (UTC)`);
+});
+
+it("rejects seeded seconds unless the rule overrides them", () => {
+  const value = { ...DEFAULT_RECURRENCE, start: "2026-09-09T09:00:30", rule: "FREQ=DAILY" };
+  expect(projectRecurrence(value)).toBeNull();
+  expect(projectRecurrence({ ...value, rule: `${value.rule};BYSECOND=0` })?.times).toEqual([
+    "09:00",
+  ]);
 });
