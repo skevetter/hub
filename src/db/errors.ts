@@ -36,6 +36,26 @@ export class ConnectionAttemptUnavailableError extends Error {
   }
 }
 
+/** A name the author chose is already taken. `code` lets the failure boundary report it as a conflict. */
+export class TriggerNameConflictError extends Error {
+  readonly code = "conflict";
+
+  constructor() {
+    super("trigger name already exists");
+    this.name = "TriggerNameConflictError";
+  }
+}
+
+const UniqueViolationSchema = z
+  .object({ code: z.string(), constraint: z.string().optional() })
+  .loose();
+
+/** Matches by constraint name, never by message text. */
+export function isUniqueViolation(error: unknown, constraint: string): boolean {
+  const parsed = UniqueViolationSchema.safeParse(error);
+  return parsed.success && parsed.data.code === "23505" && parsed.data.constraint === constraint;
+}
+
 export function isDatabaseUnavailableError(error: unknown): error is DatabaseUnavailableError {
   return error instanceof DatabaseUnavailableError;
 }
