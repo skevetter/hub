@@ -1157,6 +1157,19 @@ export class DaemonDispatchLifecycle {
     );
     this.executionSubscriptions.get(executionId)?.();
     this.executionSubscriptions.set(executionId, unsubscribe);
+    await this.releaseIfArchiveFinished(executionId, unsubscribe);
+  }
+
+  // The archive can finish while watch() is still pending, so there was nothing to release then.
+  private async releaseIfArchiveFinished(
+    executionId: string,
+    unsubscribe: () => void,
+  ): Promise<void> {
+    const current = await this.options.database.findAgentExecutionById(executionId);
+    if (current === undefined || current.hubActionCompletedAt === null) return;
+    if (this.executionSubscriptions.get(executionId) === unsubscribe) {
+      this.releaseExecutionResources(executionId);
+    }
   }
 
   async failPendingExecutionsForDisconnectedMachine(
