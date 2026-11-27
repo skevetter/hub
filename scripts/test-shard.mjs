@@ -22,13 +22,24 @@ const SENSITIVE_NAME =
   /TOKEN|SECRET|KEY|PASS|CREDENTIAL|PRIVATE|AUTH|COOKIE|SESSION|URL|URI|DSN|JWT|BEARER|SALT|SIG|CONN|WEBHOOK|CERT|SEED/iu;
 const PUBLIC_NAMES = new Set(["GITHUB_SERVER_URL", "GITHUB_API_URL", "GITHUB_GRAPHQL_URL"]);
 const HOST_NAMES = ["HOSTNAME", "RUNNER_NAME", "COMPUTERNAME"];
+// Vitest's JSON report keeps only error.message for a suite that fails to start, so the log's
+// typed header has to corroborate these bare messages.
+const BARE_START_TIMEOUTS = new Set([
+  "database query timed out",
+  "Connection terminated due to connection timeout",
+  "timeout exceeded when trying to connect",
+  "the database system is starting up",
+]);
+const CONNECTION_TIMEOUT = /^Error: Connection terminated due to connection timeout$/u;
+// pg-pool attaches the error that ended the client as the cause of a connection timeout.
+const CONNECTION_TIMEOUT_CAUSE = /^Caused by: Error: Connection terminated unexpectedly$/u;
 const START_TIMEOUT_PATTERNS = [
   /^(?:\w*Error: )?Port \d+\/tcp not bound after \d+ ?ms\b/u,
   /^(?:\w*Error: )?Hook timed out in \d+ ?ms\b/u,
   /^DatabaseUnavailableError: database query timed out$/u,
   /^Error: Connection terminated due to connection timeout$/u,
   /^Error: timeout exceeded when trying to connect$/u,
-  /^(?:\w*[Ee]rror: )?the database system is starting up$/u,
+  /^\w*[Ee]rror: the database system is starting up$/u,
 ];
 
 /** A bad command line or environment: the process exits 2 instead of 1. */
@@ -195,9 +206,23 @@ function reportedFailures(file) {
   const assertions = file.assertionResults ?? [];
   const failed = assertions.filter(({ status }) => status === "failed");
   const texts = failed.map(({ failureMessages }) => (failureMessages ?? []).join("\n"));
+  const unexplained = texts.some((text) => text.trim() === "");
   const fileMessage = typeof file.message === "string" ? file.message : "";
-  if (fileMessage.trim() !== "") texts.push(fileMessage);
-  return { texts, unexplained: failed.some((_, index) => texts[index].trim() === "") };
+  return { texts, fileMessage, unexplained };
+}
+
+/** Drops each expected cause line that follows the connection timeout it explains. */
+function withoutExpectedCauses(headers) {
+  return headers.filter(
+    (header, index) =>
+      !(CONNECTION_TIMEOUT_CAUSE.test(header) && CONNECTION_TIMEOUT.test(headers[index - 1] ?? "")),
+  );
+}
+
+function fileMessageHeaders(fileMessage, logHeaders) {
+  if (fileMessage.trim() === "") return [];
+  const corroborated = logHeaders.length > 0 && BARE_START_TIMEOUTS.has(firstLine(fileMessage));
+  return corroborated ? [] : [fileMessage];
 }
 
 /**
@@ -205,10 +230,14 @@ function reportedFailures(file) {
  * Vitest's JSON report omits hook failures, so the log blocks count as evidence too.
  */
 export function startTimeoutFailure(file, logHeaders = []) {
-  const { texts, unexplained } = reportedFailures(file);
+  const { texts, fileMessage, unexplained } = reportedFailures(file);
   const pending = (file.assertionResults ?? []).some(({ status }) => status === "pending");
   if (pending || unexplained) return false;
-  const headers = [...texts, ...logHeaders];
+  const headers = withoutExpectedCauses([
+    ...texts,
+    ...fileMessageHeaders(fileMessage, logHeaders),
+    ...logHeaders,
+  ]);
   return headers.length > 0 && headers.every(isStartTimeoutHeader);
 }
 

@@ -297,17 +297,65 @@ test("a suite that cannot start on a slow database is retried", () => {
   assert.deepEqual(retryableFiles(report, [file], { root }), []);
 });
 
-test("a suite that fails to load is retried on a database start timeout in its message", () => {
-  const messages = [
-    "DatabaseUnavailableError: database query timed out\n    at Timeout.<anonymous> (pool.ts:112:27)",
-    "Error: Connection terminated due to connection timeout",
-    "Error: timeout exceeded when trying to connect",
-    "error: the database system is starting up",
+function failureLog(file, header, ...rest) {
+  return [" FAIL  " + file + " [ " + file + " ]", header, " \u276F " + file + ":2:7", ...rest].join(
+    "\n",
+  );
+}
+
+test("a suite that fails to load is retried when the log names the start timeout", () => {
+  const typed = [
+    ["database query timed out", "DatabaseUnavailableError: database query timed out"],
+    ["timeout exceeded when trying to connect", "Error: timeout exceeded when trying to connect"],
+    ["the database system is starting up", "error: the database system is starting up"],
+    [
+      "Connection terminated due to connection timeout",
+      "Error: Connection terminated due to connection timeout",
+    ],
   ];
-  for (const message of messages) {
+  for (const [message, header] of typed) {
     const report = reportOf(suiteFailure("a.test.ts", message, []));
-    assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root }), ["a.test.ts"], message);
+    const headers = logFailureHeaders(failureLog("a.test.ts", header));
+    assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root, headers }), ["a.test.ts"]);
+    assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root }), [], message);
   }
+});
+
+test("a bare JSON message needs a matching log header", () => {
+  const report = reportOf(suiteFailure("a.test.ts", "database query timed out", []));
+  const other = logFailureHeaders(failureLog("a.test.ts", "AssertionError: nope"));
+  assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root, headers: other }), []);
+  const typed = reportOf(
+    suiteFailure("a.test.ts", "DatabaseUnavailableError: database query timed out\n  at x", []),
+  );
+  assert.deepEqual(retryableFiles(typed, ["a.test.ts"], { root }), ["a.test.ts"]);
+});
+
+test("the cause pg-pool attaches to a connection timeout is part of that failure", () => {
+  const timeout = "Error: Connection terminated due to connection timeout";
+  const log = (cause) =>
+    [
+      " FAIL  a.test.ts > hook cause",
+      timeout,
+      " \u276F a.test.ts:4:11",
+      "      3|   beforeAll(() => {",
+      "",
+      cause,
+      " \u276F a.test.ts:5:14",
+      "",
+    ].join("\n");
+  const report = reportOf(
+    suiteFailure("a.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  const retryable = (cause) =>
+    retryableFiles(report, ["a.test.ts"], { root, headers: logFailureHeaders(log(cause)) });
+  assert.deepEqual(retryable("Caused by: Error: Connection terminated unexpectedly"), [
+    "a.test.ts",
+  ]);
+  assert.deepEqual(retryable("Caused by: Error: connect ECONNREFUSED 127.0.0.1:5432"), []);
+  const alone = "Caused by: Error: Connection terminated unexpectedly";
+  const standalone = logFailureHeaders(` FAIL  a.test.ts > s\nAssertionError: nope\n${alone}\n`);
+  assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root, headers: standalone }), []);
 });
 
 test("other database errors and a mixed failure are not retried", () => {

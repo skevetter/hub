@@ -76,8 +76,11 @@ A file is retried once when every failure in it starts with `Port <n>/tcp not bo
 `Hook timed out in <n>ms` or a database start timeout: `DatabaseUnavailableError: database query
 timed out`, `Connection terminated due to connection timeout`, `timeout exceeded when trying to
 connect` or `the database system is starting up`. This covers a suite that cannot start as well as
-a failing test. Vitest's JSON report leaves out hook failures, so the runner also reads the first
-error line of each failure block in `vitest.log`. Each such file runs alone in its own
+a failing test, including a query deadline hit inside a test. Vitest's JSON report leaves out hook
+failures and keeps only the bare message of a suite that fails to start, so the runner also reads
+the first error line of each failure block in `vitest.log`. A bare message counts only when the log
+names the same timeout. The `Caused by: Error: Connection terminated unexpectedly` line that follows
+a connection timeout belongs to it; any other cause blocks the retry. Each such file runs alone in its own
 Vitest process. Each retry prints a `::warning::` line (or `::error::` if it fails again) and shows
 in the step summary. Nothing is retried when the shard has any other failure, a process error, an
 incomplete report or an unhandled error. More than 5 candidate files in one shard fails the shard
