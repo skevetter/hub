@@ -156,6 +156,23 @@ export class TriggerSteps {
     await this.page.setViewportSize(VIEWPORTS[0]);
   }
 
+  /** The row's Edit button and every step's menu button, as drawn at the current width. */
+  async rowControlSizes(): Promise<{ name: string; width: number; height: number }[]> {
+    const controls = this.page
+      .locator("ol")
+      .getByRole("button", { name: /^(Edit step|Actions for step) \d+$/u });
+    return controls.evaluateAll((elements) =>
+      elements.map((element) => {
+        const box = element.getBoundingClientRect();
+        return {
+          name: element.getAttribute("aria-label") ?? "",
+          width: Math.round(box.width),
+          height: Math.round(box.height),
+        };
+      }),
+    );
+  }
+
   /** A viewport tall enough to hold the list, so fixed bars are drawn once instead of per slice. */
   private async shoot(directory: string, name: string, viewport: { width: number }) {
     await this.page.setViewportSize({ width: viewport.width, height: 6000 });

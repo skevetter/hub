@@ -74,6 +74,15 @@ describe("segmented control semantics", () => {
     assert.equal(markup.match(/tabindex="0"/gu)?.length, 1);
     assert.equal(markup.match(/tabindex="-1"/gu)?.length, MODES.length - 1);
   });
+
+  it("gives every segment a 44 px target on a phone", () => {
+    const markup = renderToStaticMarkup(
+      <SegmentedControl label="Editor mode" value="yaml" options={MODES} onChange={NOOP} />,
+    );
+
+    assert.equal(markup.match(/max-md:min-h-11/gu)?.length, MODES.length);
+    assert.equal(markup.match(/max-md:min-w-11/gu)?.length, MODES.length);
+  });
 });
 
 const WITH_LUCIDE_ICON: readonly SegmentedOption[] = [
