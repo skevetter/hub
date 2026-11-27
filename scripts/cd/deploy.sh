@@ -47,11 +47,15 @@ rollback_release() {
   smoke "$to" || echo "Rollback smoke failed" >&2
 }
 
+pause_failed() {
+  logged pause cd-failed >/dev/null
+}
+
 fail_deploy() {
-  if [[ "$1" == rollback && "$MANUAL_DEPLOY" != true ]]; then
+  if [[ "$1" == rollback && "${HELD:-$MANUAL_DEPLOY}" != true ]]; then
     rollback_release || :
   fi
-  logged pause cd-failed >/dev/null || echo "Unable to pause deployment" >&2
+  pause_failed || echo "Unable to pause deployment" >&2
   return 1
 }
 
@@ -59,8 +63,14 @@ smoke() {
   logged smoke "$1" >/dev/null && external_smoke
 }
 
-mark_deployed() {
-  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf 'deployed=true\n' >> "$GITHUB_OUTPUT"; fi
+mark_output() {
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf '%s=true\n' "$1" >> "$GITHUB_OUTPUT"; fi
+}
+
+handle_interruption() {
+  trap '' INT TERM
+  pause_failed || echo "Unable to pause deployment after interruption" >&2
+  exit "$1"
 }
 
 finish_install() {
@@ -74,7 +84,7 @@ finish_install() {
   esac
   smoke "$DEPLOY_VERSION" || { fail_deploy rollback; return; }
   logged record "$DEPLOY_VERSION" "$DEPLOY_SHA" >/dev/null || { fail_deploy pause; return; }
-  mark_deployed || fail_deploy pause
+  mark_output deployed || fail_deploy pause
 }
 
 validate_release() {
@@ -83,36 +93,41 @@ validate_release() {
     [[ "$HUB_PUBLIC_URL" == https://* ]]
 }
 
+check_running() {
+  local running="$1" ancestry=0
+  git merge-base --is-ancestor "$running" "$DEPLOY_SHA" 2>/dev/null || ancestry=$?
+  if [[ "$ancestry" == 1 ]]; then
+    echo "::notice::Skipping superseded release"
+    if [[ "$MANUAL_DEPLOY" == true ]]; then exit 1; fi
+    exit 0
+  fi
+  [[ "$ancestry" == 0 ]] || exit 1
+  if [[ "$running" != "$DEPLOY_SHA" ]]; then return; fi
+  echo "::notice::Release already recorded"
+  if [[ "$MANUAL_DEPLOY" == true ]]; then
+    if ! { smoke "$DEPLOY_VERSION" && mark_output deployed; }; then
+      fail_deploy pause
+    fi
+  fi
+  exit 0
+}
+
 deploy() {
-  local status running ancestry=0
+  local status running code=0
   validate_release
   status=$(logged status)
   running=$(jq -r '.commit // empty' <<< "$status")
-  if [[ -n "$running" ]]; then
-    git merge-base --is-ancestor "$running" "$DEPLOY_SHA" 2>/dev/null || ancestry=$?
-    if [[ "$ancestry" == 1 ]]; then
-      echo "::notice::Skipping superseded release"
-      return 0
-    fi
-    [[ "$ancestry" == 0 ]]
-    if [[ "$running" == "$DEPLOY_SHA" ]]; then
-      echo "::notice::Release already recorded"
-      if [[ "$MANUAL_DEPLOY" == true ]]; then
-        if ! { smoke "$DEPLOY_VERSION" && mark_deployed; }; then
-          fail_deploy pause
-          return
-        fi
-      fi
-      return 0
-    fi
-  fi
+  if [[ -n "$running" ]]; then check_running "$running"; fi
   logged precheck "$DEPLOY_VERSION" "$DEPLOY_SHA" >/dev/null
   logged quiet 600 >/dev/null
   logged backup "$DEPLOY_VERSION" >/dev/null
-  local code=0
   logged install "$DEPLOY_VERSION" "$DEPLOY_CHECKSUM" >/dev/null || code=$?
   case "$code" in
-    0) finish_install ;;
+    0)
+      trap 'handle_interruption 130' INT
+      trap 'handle_interruption 143' TERM
+      mark_output install_accepted || { fail_deploy pause; return; }
+      finish_install ;;
     2) return 2 ;;
     *) fail_deploy pause ;;
   esac
@@ -141,6 +156,7 @@ case "${1:-deploy}" in
   deploy) deploy ;;
   status|unpause) logged "$1" >/dev/null ;;
   pause) logged pause manual-pause >/dev/null ;;
+  pause-failed) pause_failed ;;
   selftest) selftest ;;
   *) exit 2 ;;
 esac

@@ -103,6 +103,7 @@ publish() {
 case "$1" in
   plan) plan ;;
   pack) pack "$2" "$3" ;;
+  verify) confirm_checksum "$3/getpaseo-hub-$2.tgz" ;;
   publish) publish "$2" "$3" ;;
   *) exit 2 ;;
 esac

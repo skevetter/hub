@@ -14,13 +14,25 @@ confirm_ci() {
     --jq '.workflow_runs[] | .id')
   while IFS= read -r run; do
     [[ -n "$run" ]] || continue
-    jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?per_page=100" \
-      --jq '.jobs[] | select(.name == "check / required" and .conclusion == "success") | .id')
+    jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?per_page=100" |
+      jq -r '.jobs[] | select(.name == "check / required" and .conclusion == "success") | .id')
     if [[ -n "$jobs" ]]; then return 0; fi
   done <<< "$runs"
   echo "::error::No successful CI check found for the requested commit"
   return 1
 }
+
+verify_release_files() (
+  local tag="$1" file="$2" digest="$3" directory
+  directory=$(mktemp -d "$RUNNER_TEMP/hub-dispatch.XXXXXXXX")
+  cd "$directory"
+  gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$file" --pattern "$file.sha256"
+  cmp -s "$file.sha256" <(printf '%s  %s\n' "$digest" "$file")
+  sha256sum --check --strict "$file.sha256"
+  gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" \
+    --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/main.yml" \
+    --source-ref refs/heads/main --source-digest "$DEPLOY_SHA"
+)
 
 read_release() {
   local tag="$1" version="${1#v}" file digest listing prerelease
@@ -35,8 +47,7 @@ read_release() {
     asset($file).digest | select(type == "string" and test("\\Asha256:[0-9a-f]{64}\\z")) | ltrimstr("sha256:")
   ' <<< "$listing")
   prerelease=$(jq -r '.prerelease | if type == "boolean" then . else error("Invalid release type") end' <<< "$listing")
-  gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$file.sha256" --dir "$RUNNER_TEMP"
-  cmp -s "$RUNNER_TEMP/$file.sha256" <(printf '%s  %s\n' "$digest" "$file")
+  verify_release_files "$tag" "$file" "$digest"
   printf 'version=%s\nchecksum=%s\nprerelease=%s\n' "$version" "$digest" "$prerelease" >> "$GITHUB_OUTPUT"
 }
 

@@ -12,6 +12,10 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'release-main' || format('main-run-{0}', github.run_id) }}
+  cancel-in-progress: false
+
 jobs:
   check:
     name: check
@@ -30,9 +34,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    concurrency:
-      group: ${{ github.ref == 'refs/heads/main' && 'package-main' || format('package-artifact-{0}', github.ref) }}
-      cancel-in-progress: false
     defaults:
       run:
         working-directory: hub-package-source
@@ -83,9 +84,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
-    concurrency:
-      group: publish-main
-      cancel-in-progress: false
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -98,6 +98,14 @@ jobs:
         with:
           name: hub-tarball
           path: ${{ runner.temp }}/hub-package/
+      - name: Verify the downloaded artifact
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+          EXPECTED_CHECKSUM: ${{ needs.package.outputs.checksum }}
+        run: bash scripts/cd/package.sh verify "$VERSION" "$RUNNER_TEMP/hub-package"
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: ${{ runner.temp }}/hub-package/getpaseo-hub-${{ needs.package.outputs.version }}.tgz
       - name: Publish the checked tarball
         env:
           BASE_TAG: ${{ needs.package.outputs.base_tag }}
@@ -119,6 +127,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      attestations: read
     outputs:
       version: ${{ steps.dispatch.outputs.version }}
       checksum: ${{ steps.dispatch.outputs.checksum }}
@@ -152,6 +161,7 @@ jobs:
       contents: read
     outputs:
       deployed: ${{ steps.deploy.outputs.deployed }}
+      install_accepted: ${{ steps.deploy.outputs.install_accepted }}
     concurrency:
       group: deploy-production
       cancel-in-progress: false
@@ -182,11 +192,18 @@ jobs:
           DEPLOY_SHA: ${{ inputs.sha || github.sha }}
           DEPLOY_VERSION: ${{ needs.dispatch-guard.outputs.version || needs.package.outputs.version }}
           DEPLOY_CHECKSUM: ${{ needs.dispatch-guard.outputs.checksum || needs.package.outputs.checksum }}
-          MANUAL_DEPLOY: ${{ needs.dispatch-guard.outputs.prerelease == 'true' }}
+          MANUAL_DEPLOY: ${{ github.event_name == 'workflow_dispatch' }}
+          HELD: ${{ needs.dispatch-guard.outputs.prerelease == 'true' }}
           HUB_PUBLIC_URL: ${{ vars.HUB_PUBLIC_URL }}
           VPS2_SSH_HOST: ${{ secrets.VPS2_SSH_HOST }}
           VPS2_SSH_PORT: ${{ secrets.VPS2_SSH_PORT }}
         run: bash scripts/cd/deploy.sh
+      - name: Pause after an interrupted install
+        if: (cancelled() || failure()) && steps.deploy.outputs.install_accepted == 'true'
+        env:
+          VPS2_SSH_HOST: ${{ secrets.VPS2_SSH_HOST }}
+          VPS2_SSH_PORT: ${{ secrets.VPS2_SSH_PORT }}
+        run: bash scripts/cd/deploy.sh pause-failed || echo "::warning::Unable to pause deployment"
       - name: Remove SSH credentials
         if: always()
         run: rm -f -- "$RUNNER_TEMP/hub-deploy-key" "$RUNNER_TEMP/hub-deploy-known-hosts"
@@ -195,15 +212,16 @@ jobs:
     name: promote
     needs: [dispatch-guard, deploy]
     if: >-
-      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
-      github.repository == 'skevetter/hub' && needs.deploy.outputs.deployed == 'true' &&
+      !cancelled() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+      github.repository == 'skevetter/hub' && needs.dispatch-guard.result == 'success' &&
+      needs.deploy.result == 'success' && needs.deploy.outputs.deployed == 'true' &&
       needs.dispatch-guard.outputs.prerelease == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: write
     concurrency:
-      group: publish-main
+      group: promote-main
       cancel-in-progress: false
     steps:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -221,7 +239,8 @@ jobs:
     if: >-
       always() && github.ref == 'refs/heads/main' && github.repository == 'skevetter/hub' &&
       (needs.deploy.result == 'failure' || needs.dispatch-guard.result == 'failure' || needs.promote.result == 'failure' ||
-      needs.publish.result == 'failure' || needs.package.result == 'failure' ||
+      (needs.deploy.result == 'cancelled' && needs.deploy.outputs.install_accepted == 'true') ||
+      needs.publish.result == 'failure' || needs.publish.result == 'cancelled' || needs.package.result == 'failure' ||
       (needs.publish.result == 'success' && needs.package.outputs.held == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -6,13 +6,24 @@ This guide covers repository operations for maintainers. Product usage belongs i
 
 ## Verify a change
 
-The required checks match the jobs in [CI](.github/workflows/ci.yml):
+1. Pull requests run [CI](.github/workflows/ci.yml): static checks, Docker smoke, and six
+   unit shards. Static builds Hub, checks migrations and packaging, runs script tests and
+   the built-only tests, and confirms the six shards and built-only tests cover every test
+   file exactly once. Static runs both regular lint and strict lint. Strict lint checks
+   applicable changed files against the comparison base.
+2. On pull requests, UI paths also trigger three browser shards, Hub integration paths
+   trigger Hub E2E, and workflow paths trigger workflow and shell lint. The required check
+   checks the results for the jobs that apply.
+3. [Nightly](.github/workflows/nightly.yml) runs all three browser shards and Hub E2E
+   regardless of changed paths. It skips static checks, Docker smoke, unit shards, and
+   workflow lint.
 
 ```sh
 npm run typecheck
 npm run lint
+npm run lint:strict
 npm run format:check
-npm test
+npm run test:parallel
 npm run db:check
 npm run build
 npm run docker:smoke
@@ -35,7 +46,9 @@ scratch checkout. The version comes from Conventional Commits. The checkout's ve
 unchanged. The package job extracts the tarball, runs `npm ci --omit=dev --legacy-peer-deps`,
 and checks the production tree against the bundled shrinkwrap before
 it can be published. The build branch produces a workflow artifact. Only `main` creates a tag and
-GitHub Release with the tarball and its checksum.
+GitHub Release with the tarball and its checksum. Main release runs serialize planning,
+packing, and publishing. Publish attests the verified tarball. Manual deployment checks
+the downloaded checksum and attestation for the requested main commit.
 
 The release check compares the tested commit to the latest reachable `v*` tag. Changes limited
 to the [no-ship paths](scripts/cd/ship-paths.mjs) skip the tag and deploy. If the last release was
@@ -48,6 +61,13 @@ on the PR. The pipeline publishes held releases as prereleases. It keeps the hol
 releases until a successful manual deploy promotes a prerelease. Held deployments do not roll back
 automatically. Only the repository owner can unpause. See the `cd-alert` issues for failed or held
 releases.
+
+### Accepted limits
+
+- Holds are stored in the GitHub Release prerelease flag. Anyone with repository write access
+  can change that flag.
+- Store deploy secrets only in the `production` environment, never at repository level.
+- The `production` environment limits deployment to `main`.
 
 ## Update public documentation
 

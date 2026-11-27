@@ -14,6 +14,11 @@ test("flags destructive migration SQL", () => {
     "ALTER TABLE foo ADD x int NOT NULL, ADD y int DEFAULT 0;",
     "CREATE UNIQUE INDEX CONCURRENTLY idx ON public.foo (id);",
     "ALTER TABLE foo ADD CONSTRAINT idx UNIQUE (id);",
+    'ALTER TABLE "x--" DROP COLUMN y;',
+    `ALTER TABLE "owner's;table" DROP COLUMN y, ADD COLUMN note text DEFAULT 'later';`,
+    'ALTER TABLE foo ADD CONSTRAINT "parent fk" FOREIGN KEY (parent) REFERENCES old(id);',
+    "ALTER TABLE foo ADD label text, ADD CONSTRAINT positive CHECK (id > 0);",
+    "DO $body$ BEGIN DELETE FROM foo; END $body$;",
     "ALTER TYPE foo ADD VALUE 'new';",
     "INSERT INTO foo (x) VALUES (1);",
     "UPDATE foo SET x = 'value';",
@@ -35,8 +40,12 @@ test("accepts additive migrations and referential action clauses", () => {
     needsRollbackReview(`
     -- DROP a table later
     CREATE TABLE "new" (id int, parent int REFERENCES old(id) ON UPDATE CASCADE ON DELETE CASCADE);
+    CREATE TABLE "new--table" (id int, parent int, CHECK (id > 0), FOREIGN KEY (parent) REFERENCES old(id));
     CREATE UNIQUE INDEX idx ON "new" (id);
     ALTER TABLE "new" ADD CONSTRAINT constraint_id UNIQUE (id);
+    ALTER TABLE "new--table" ADD CONSTRAINT positive CHECK (id > 0);
+    ALTER TABLE old ADD COLUMN notes text DEFAULT $tag$contains 'quotes'; DROP TABLE old; -- text$tag$;
+    ALTER TABLE old ADD COLUMN more text DEFAULT $$DROP TABLE old;$$;
     ALTER TABLE old ADD COLUMN label text;
     ALTER TABLE old ADD COLUMN enabled bool NOT NULL DEFAULT false;
   `),

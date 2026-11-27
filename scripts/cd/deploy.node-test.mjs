@@ -15,6 +15,7 @@ case "$command" in
   status) echo "{\\"ok\\":true,\\"commit\\":$RUNNING,\\"private\\":\\"$VPS2_SSH_HOST\\",\\"version\\":\\"1.0.0\\\\n$VPS2_SSH_HOST\\"}" ;;
   backup*) echo '{"ok":true,"entries":5,"bytes":99,"file":"/private/database.dump"}' ;;
   wait\\ 60)
+    if [[ -n "$INTERRUPT" ]]; then kill -s "$INTERRUPT" "$DEPLOY_PID"; fi
     if ! grep -qx rollback "$RUNNER_TEMP/calls"; then
       case "$WAIT" in
         running) echo '{"ok":false,"state":"running"}'; exit 5 ;;
@@ -57,13 +58,19 @@ function execute(action, options = {}) {
     writeFileSync(join(temp, "curl"), curl, { mode: 0o700 });
     writeFileSync(join(temp, "git"), '#!/usr/bin/env bash\nexit "$ANCESTRY"\n', { mode: 0o700 });
     writeFileSync(join(temp, "calls"), "");
-    const args = typeof action === "string" ? [source, action] : action;
+    const args =
+      typeof action === "string"
+        ? ["-c", 'export DEPLOY_PID=$$; exec bash "$@"', "test", source, action]
+        : action;
+    const outputPath = join(temp, "output");
+    writeFileSync(outputPath, "");
     const result = spawnSync("bash", args, {
       encoding: "utf8",
       env: {
         ...process.env,
         PATH: `${temp}:${process.env.PATH}`,
         RUNNER_TEMP: temp,
+        GITHUB_OUTPUT: outputPath,
         RUNNING: "null",
         CD_DIR: fileURLToPath(new URL(".", import.meta.url)),
         ANCESTRY: "0",
@@ -82,7 +89,7 @@ function execute(action, options = {}) {
       result.stdout + result.stderr,
       /sensitive\.example|hub-deploy-key|database\.dump|15123/u,
     );
-    return { ...result, calls };
+    return { ...result, calls, output: readFileSync(outputPath, "utf8") };
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
@@ -94,6 +101,7 @@ test("deploys from a null running commit and records only after smoke", () => {
   const result = execute("deploy");
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.calls, [...deployCalls, "record"]);
+  assert.equal(result.output, "install_accepted=true\ndeployed=true\n");
 });
 
 test("skips a superseded commit before precheck", () => {
@@ -101,6 +109,27 @@ test("skips a superseded commit before precheck", () => {
   assert.equal(result.status, 0);
   assert.match(result.stdout, /Skipping superseded/u);
   assert.deepEqual(result.calls, ["status"]);
+  assert.equal(result.output, "");
+  const manual = execute("deploy", {
+    RUNNING: JSON.stringify("c".repeat(40)),
+    ANCESTRY: "1",
+    MANUAL_DEPLOY: "true",
+  });
+  assert.equal(manual.status, 1);
+  assert.equal(manual.output, "");
+  assert.deepEqual(manual.calls, ["status"]);
+});
+
+test("pauses on INT or TERM after the install is accepted", () => {
+  for (const [INTERRUPT, code] of [
+    ["INT", 130],
+    ["TERM", 143],
+  ]) {
+    const result = execute("deploy", { INTERRUPT });
+    assert.equal(result.status, code, result.stderr);
+    assert.equal(result.output, "install_accepted=true\n");
+    assert.deepEqual(result.calls, [...deployCalls.slice(0, 6), "pause"]);
+  }
 });
 
 test("fails closed when git cannot establish ancestry", () => {

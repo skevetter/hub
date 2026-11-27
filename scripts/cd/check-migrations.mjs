@@ -1,9 +1,11 @@
 import { readFileSync } from "node:fs";
 import { diffPaths, git, releaseTag, shaPattern } from "./git.mjs";
 
-const identifier = String.raw`(?:"(?:[^"]|"")+"|[\w$]+)`;
+const quotedIdentifier = String.raw`"(?:[^"]|"")*"`;
+const identifier = String.raw`(?:${quotedIdentifier}|[\w$]+)`;
 const tableName = String.raw`(?:${identifier}\s*\.\s*)?${identifier}`;
 const unsafe = [
+  /^\s*do\b/iu,
   /\b(?:truncate|drop|rename)\s+/iu,
   /\balter\s+(?:column\s+)?(?:"(?:[^"]|"")+"|[\w$]+)\s+(?:set\s+data\s+)?type\b/iu,
   /\bset\s+not\s+null\b/iu,
@@ -17,6 +19,10 @@ const unsafe = [
 
 const createTable = new RegExp(String.raw`^\s*create\s+table\s+(${tableName})\s*\(`, "iu");
 const alterTable = new RegExp(String.raw`^\s*alter\s+table\s+(?:only\s+)?(${tableName})\s+`, "iu");
+const addedConstraint = new RegExp(
+  String.raw`\badd\s+(?:constraint\s+${identifier}\s+)?(?:unique|foreign\s+key|check)\b`,
+  "iu",
+);
 const uniqueIndex = new RegExp(
   String.raw`^\s*create\s+unique\s+index\b[^;]*?\bon\s+(?:only\s+)?(${tableName})`,
   "iu",
@@ -51,13 +57,31 @@ function isUnsafe(statement, newTables, existingTables) {
   if (index) return !newTables.has(canonicalTable(index[1]));
   const alter = alterTable.exec(statement);
   return Boolean(
-    alter && /\badd\b[^;]*\bunique\b/iu.test(statement) && !newTables.has(canonicalTable(alter[1])),
+    alter &&
+    addedConstraint.test(statement.slice(alter[0].length)) &&
+    !newTables.has(canonicalTable(alter[1])),
   );
 }
 
 function statements(sql) {
-  const stripped = sql.replaceAll(/'(?:[^']|'')*'|--[^\n]*|\/\*[\s\S]*?\*\//gu, " ");
-  return stripped.split(";");
+  const tokens =
+    /"(?:[^"]|"")*"|'(?:[^']|'')*'|--[^\n]*|\/\*[\s\S]*?\*\/|(?<![\w$])(\$(?:[a-zA-Z_]\w*)?\$)[\s\S]*?\1|;/gu;
+  const result = [];
+  let statement = "";
+  let offset = 0;
+  for (const match of sql.matchAll(tokens)) {
+    const token = match[0];
+    statement += sql.slice(offset, match.index);
+    offset = match.index + token.length;
+    if (token === ";") {
+      result.push(statement);
+      statement = "";
+    } else {
+      statement += token.startsWith('"') ? token : " ";
+    }
+  }
+  result.push(statement + sql.slice(offset));
+  return result;
 }
 
 export function needsRollbackReview(sql, newTables = new Set(), existingTables = new Set()) {

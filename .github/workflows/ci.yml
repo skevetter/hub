@@ -86,7 +86,22 @@ jobs:
         run: node scripts/cd/check-migrations.mjs
       - run: npm run test:scripts
       - run: npm pack --dry-run
-      - run: npm run test:parallel -- --built-only
+      - name: Run built-only tests
+        env:
+          TEST_SHARD_REPORT_DIR: ${{ runner.temp }}/built-only
+        run: npm run test:parallel -- --built-only
+      - name: Upload built-only report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unit-built-only
+          path: |
+            ${{ runner.temp }}/built-only/built-only.json
+            ${{ runner.temp }}/built-only/built-only.summary.json
+            ${{ runner.temp }}/built-only/vitest.log
+            ${{ runner.temp }}/built-only/vitest.retry-*.log
+          retention-days: 7
+          if-no-files-found: warn
       - name: Check shard coverage
         run: npm run test:parallel -- --check-coverage
 
