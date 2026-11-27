@@ -12,26 +12,26 @@ export function readTimelineScrubValues(
   providerConfigurations: readonly object[] = [],
 ): readonly string[] {
   const values = new Set<string>();
-  for (const [name, value] of Object.entries(environment)) {
-    if (
-      value !== undefined &&
-      value.length !== 0 &&
-      NON_SECRET_ENVIRONMENT_NAMES[name] !== true &&
-      (name === "DATABASE_URL" || /KEY|SECRET|TOKEN|PASSWORD/u.test(name))
-    ) {
-      values.add(value);
-      const effective = value.trim();
-      if (effective.length !== 0) values.add(effective);
-      if (name === "PASEO_HUB_WEBHOOK_HMAC_KEYRING") addKeyringEntries(value, values);
-    }
-  }
-  for (const configuration of providerConfigurations) {
-    for (const [name, value] of Object.entries(configuration)) {
-      if (typeof value === "string" && value.length !== 0 && /secret|token|privatekey/iu.test(name))
-        values.add(value);
-    }
-  }
+  for (const [name, value] of Object.entries(environment)) addEnvironmentValue(name, value, values);
+  for (const configuration of providerConfigurations) addProviderValues(configuration, values);
   return [...values];
+}
+
+function addEnvironmentValue(name: string, value: string | undefined, values: Set<string>): void {
+  if (value === undefined || value.length === 0 || NON_SECRET_ENVIRONMENT_NAMES[name] === true)
+    return;
+  if (name !== "DATABASE_URL" && !/KEY|SECRET|TOKEN|PASSWORD/u.test(name)) return;
+  values.add(value);
+  const effective = value.trim();
+  if (effective.length !== 0) values.add(effective);
+  if (name === "PASEO_HUB_WEBHOOK_HMAC_KEYRING") addKeyringEntries(value, values);
+}
+
+function addProviderValues(configuration: object, values: Set<string>): void {
+  for (const [name, value] of Object.entries(configuration)) {
+    if (typeof value === "string" && value.length !== 0 && /secret|token|privatekey/iu.test(name))
+      values.add(value);
+  }
 }
 
 // The keyring is a JSON object, so each key must be scrubbed on its own when it appears outside the JSON.

@@ -79,14 +79,24 @@ describe.each(["postgres", "pglite", "memory"] as const)("trigger list pages on 
       const name = `sample-${String(index).padStart(3, "0")}`;
       const on = EVENTS[index % EVENTS.length] ?? "manual.run";
       const events = index === 127 ? ([on, "discord.mention"] as const) : [on];
-      const trigger = await createTrigger(database, ORGANIZATION, name, index % 2 === 0, events);
+      const trigger = await createTrigger(database, ORGANIZATION, {
+        name,
+        enabled: index % 2 === 0,
+        events,
+      });
       fixture.push({ trigger, events });
     }
-    const special = await createTrigger(database, ORGANIZATION, "special_name", true, [
-      "manual.run",
-    ]);
+    const special = await createTrigger(database, ORGANIZATION, {
+      name: "special_name",
+      enabled: true,
+      events: ["manual.run"],
+    });
     fixture.push({ trigger: special, events: ["manual.run"] });
-    await createTrigger(database, OTHER_ORGANIZATION, "sample-000", true, ["manual.run"]);
+    await createTrigger(database, OTHER_ORGANIZATION, {
+      name: "sample-000",
+      enabled: true,
+      events: ["manual.run"],
+    });
   }, 60_000);
 
   afterAll(async () => {
@@ -145,7 +155,11 @@ describe.each(["postgres", "pglite", "memory"] as const)("trigger list pages on 
     );
     const expected = ["a--z", "a-b", "a-c", "a0", "a_-", "a_a", "a_b", "ab", "b"];
     for (const name of expected.toReversed()) {
-      await createTrigger(database, COLLATION_ORGANIZATION, name, true, ["manual.run"]);
+      await createTrigger(database, COLLATION_ORGANIZATION, {
+        name,
+        enabled: true,
+        events: ["manual.run"],
+      });
     }
     const read = (position?: TriggerListRequest["position"]) =>
       database.listOrganizationTriggerPage(COLLATION_ORGANIZATION, {
@@ -216,9 +230,15 @@ describe.each(["postgres", "pglite", "memory"] as const)("trigger list pages on 
 async function createTrigger(
   database: Database,
   organizationId: string,
-  name: string,
-  enabled: boolean,
-  events: readonly (typeof EVENTS)[number][],
+  {
+    name,
+    enabled,
+    events,
+  }: {
+    name: string;
+    enabled: boolean;
+    events: readonly (typeof EVENTS)[number][];
+  },
 ) {
   const compiled = compileTriggerDocument(YAML);
   const [event] = compiled.events;

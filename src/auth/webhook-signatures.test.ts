@@ -62,64 +62,40 @@ describe("GitHub SHA-256 primitives", () => {
   it("requires both sources of derivation material and binds every identity component", () => {
     const master = Buffer.alloc(32, 1);
     const salt = Buffer.alloc(32, 2).toString("base64url");
-    const original = deriveSigningSecret(
+    const options = {
       master,
-      "master",
+      masterKeyId: "master",
       salt,
-      "organization",
-      "api-key",
-      "version",
-    );
+      organizationId: "organization",
+      apiKeyId: "api-key",
+      versionId: "version",
+    };
+    const original = deriveSigningSecret(options);
     assert.match(original, /^paseo_whsec_[A-Za-z0-9_-]{43}$/u);
     for (const changed of [
-      deriveSigningSecret(
-        Buffer.alloc(32, 3),
-        "master",
-        salt,
-        "organization",
-        "api-key",
-        "version",
-      ),
-      deriveSigningSecret(
-        master,
-        "master",
-        Buffer.alloc(32, 3).toString("base64url"),
-        "organization",
-        "api-key",
-        "version",
-      ),
-      deriveSigningSecret(master, "master", salt, "another", "api-key", "version"),
-      deriveSigningSecret(master, "master", salt, "organization", "another", "version"),
-      deriveSigningSecret(master, "master", salt, "organization", "api-key", "another"),
+      deriveSigningSecret({ ...options, master: Buffer.alloc(32, 3) }),
+      deriveSigningSecret({ ...options, salt: Buffer.alloc(32, 3).toString("base64url") }),
+      deriveSigningSecret({ ...options, organizationId: "another" }),
+      deriveSigningSecret({ ...options, apiKeyId: "another" }),
+      deriveSigningSecret({ ...options, versionId: "another" }),
     ])
       assert.notEqual(changed, original);
-    assert.throws(() =>
-      deriveSigningSecret(Buffer.alloc(0), "master", salt, "organization", "api-key", "version"),
-    );
-    assert.throws(() =>
-      deriveSigningSecret(master, "master", "", "organization", "api-key", "version"),
-    );
+    assert.throws(() => deriveSigningSecret({ ...options, master: Buffer.alloc(0) }));
+    assert.throws(() => deriveSigningSecret({ ...options, salt: "" }));
   });
 
   it("derives noninterchangeable proofs from equal master bytes under different IDs", () => {
     const master = Buffer.alloc(32, 1);
     const salt = Buffer.alloc(32, 2).toString("base64url");
-    const first = deriveSigningSecret(
+    const material = {
       master,
-      "current",
       salt,
-      "organization",
-      "api-key",
-      "version",
-    );
-    const second = deriveSigningSecret(
-      master,
-      "replacement",
-      salt,
-      "organization",
-      "api-key",
-      "version",
-    );
+      organizationId: "organization",
+      apiKeyId: "api-key",
+      versionId: "version",
+    };
+    const first = deriveSigningSecret({ ...material, masterKeyId: "current" });
+    const second = deriveSigningSecret({ ...material, masterKeyId: "replacement" });
     const body = Buffer.from('{"message":"key ID binding"}');
     const firstProof = createHmac("sha256", first).update(body).digest();
     const secondProof = createHmac("sha256", second).update(body).digest();

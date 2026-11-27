@@ -10,7 +10,7 @@ import type {
 } from "./capture-types.js";
 import { projectTimelineEvent } from "./project.js";
 import { isRunTimelineExpired, retentionCutoff } from "./retention.js";
-import type { TimelineOrigin } from "./store.js";
+import type { RunTimelineState, TimelineOrigin } from "./store.js";
 
 export interface RunTimelineReconcilerOptions {
   queue: TimelineQueue;
@@ -53,6 +53,39 @@ function earliestStepStart(steps: readonly WorkflowStepRunRecord[], fallback: Da
       startedAt = step.startedAt;
   }
   return startedAt ?? fallback;
+}
+
+function finishedRunEvent(
+  context: ReconciliationContext,
+  counts: TimelineStepCounts,
+  terminalCount: number,
+): { at: Date; input: TimelineProjectionInput } | undefined {
+  const { run, startedAt, now } = context;
+  if (run.status === "running") return undefined;
+  const endedAt = run.completedAt ?? now;
+  return {
+    at: endedAt,
+    input: {
+      kind: "run_finished",
+      status: run.status,
+      durationMs: duration(startedAt, endedAt),
+      failure: run.failureReason,
+      steps: counts,
+      stepRowsOmitted: Math.max(0, terminalCount - 100),
+    },
+  };
+}
+
+function stepStartAgent(
+  step: WorkflowStepRunRecord,
+  intent: WorkflowStepRunRecord["dispatchIntent"],
+): { provider: string; mode?: string } | undefined {
+  return step.agentExecutionId !== null && intent !== null
+    ? {
+        provider: intent.agent.provider,
+        ...(intent.agent.mode === undefined ? {} : { mode: intent.agent.mode }),
+      }
+    : undefined;
 }
 
 export class RunTimelineReconciler {
@@ -215,9 +248,9 @@ export class RunTimelineReconciler {
     if (this.closed) return;
     const context = await this.readContext(scope);
     if (context === undefined) return;
-    const { run, steps, origin, startedAt } = context;
+    const { run, steps, startedAt } = context;
     if (
-      !(await this.append(scope, origin, startedAt, {
+      !(await this.append(context, startedAt, {
         kind: "run_started",
         trigger: run.configuredTriggerName,
         steps: steps.length,
@@ -243,16 +276,24 @@ export class RunTimelineReconciler {
       terminalCount += 1;
       if (!(await this.appendStepEnd(context, step, step.status))) return;
     }
-    if (run.status === "running") return;
-    const endedAt = run.completedAt ?? context.now;
-    await this.append(scope, origin, endedAt, {
-      kind: "run_finished",
-      status: run.status,
-      durationMs: duration(startedAt, endedAt),
-      failure: run.failureReason,
-      steps: counts,
-      stepRowsOmitted: Math.max(0, terminalCount - 100),
-    });
+    const finished = finishedRunEvent(context, counts, terminalCount);
+    if (finished !== undefined) await this.append(context, finished.at, finished.input);
+  }
+
+  private canReadContext(
+    run: AcceptedTriggerRunRecord,
+    state: RunTimelineState | undefined,
+    now: Date,
+  ): boolean {
+    return !(
+      this.closed ||
+      state?.sealedSeq != null ||
+      isRunTimelineExpired(
+        { completedAt: run.completedAt, expiredAt: state?.expiredAt ?? null },
+        retentionCutoff(now, this.options.retentionDays),
+      ) ||
+      (state === undefined && run.status === "running")
+    );
   }
 
   private async readContext(scope: TimelineRunScope): Promise<ReconciliationContext | undefined> {
@@ -266,19 +307,7 @@ export class RunTimelineReconciler {
       scope.triggerRunId,
     );
     const now = this.options.now?.() ?? new Date();
-    if (
-      this.closed ||
-      state?.sealedSeq != null ||
-      isRunTimelineExpired(
-        {
-          completedAt: run.completedAt,
-          expiredAt: state?.expiredAt ?? null,
-        },
-        retentionCutoff(now, this.options.retentionDays),
-      )
-    )
-      return undefined;
-    if (state === undefined && run.status === "running") return undefined;
+    if (!this.canReadContext(run, state, now)) return undefined;
     const steps = await this.database.listWorkflowStepRunsForTriggerRun(run.id);
     return {
       scope,
@@ -300,16 +329,9 @@ export class RunTimelineReconciler {
       intent =
         (await this.database.findAgentExecutionById(step.agentExecutionId))?.launchIntent ?? null;
     }
-    const agent =
-      step.agentExecutionId !== null && intent !== null
-        ? {
-            provider: intent.agent.provider,
-            ...(intent.agent.mode === undefined ? {} : { mode: intent.agent.mode }),
-          }
-        : undefined;
+    const agent = stepStartAgent(step, intent);
     return this.append(
-      context.scope,
-      context.origin,
+      context,
       step.startedAt,
       {
         kind: "step_started",
@@ -332,8 +354,7 @@ export class RunTimelineReconciler {
       "completion" in step.output &&
       step.output.completion === "inferred_from_turn_end";
     return this.append(
-      context.scope,
-      context.origin,
+      context,
       endedAt,
       {
         kind: "step_finished",
@@ -350,8 +371,7 @@ export class RunTimelineReconciler {
   }
 
   private async append(
-    scope: TimelineRunScope,
-    origin: TimelineOrigin,
+    context: ReconciliationContext,
     at: Date,
     input: TimelineProjectionInput,
     stepId?: string,
@@ -360,16 +380,16 @@ export class RunTimelineReconciler {
     const projected = projectTimelineEvent(input, this.options.scrub);
     if (projected === undefined) throw new Error("Persisted timeline event could not be projected");
     const result = await this.database.appendRunTimelineEvent({
-      ...scope,
+      ...context.scope,
       ...projected,
-      origin,
+      origin: context.origin,
       at,
       maxEvents: this.options.maxEvents,
       ...(stepId === undefined ? {} : { stepId }),
     });
     if (!result) return false;
     if ("seq" in result) {
-      if (result.inserted) this.options.bus.publish(scope.triggerRunId, result.seq);
+      if (result.inserted) this.options.bus.publish(context.scope.triggerRunId, result.seq);
       return true;
     }
     return result.reason === "cap";

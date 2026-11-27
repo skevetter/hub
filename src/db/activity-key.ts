@@ -26,9 +26,12 @@ export function activityTimestampMicros(text: string): bigint | undefined {
   const match = TIMESTAMP.exec(text);
   if (match === null) return undefined;
   const [, year, month, day, hour, minute, second, fraction = "", zone = "Z"] = match;
-  const [y, mo, d, h, mi, s] = [year, month, day, hour, minute, second].map(Number);
-  if (y === undefined || mo === undefined || d === undefined) return undefined;
-  if (h === undefined || mi === undefined || s === undefined) return undefined;
+  const y = Number(year);
+  const mo = Number(month);
+  const d = Number(day);
+  const h = Number(hour);
+  const mi = Number(minute);
+  const s = Number(second);
   if (!isCalendarDate(y, mo, d) || h > 23 || mi > 59 || s > 59) return undefined;
   const offset = offsetMinutes(zone);
   if (offset === undefined) return undefined;

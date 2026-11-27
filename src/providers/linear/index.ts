@@ -135,51 +135,14 @@ export function createLinearRegistration(
           connectionClient,
           ...fetchOption,
         }));
-  const accept =
-    database === null
-      ? () => Promise.reject(new DatabaseUnavailableError())
-      : (
-          input: Omit<
-            Parameters<Database["acceptLinearEvent"]>[0],
-            "providerApplicationId" | "providerConfigurationVersion"
-          >,
-        ) =>
-          database.acceptLinearEvent({
-            ...input,
-            providerApplicationId: configuration.clientId,
-            providerConfigurationVersion: options.configurationVersion ?? 0,
-          });
-  const webhook = createLinearWebhookSource({
-    signingSecret: configuration.webhookSecret,
-    ...linearPilotWebhookOptions(
-      options,
-      configuration.clientId,
-      publicBaseUrl,
-      connectionClient,
-      connectionForLinearOrganization,
-    ),
-    accept,
-    ...(database === null
-      ? {}
-      : {
-          findMarkedReceipt: database.findMarkedLinearReceipt.bind(database),
-          findAppUserId: async (linearOrganizationId) => {
-            const connection = await connectionForLinearOrganization(linearOrganizationId);
-            return connection?.providerApplicationId === configuration.clientId
-              ? connection.appUserId
-              : undefined;
-          },
-          canHydrateIssue: async (linearOrganizationId) => {
-            const connection = await database.findLinearConnection(linearOrganizationId);
-            return connection !== undefined && !linearConnectionRequiresReauthorization(connection);
-          },
-        }),
-    ...(api === undefined
-      ? {}
-      : {
-          resolveIssue: ({ linearOrganizationId, issueId }) =>
-            api.readIssue({ linearOrganizationId, issueId }),
-        }),
+  const webhook = createRegistrationWebhook({
+    options,
+    configuration,
+    database,
+    api,
+    publicBaseUrl,
+    connectionClient,
+    connectionForLinearOrganization,
   });
   if (database === null) {
     return {
@@ -190,6 +153,41 @@ export function createLinearRegistration(
       requests: [{ name: "linear.events", handle: (request) => webhook.handle(request) }],
     };
   }
+  return configuredLinearRegistration({
+    options,
+    configuration,
+    database,
+    api,
+    webhook,
+    publicBaseUrl,
+    connectionClient,
+    connectionForLinearOrganization,
+  });
+}
+
+interface RegisteredLinearOptions {
+  options: CreateLinearRegistrationOptions;
+  configuration: LinearRegistrationConfiguration;
+  database: Database | null;
+  api: LinearApiClient | undefined;
+  publicBaseUrl: string;
+  connectionClient: LinearConnectionClient;
+  connectionForLinearOrganization: Database["findLinearConnection"];
+}
+
+function configuredLinearRegistration({
+  options,
+  configuration,
+  database,
+  api,
+  webhook,
+  publicBaseUrl,
+  connectionClient,
+  connectionForLinearOrganization,
+}: Omit<RegisteredLinearOptions, "database"> & {
+  database: Database;
+  webhook: ReturnType<typeof createLinearWebhookSource>;
+}): ProviderRegistration {
   const connection =
     options.auth === null
       ? linearConnectionStatus(true)
@@ -213,32 +211,13 @@ export function createLinearRegistration(
       callbackOrigin: publicBaseUrl,
     },
     connection,
-    ...(api === undefined
-      ? {}
-      : {
-          linearRunReplyWriter: new LinearRunReplyWriter({
-            client: api,
-            database,
-            connectionForLinearOrganization,
-            clientSecret: configuration.clientSecret,
-            providerApplicationId: configuration.clientId,
-            secrets: readTimelineScrubValues(options.environment ?? process.env, [configuration]),
-          }),
-          progressProvider: createLinearProgressProvider({
-            client: api,
-            connectionForLinearOrganization,
-            async readRunOutputContext(scope) {
-              const run = await database.findTriggerRunForOrganization(
-                scope.organizationId,
-                scope.id,
-              );
-              if (run?.outcome === "accepted" && run.projectId === scope.projectId)
-                return run.outputContext;
-              return undefined;
-            },
-            clientSecret: configuration.clientSecret,
-          }),
-        }),
+    ...linearApiExtensions({
+      options,
+      configuration,
+      database,
+      api,
+      connectionForLinearOrganization,
+    }),
     triggerProviders: [
       ({ configurationStoreForProject }) =>
         createLinearTriggerProvider({
@@ -248,28 +227,131 @@ export function createLinearRegistration(
         }),
     ],
     sources: [webhook],
-    outputs:
-      api === undefined
-        ? []
-        : [
-            {
-              type: "linear.reply",
-              tool: replyOutputTool,
-              available: outputContextProvider("linear"),
-              execute: createLinearReplyExecutor({ client: api }),
-            },
-          ],
+    outputs: linearOutputs(api),
     requests: [{ name: "linear.events", handle: (request) => webhook.handle(request) }],
   };
 }
 
-function linearPilotWebhookOptions(
-  options: Pick<CreateLinearRegistrationOptions, "database" | "linearPilot" | "fetch">,
-  clientId: string,
-  publicBaseUrl: string,
-  connectionClient: LinearConnectionClient,
-  connectionForLinearOrganization: Database["findLinearConnection"],
-): Pick<
+function linearOutputs(api: LinearApiClient | undefined): ProviderRegistration["outputs"] {
+  if (api === undefined) return [];
+  return [
+    {
+      type: "linear.reply",
+      tool: replyOutputTool,
+      available: outputContextProvider("linear"),
+      execute: createLinearReplyExecutor({ client: api }),
+    },
+  ];
+}
+
+function linearApiExtensions({
+  options,
+  configuration,
+  database,
+  api,
+  connectionForLinearOrganization,
+}: Pick<
+  RegisteredLinearOptions,
+  "options" | "configuration" | "api" | "connectionForLinearOrganization"
+> & {
+  database: Database;
+}): Pick<ProviderRegistration, "linearRunReplyWriter" | "progressProvider"> {
+  if (api === undefined) return {};
+  return {
+    linearRunReplyWriter: new LinearRunReplyWriter({
+      client: api,
+      database,
+      connectionForLinearOrganization,
+      clientSecret: configuration.clientSecret,
+      providerApplicationId: configuration.clientId,
+      secrets: readTimelineScrubValues(options.environment ?? process.env, [configuration]),
+    }),
+    progressProvider: createLinearProgressProvider({
+      client: api,
+      connectionForLinearOrganization,
+      async readRunOutputContext(scope) {
+        const run = await database.findTriggerRunForOrganization(scope.organizationId, scope.id);
+        if (run?.outcome === "accepted" && run.projectId === scope.projectId)
+          return run.outputContext;
+        return undefined;
+      },
+      clientSecret: configuration.clientSecret,
+    }),
+  };
+}
+
+function createRegistrationWebhook({
+  options,
+  configuration,
+  database,
+  api,
+  publicBaseUrl,
+  connectionClient,
+  connectionForLinearOrganization,
+}: RegisteredLinearOptions) {
+  const accept =
+    database === null
+      ? () => Promise.reject(new DatabaseUnavailableError())
+      : (
+          input: Omit<
+            Parameters<Database["acceptLinearEvent"]>[0],
+            "providerApplicationId" | "providerConfigurationVersion"
+          >,
+        ) =>
+          database.acceptLinearEvent({
+            ...input,
+            providerApplicationId: configuration.clientId,
+            providerConfigurationVersion: options.configurationVersion ?? 0,
+          });
+  return createLinearWebhookSource({
+    signingSecret: configuration.webhookSecret,
+    ...linearPilotWebhookOptions({
+      options,
+      clientId: configuration.clientId,
+      publicBaseUrl,
+      connectionClient,
+      connectionForLinearOrganization,
+    }),
+    accept,
+    ...(database === null
+      ? {}
+      : {
+          findMarkedReceipt: database.findMarkedLinearReceipt.bind(database),
+          findAppUserId: async (linearOrganizationId) => {
+            const connection = await connectionForLinearOrganization(linearOrganizationId);
+            return connection?.providerApplicationId === configuration.clientId
+              ? connection.appUserId
+              : undefined;
+          },
+          canHydrateIssue: async (linearOrganizationId) => {
+            const connection = await database.findLinearConnection(linearOrganizationId);
+            return connection !== undefined && !linearConnectionRequiresReauthorization(connection);
+          },
+        }),
+    ...(api === undefined
+      ? {}
+      : {
+          resolveIssue: ({ linearOrganizationId, issueId }) =>
+            api.readIssue({ linearOrganizationId, issueId }),
+        }),
+  });
+}
+
+interface LinearPilotWebhookOptions {
+  options: Pick<CreateLinearRegistrationOptions, "database" | "linearPilot" | "fetch">;
+  clientId: string;
+  publicBaseUrl: string;
+  connectionClient: LinearConnectionClient;
+  connectionForLinearOrganization: Database["findLinearConnection"];
+}
+
+function linearPilotWebhookOptions({
+  options,
+  clientId,
+  publicBaseUrl,
+  connectionClient,
+  connectionForLinearOrganization,
+}: LinearPilotWebhookOptions): Pick<
   LinearWebhookSourceOptions,
   "offerVerifiedLinearPilotEvent" | "suppressVerifiedLinearPilotComment"
 > {
@@ -338,68 +420,73 @@ function createLinearConnection(
   options: LinearConnectionOptions,
   client: LinearConnectionClient | undefined,
 ): ProviderConnectionRegistration {
-  const start = async (request: Request): Promise<Response> => {
-    if (!isHttpsCallbackOrigin(options.callbackOrigin)) {
-      return Response.json({ error: "https_required" }, { status: 400 });
-    }
-    const rejected = options.auth.rejectCookieMutation(request);
-    if (rejected !== undefined) return rejected;
-    try {
-      const access = await manageConnectionAccess(options.auth, options.database, request);
-      if (client === undefined)
-        return Response.json({ error: "provider_not_configured" }, { status: 409 });
-      const state = newConnectionState();
-      await options.database.startConnectionAttempt({
-        provider: "linear",
-        stateVerifier: stateHash(state),
-        access: connectionAccess(access),
-        lifetimeMinutes: CONNECTION_ATTEMPT_LIFETIME_MINUTES,
-        callbackOrigin: options.callbackOrigin,
-        configurationVersion: options.configurationVersion,
-        providerApplicationId: options.configuration.clientId,
-        configurationSnapshot: { provider: "linear", ...options.configuration },
-        expectedConfigurationVersion: options.expectedConfigurationVersion ?? null,
-        activateConfiguration: options.activateConfiguration,
-      });
-      return Response.json({ url: client.authorizationUrl(state) });
-    } catch (error) {
-      return connectionActionFailure(error, "linear", "start");
-    }
-  };
-
-  const disconnect = async (request: Request): Promise<Response> => {
-    const rejected = options.auth.rejectCookieMutation(request);
-    if (rejected !== undefined) return rejected;
-    try {
-      const access = await manageConnectionAccess(options.auth, options.database, request);
-      const disconnected = await options.database.disconnectConnection(
-        "linear",
-        requiredConnectionId(request),
-        connectionAccess(access),
-      );
-      if (disconnected.provider === "linear" && disconnected.accessToken !== undefined) {
-        void client?.revoke(disconnected.accessToken).catch((error: unknown) => {
-          logger.warn(
-            { err: error, provider: "linear" },
-            "provider cleanup failed after disconnect",
-          );
-        });
-      }
-      return Response.json({ disconnected: true });
-    } catch (error) {
-      return connectionActionFailure(error, "linear", "disconnect");
-    }
-  };
-
   return {
     name: "linear",
     status: (connections) => linearStatus(client !== undefined, connections.linear),
     actions: {
-      start,
-      disconnect,
+      start: (request) => startAuthorization(options, client, request),
+      disconnect: (request) => disconnectLinearConnection(options, client, request),
       callback: (request) => completeAuthorization(options, client, request),
     },
   };
+}
+
+async function startAuthorization(
+  options: LinearConnectionOptions,
+  client: LinearConnectionClient | undefined,
+  request: Request,
+): Promise<Response> {
+  if (!isHttpsCallbackOrigin(options.callbackOrigin)) {
+    return Response.json({ error: "https_required" }, { status: 400 });
+  }
+  const rejected = options.auth.rejectCookieMutation(request);
+  if (rejected !== undefined) return rejected;
+  try {
+    const access = await manageConnectionAccess(options.auth, options.database, request);
+    if (client === undefined)
+      return Response.json({ error: "provider_not_configured" }, { status: 409 });
+    const state = newConnectionState();
+    await options.database.startConnectionAttempt({
+      provider: "linear",
+      stateVerifier: stateHash(state),
+      access: connectionAccess(access),
+      lifetimeMinutes: CONNECTION_ATTEMPT_LIFETIME_MINUTES,
+      callbackOrigin: options.callbackOrigin,
+      configurationVersion: options.configurationVersion,
+      providerApplicationId: options.configuration.clientId,
+      configurationSnapshot: { provider: "linear", ...options.configuration },
+      expectedConfigurationVersion: options.expectedConfigurationVersion ?? null,
+      activateConfiguration: options.activateConfiguration,
+    });
+    return Response.json({ url: client.authorizationUrl(state) });
+  } catch (error) {
+    return connectionActionFailure(error, "linear", "start");
+  }
+}
+
+async function disconnectLinearConnection(
+  options: LinearConnectionOptions,
+  client: LinearConnectionClient | undefined,
+  request: Request,
+): Promise<Response> {
+  const rejected = options.auth.rejectCookieMutation(request);
+  if (rejected !== undefined) return rejected;
+  try {
+    const access = await manageConnectionAccess(options.auth, options.database, request);
+    const disconnected = await options.database.disconnectConnection(
+      "linear",
+      requiredConnectionId(request),
+      connectionAccess(access),
+    );
+    if (disconnected.provider === "linear" && disconnected.accessToken !== undefined) {
+      void client?.revoke(disconnected.accessToken).catch((error: unknown) => {
+        logger.warn({ err: error, provider: "linear" }, "provider cleanup failed after disconnect");
+      });
+    }
+    return Response.json({ disconnected: true });
+  } catch (error) {
+    return connectionActionFailure(error, "linear", "disconnect");
+  }
 }
 
 function isHttpsCallbackOrigin(value: string): boolean {
@@ -453,21 +540,7 @@ async function completeAuthorization(
     callbackOrigin = attempt.callbackOrigin;
     const installation = await client.exchangeCode(code);
     const binding = linearBinding(state, access, installation, options.configuration.clientId);
-    if (attempt.activateConfiguration) {
-      if (options.onVerifiedInstallation === undefined) {
-        throw new Error("Linear installation handler unavailable");
-      }
-      await options.onVerifiedInstallation({
-        configuration: attempt.configurationSnapshot,
-        expectedConfigurationVersion: attempt.expectedConfigurationVersion ?? undefined,
-        callbackOrigin: attempt.callbackOrigin,
-        userId: attempt.userId,
-        installation,
-        binding,
-      });
-    } else {
-      await options.database.bindLinearConnection(binding);
-    }
+    await bindVerifiedLinearInstallation(options, attempt, installation, binding);
     return connectionResult(callbackOrigin, attempt.returnRoute, "linear_connected", "linear");
   } catch (error) {
     return connectionCallbackFailure({
@@ -479,6 +552,26 @@ async function completeAuthorization(
       returnRoute,
     });
   }
+}
+
+function bindVerifiedLinearInstallation(
+  options: LinearConnectionOptions,
+  attempt: Awaited<ReturnType<Database["readConnectionAttempt"]>>,
+  installation: LinearInstallation,
+  binding: BindLinearConnectionInput,
+) {
+  if (!attempt.activateConfiguration) return options.database.bindLinearConnection(binding);
+  if (options.onVerifiedInstallation === undefined) {
+    throw new Error("Linear installation handler unavailable");
+  }
+  return options.onVerifiedInstallation({
+    configuration: attempt.configurationSnapshot,
+    expectedConfigurationVersion: attempt.expectedConfigurationVersion ?? undefined,
+    callbackOrigin: attempt.callbackOrigin,
+    userId: attempt.userId,
+    installation,
+    binding,
+  });
 }
 
 class LinearCallbackError extends Error {

@@ -1,4 +1,4 @@
-import type { FormEvent } from "react";
+import type { SyntheticEvent } from "react";
 
 import { AuthForm } from "../components/app/auth-form.js";
 import { FormField } from "../components/app/form-field.js";
@@ -12,25 +12,13 @@ export function LoginForm({
 }: {
   mode: "signIn" | "signUp";
   busy: boolean;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmit: (event: SyntheticEvent<HTMLFormElement>) => void;
   emailValue?: string;
   emailReadOnly?: boolean;
 }) {
   const prefix = mode === "signIn" ? "sign-in" : "sign-up";
   const action = mode === "signIn" ? "Sign in" : "Create account";
-  const emailProps: {
-    value?: string;
-    defaultValue?: string;
-    readOnly?: boolean;
-  } = {};
-  if (emailValue !== undefined) {
-    if (emailReadOnly) {
-      emailProps.value = emailValue;
-      emailProps.readOnly = true;
-    } else {
-      emailProps.defaultValue = emailValue;
-    }
-  }
+  const emailProps = loginEmailProps(emailValue, emailReadOnly);
   return (
     <AuthForm label={action} busy={busy} submitLabel={action} onSubmit={onSubmit}>
       {mode === "signUp" && (
@@ -63,4 +51,21 @@ export function LoginForm({
       />
     </AuthForm>
   );
+}
+
+function loginEmailProps(emailValue: string | undefined, emailReadOnly: boolean) {
+  const emailProps: {
+    value?: string;
+    defaultValue?: string;
+    readOnly?: boolean;
+  } = {};
+  if (emailValue !== undefined) {
+    if (emailReadOnly) {
+      emailProps.value = emailValue;
+      emailProps.readOnly = true;
+    } else {
+      emailProps.defaultValue = emailValue;
+    }
+  }
+  return emailProps;
 }

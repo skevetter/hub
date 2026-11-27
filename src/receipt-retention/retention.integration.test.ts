@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { embeddedDatabaseRuntime } from "../db/runtime/index.js";
+import { embeddedDatabaseRuntime, type QueryHandle } from "../db/runtime/index.js";
 import { afterAll, beforeAll, describe, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { createPostgresTestRuntime } from "../db/test-utils/runtime.js";
@@ -120,15 +120,7 @@ describe("unhandled receipt retention", () => {
         retention.start();
         retention.start();
         try {
-          const deadline = Date.now() + 5000;
-          for (;;) {
-            const result = await runtime.query(
-              "select id from provider_event_receipts where delivery_id = 'automatic'",
-            );
-            if (result.rowCount === 0) break;
-            assert.ok(Date.now() < deadline, "automatic cleanup did not run");
-            await delay(10);
-          }
+          await waitForAutomaticCleanup(runtime);
         } finally {
           await retention.stop();
         }
@@ -140,3 +132,15 @@ describe("unhandled receipt retention", () => {
     120_000,
   );
 });
+
+async function waitForAutomaticCleanup(runtime: QueryHandle) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const result = await runtime.query(
+      "select id from provider_event_receipts where delivery_id = 'automatic'",
+    );
+    if (result.rowCount === 0) break;
+    assert.ok(Date.now() < deadline, "automatic cleanup did not run");
+    await delay(10);
+  }
+}

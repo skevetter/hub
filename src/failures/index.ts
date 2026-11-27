@@ -101,11 +101,34 @@ export function reportFailure(
     const existing = reportedErrors.get(error);
     if (existing !== undefined) return existing;
   }
+  const report = describeFailure(error, context, options);
+  const record = failureRecord(asError(error), context, options, report);
+  const log = failureLogger(options, activeRequest);
+  if (isExpected(report.kind)) log.warn(record, `${context.operation} failed`);
+  else log.error(record, `${context.operation} failed`);
+  if (typeof error === "object" && error !== null) reportedErrors.set(error, report);
+  return report;
+}
+
+function failureLogger(options: ReportOptions, activeRequest: RequestFailureState | undefined) {
+  return options.logger ?? activeRequest?.logger ?? defaultLogger;
+}
+
+function describeFailure(error: unknown, context: FailureContext, options: ReportOptions) {
   const kind = options.kind ?? classifyFailure(error, options.status ?? context.status);
   const requestId = context.requestId ?? randomUUID();
-  const record = {
+  return { kind, requestId };
+}
+
+function failureRecord(
+  error: Error,
+  context: FailureContext,
+  options: ReportOptions,
+  { kind, requestId }: FailureReport,
+) {
+  return {
     err: errorForLog(
-      asError(error),
+      error,
       options.scrubValues === undefined ? {} : { scrubValues: options.scrubValues },
     ),
     failureKind: kind,
@@ -121,12 +144,6 @@ export function reportFailure(
           ),
         }),
   };
-  const log = options.logger ?? activeRequest?.logger ?? defaultLogger;
-  if (isExpected(kind)) log.warn(record, `${context.operation} failed`);
-  else log.error(record, `${context.operation} failed`);
-  const report = { kind, requestId };
-  if (typeof error === "object" && error !== null) reportedErrors.set(error, report);
-  return report;
 }
 
 export function respondWithFailure(
@@ -148,6 +165,10 @@ export function classifyFailure(error: unknown, status?: number): FailureKind {
   const code = errorProperty(error, "code") ?? errorProperty(error, "reason");
   const codeKind = code === undefined ? undefined : FAILURE_CODES.get(code);
   if (codeKind !== undefined) return codeKind;
+  return classifyErrorIdentity(error);
+}
+
+function classifyErrorIdentity(error: unknown): FailureKind {
   const name = error instanceof Error ? error.name : undefined;
   const nameKind = name === undefined ? undefined : classifyErrorName(name);
   if (nameKind !== undefined) return nameKind;
