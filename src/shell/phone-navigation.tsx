@@ -17,7 +17,8 @@ import { CommandSearchButton } from "./command-menu.js";
 import { CrumbLink } from "./crumb-link.js";
 import { NavItem, PHONE_TAB_CLASS, type NavigationItem } from "./navigation-group.js";
 
-const PHONE_CRUMB_LINK = "truncate underline-offset-4 hover:underline focus-visible:underline";
+const PHONE_CRUMB_LINK =
+  "relative z-10 -mt-1.5 -mb-5.5 -mx-2.5 truncate px-2.5 pt-1.5 pb-5.5 underline-offset-4 hover:underline focus-visible:underline";
 
 export function PhoneHeader({
   scope,

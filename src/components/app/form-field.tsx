@@ -178,7 +178,7 @@ export function FieldSkeleton({ description = true }: { description?: boolean })
   return (
     <div className="grid gap-2">
       <Skeleton className="h-4 w-28" />
-      <Skeleton className="h-8 w-full" />
+      <Skeleton className="h-8 w-full max-md:h-11" />
       {description ? <Skeleton className="h-4 w-48" /> : null}
     </div>
   );

@@ -145,7 +145,7 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
     await steps.expectSummary(2, "Agent: Gateway Model v1", true);
     for (const width of [1280, 390, 320]) {
       await page.setViewportSize({ width, height: 900 });
-      await steps.expectRowControlsFit(2, width >= 390);
+      await steps.expectRowControlsFit(2);
     }
     await page.setViewportSize({ width: 1280, height: 900 });
     await steps.rename(2, "fix");

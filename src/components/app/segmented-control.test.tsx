@@ -83,6 +83,15 @@ describe("segmented control semantics", () => {
     assert.equal(markup.match(/max-md:min-h-11/gu)?.length, MODES.length);
     assert.equal(markup.match(/max-md:min-w-11/gu)?.length, MODES.length);
   });
+
+  it("wraps inside a narrow card instead of widening it", () => {
+    const markup = renderToStaticMarkup(
+      <SegmentedControl label="Editor mode" value="yaml" options={MODES} onChange={NOOP} />,
+    );
+
+    assert.match(markup, /class="[^"]*\bflex-wrap\b/u);
+    assert.match(markup, /class="[^"]*\bmax-w-full\b/u);
+  });
 });
 
 const WITH_LUCIDE_ICON: readonly SegmentedOption[] = [

@@ -80,7 +80,7 @@ export function SegmentedControl({
           ? {}
           : { "aria-describedby": descriptionId })}
         onKeyDown={move}
-        className="inline-flex w-fit items-center gap-0.5 rounded-sm bg-muted p-0.5"
+        className="inline-flex w-fit max-w-full flex-wrap items-center gap-0.5 rounded-sm bg-muted p-0.5"
       >
         {options.map((option) => (
           <Segment

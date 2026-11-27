@@ -33,7 +33,7 @@ export function TabNav({ label, items }: { label: string; items: readonly TabNav
             to={item.to as never}
             aria-current={active ? "page" : undefined}
             className={cn(
-              "-mb-px inline-flex h-9 items-center border-b text-sm transition-colors duration-150",
+              "relative -mb-px inline-flex h-9 items-center border-b text-sm transition-colors duration-150 max-md:after:absolute max-md:after:top-0 max-md:after:-inset-x-2 max-md:after:-bottom-2.5",
               active
                 ? "border-foreground text-foreground"
                 : "border-transparent text-muted-foreground hover:text-foreground",
