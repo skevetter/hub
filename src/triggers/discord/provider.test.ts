@@ -4,6 +4,7 @@ import { createMemoryDatabase } from "../../db/memory.js";
 import { createAttachmentCapabilityRegistry } from "../../attachments/capabilities.js";
 import { createActiveProjectConfiguration } from "../../test-utils/project-configuration.js";
 import { MemoryDiscordBotClient } from "./memory-bot.js";
+import { matchDiscordTriggers, readDiscordInvocationParserMessage } from "./match.js";
 import { createDiscordTriggerProvider } from "./provider.js";
 import type { NormalizedDiscordMessageEvent } from "./events.js";
 import { isAcceptedTriggerProviderMatch } from "../index.js";
@@ -60,6 +61,53 @@ describe("Discord Phase 1 trigger provider", () => {
       throw new Error("expected accepted matches");
     assert.ok(root.conversation);
     assert.equal(root.conversation.key, reply.conversation?.key);
+  });
+
+  it("keeps exact command boundaries and mention precedence with large Unicode content", () => {
+    const config = {
+      triggers: [
+        { name: "run", on: "discord.mention", filters: { pattern: "run", from_users: ["tester"] } },
+      ],
+    };
+    const suffix = "\u2603".repeat(100_000);
+    const mention = event({
+      content: `<@!900> wrong <@900> run\u00a0${suffix}`,
+    });
+    assert.equal(matchDiscordTriggers(config, mention, "900").length, 1);
+    assert.equal(readDiscordInvocationParserMessage(mention, "900", { pattern: "run" }), suffix);
+    const joined = event({ content: `<@900> run${suffix}` });
+    assert.deepEqual(matchDiscordTriggers(config, joined, "900"), []);
+    assert.equal(
+      readDiscordInvocationParserMessage(joined, "900", { pattern: "run" }),
+      `run${suffix}`,
+    );
+    assert.deepEqual(matchDiscordTriggers(config, event({ content: "" }), "900"), []);
+  });
+
+  it("parses before touching configuration and does not ask for bot identity on a drop", async () => {
+    const { project, revision, store } = await activeConfiguration();
+    const bot = new MemoryDiscordBotClient({ selfUserId: "900" });
+    const identity = vi.spyOn(bot, "getSelfUserId").mockImplementation(() => {
+      throw new Error("self user unavailable");
+    });
+    const configuration = vi.fn(() => store);
+    const provider = createDiscordTriggerProvider({
+      configurationStoreForProject: configuration,
+      bot,
+    });
+    const trigger = external(project.id, revision.id, event());
+
+    await assert.rejects(
+      provider.match({ ...trigger, payload: null }),
+      /expected object, received null/u,
+    );
+    assert.equal(configuration.mock.calls.length, 0);
+    assert.equal(
+      await provider.match({ ...trigger, source: "discord.other" }),
+      "no_trigger_for_source",
+    );
+    assert.equal(identity.mock.calls.length, 0);
+    await assert.rejects(provider.match(trigger), { message: "self user unavailable" });
   });
 
   it("normalizes typed inputs identically at the provider boundary", async () => {
