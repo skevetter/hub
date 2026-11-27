@@ -1231,6 +1231,33 @@ run:
     assert.deepEqual(dispatches, []);
   });
 
+  it.each([
+    { name: "a later step can be skipped", later: "${{ false }}", candidate: true },
+    { name: "the later step always runs", later: undefined, candidate: false },
+  ])("marks the first step as a reply candidate only when $name", async ({ later, candidate }) => {
+    const raw = replyCandidateConfiguration(later);
+    const compiled = structuredClone(compileHubConfig(raw));
+    for (const trigger of compiled.triggers) trigger.replyMessage = true;
+    const fixture = await workflowFixture({
+      rawConfiguration: raw,
+      compiledConfiguration: compiled,
+    });
+    const intents: LaunchMachineIntent[] = [];
+    const { handler, engine } = engineFor(fixture, [], {
+      beforeDispatch: async (intent) => {
+        intents.push(intent);
+      },
+    });
+
+    await handler(fixture.trigger("run"));
+    await engine.processAvailable();
+
+    assert.equal(intents.length, 1);
+    assert.equal(intents[0]?.replyCaptureCandidate, candidate ? true : undefined);
+    assert.equal(intents[0]?.replyMessage, undefined);
+    assert.deepEqual(intents[0]?.allowOutputs, []);
+  });
+
   it("does not persist or dispatch skipped-step GitHub authority", async () => {
     const fixture = await workflowFixture({ rawConfiguration: skippedAuthorityConfiguration() });
     const intents: LaunchMachineIntent[] = [];
@@ -2452,6 +2479,29 @@ function namedSelectionConfiguration(): Record<string, unknown> {
             prompt: [{ text: "Work" }],
           },
         ],
+      },
+    ],
+  };
+}
+
+function replyCandidateConfiguration(laterCondition: string | undefined): Record<string, unknown> {
+  const step = (id: string, condition?: string) => ({
+    id,
+    ...(condition === undefined ? {} : { if: condition }),
+    environment: "runner",
+    max_runtime: "10m",
+    idle_timeout: "1m",
+    agent: { provider: "codex" },
+    prompt: [{ text: id }],
+  });
+  return {
+    environments: [{ name: "runner", kind: "daemon", daemon: "runner", cwd: "/workspace" }],
+    triggers: [
+      {
+        name: "reply-candidate",
+        on: "manual.run",
+        max_runtime: "1h",
+        steps: [step("first"), step("last", laterCondition)],
       },
     ],
   };

@@ -10,16 +10,33 @@ in the trigger editor. Replies are off by default. The trigger needs a named
 ## Answer selection and privacy
 
 Hub waits for the workflow to succeed and uses the final assistant message from
-the last agent step it ran. It collects live message deltas for that turn in
-memory and redacts credentials before sending. After a successful call to
-`finish_execution`, Hub waits up to 10 seconds for that turn to end. An empty
-final message or a missing turn end produces a refusal on the run.
+the last agent step that ran. A step skipped by its `if` does not count, so an
+earlier step's final message is posted when every later agent step was skipped.
+If no agent step ran, the run records `No agent step ran, so there was no reply.`
+Hub collects live message deltas for every agent step that could be last, in
+memory, and redacts credentials before sending. Only the message of the step that
+ran last leaves Hub. If that step sends an empty final message, Hub refuses the
+reply and does not fall back to an earlier step.
+
+Answer capture adds no tool. The automatic `<provider>.reply` output is granted
+to the last agent step by position, and to any step you grant it to explicitly.
+A step without that grant can have its final message posted by Hub, but it cannot
+post through the tool. To let an earlier step reply with the tool, grant it that
+output yourself.
+
+Because an earlier step's final message can now be posted, give each step that
+could be last only context you are willing to show the issue's readers.
+
+After a successful call to `finish_execution`, Hub waits up to 10 seconds for
+that turn to end. A missing turn end produces a refusal on the run.
 
 The answer leaves Hub for the source issue as a new Paseo app comment. Anyone
 who can read the issue can read the answer. Hub retains only delivery
 metadata, including the comment ID, length and hash. For an opted-in run,
-inferred turn completion records the completion status in execution results
-and step outputs. The captured assistant message stays in memory through delivery.
+inferred turn completion on the last agent step by position records the
+completion status in its execution result and step output, without the message.
+Earlier steps keep recording their message as before. Captured messages stay
+in memory until the run settles, and Hub reads only the one from the last step that ran.
 
 ## Delivery and repair
 

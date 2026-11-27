@@ -25,7 +25,7 @@ import {
 } from "../config/compiler.js";
 import { triggerDocumentName, type CompiledProjectConfiguration } from "../configuration/store.js";
 import { logger as defaultLogger } from "../logger.js";
-import { capturesReply } from "./reply-capture.js";
+import { capturesReply, isReplyCaptureCandidate } from "./reply-capture.js";
 import { reportFailure } from "../failures/index.js";
 import { durableExecutionId } from "../daemons/lifecycle.js";
 import { EntitlementDenied } from "../entitlements/catalog.js";
@@ -1602,6 +1602,7 @@ function buildAgentLaunchIntent(
     background: step.background,
     ...(step.completeOnTurnEnd === true ? { completeOnTurnEnd: true } : {}),
     ...(capturesReply(trigger, step) ? { replyMessage: true } : {}),
+    ...(isReplyCaptureCandidate(trigger, step) ? { replyCaptureCandidate: true } : {}),
     triggerContext: run.triggerContext,
     outputContext: run.outputContext,
     configurationRevisionId: run.configurationRevisionId,

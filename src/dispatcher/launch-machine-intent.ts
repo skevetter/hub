@@ -40,7 +40,10 @@ export interface LaunchMachineIntent {
   background: boolean;
   /** Complete the execution when the agent's turn ends without finish_execution. */
   completeOnTurnEnd?: boolean;
+  /** The last agent step by position: its answer is kept out of step output. */
   replyMessage?: true;
+  /** The run's reply may be this step's final answer. Watching it grants no tool. */
+  replyCaptureCandidate?: true;
   triggerContext: unknown;
   outputContext: unknown;
   outputSchema?: JsonValue;
@@ -71,6 +74,7 @@ export function buildLaunchMachineIntent(input: {
   /** Complete the execution when the agent's turn ends without finish_execution. */
   completeOnTurnEnd?: boolean;
   replyMessage?: true;
+  replyCaptureCandidate?: true;
   triggerContext: unknown;
   outputContext: unknown;
   hubConfig: unknown;
@@ -96,6 +100,7 @@ export function buildLaunchMachineIntent(input: {
     background: input.background,
     ...(input.completeOnTurnEnd === true ? { completeOnTurnEnd: true } : {}),
     ...(input.replyMessage === true ? { replyMessage: true } : {}),
+    ...(input.replyCaptureCandidate === true ? { replyCaptureCandidate: true } : {}),
     triggerContext: input.triggerContext,
     outputContext: input.outputContext,
     configurationRevisionId: input.configurationRevisionId,

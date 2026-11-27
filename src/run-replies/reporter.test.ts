@@ -63,6 +63,48 @@ describe("run reply reporting", () => {
     },
   );
 
+  it("posts the answer of the last agent step that ran when a later step was skipped", async () => {
+    const database = createMemoryDatabase();
+    const organizationId = "org";
+    const fake = fakeLinearReplies(organizationId, database);
+    const writer = new LinearRunReplyWriter({
+      database,
+      client: fake.client,
+      clientSecret: "fake-client-secret",
+      providerApplicationId: "app",
+      connectionForLinearOrganization: fake.connectionForLinearOrganization,
+    });
+    const reporter = new RunReplyReporter({ database, writer: () => writer, perHour: 60 });
+    const fixture = await turnEndFixture({
+      database,
+      organizationId,
+      workflow: true,
+      completeOnTurnEnd: true,
+      replyCaptureCandidate: true,
+      laterStepIds: ["last"],
+      onRunReplyAnswer: reporter.capture,
+      ...replyEvidence,
+    });
+    try {
+      const { execution } = await fixture.dispatch();
+      const runId = execution.launchIntent?.triggerRunId;
+      assert.ok(runId);
+      await fixture.endTurn("The earlier step's answer.");
+      await fixture.clock.advance(TURN_END_SETTLE_MS);
+      await database.markWorkflowStepSkipped(runId, "last", "condition_false");
+      await database.succeedTriggerRun(runId);
+      await reporter.processAvailable();
+      await reporter.processAvailable();
+      const delivery = await database.runReplies.find({ organizationId, runId });
+      assert.equal(delivery?.state, "sent");
+      assert.equal(fake.writes.length, 1);
+      assert.match(fake.writes[0]!, /^The earlier step's answer\./u);
+    } finally {
+      await fixture.lifecycle.stop();
+      await reporter.stop();
+    }
+  });
+
   describe("polling", () => {
     afterEach(() => vi.useRealTimers());
 
@@ -159,7 +201,7 @@ describe("run reply reporting", () => {
       assert.ok(finds().includes("a") && finds().includes("b"));
     });
 
-    it("settles a pending row left by a restart within the idle interval", async () => {
+    it("settles a run in which no agent step ran with no_agent_step", async () => {
       vi.useFakeTimers();
       const database = createMemoryDatabase();
       const { run } = await database.createAcceptedTriggerRun({
@@ -182,6 +224,30 @@ describe("run reply reporting", () => {
       await vi.advanceTimersByTimeAsync(30_500);
       const delivery = await database.runReplies.find({ organizationId: "org", runId: run.id });
       await reporter.stop();
+      assert.equal(delivery?.failure, "no_agent_step");
+    });
+
+    it("settles a pending row left by a restart after an agent step ran", async () => {
+      vi.useFakeTimers();
+      const database = createMemoryDatabase();
+      const fixture = await turnEndFixture({
+        database,
+        organizationId: "org",
+        workflow: true,
+        onRunReplyAnswer: () => undefined,
+        ...replyEvidence,
+      });
+      const { execution } = await fixture.dispatch();
+      const runId = execution.launchIntent?.triggerRunId;
+      assert.ok(runId);
+      await database.succeedTriggerRun(runId);
+      await vi.advanceTimersByTimeAsync(180_000);
+      const reporter = new RunReplyReporter({ database, writer: () => undefined, perHour: 60 });
+      reporter.start();
+      await vi.advanceTimersByTimeAsync(30_500);
+      const delivery = await database.runReplies.find({ organizationId: "org", runId });
+      await reporter.stop();
+      await fixture.lifecycle.stop();
       assert.equal(delivery?.failure, "answer_unavailable");
     });
   });
