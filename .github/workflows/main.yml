@@ -156,12 +156,14 @@ jobs:
       (github.event_name == 'push' && needs.publish.result == 'success' && needs.package.outputs.held == 'false'))
     runs-on: ubuntu-latest
     environment: production
+    # Worst case: 33m polling (2 x 15 x 66s), 10m31s quiet, about 9m for
+    # other SSH calls, both external smokes and fallback pause. The rest is for setup.
     timeout-minutes: 55
     permissions:
       contents: read
     outputs:
       deployed: ${{ steps.deploy.outputs.deployed }}
-      install_accepted: ${{ steps.deploy.outputs.install_accepted }}
+      install_attempted: ${{ steps.deploy.outputs.install_attempted }}
     concurrency:
       group: deploy-production
       cancel-in-progress: false
@@ -193,13 +195,13 @@ jobs:
           DEPLOY_VERSION: ${{ needs.dispatch-guard.outputs.version || needs.package.outputs.version }}
           DEPLOY_CHECKSUM: ${{ needs.dispatch-guard.outputs.checksum || needs.package.outputs.checksum }}
           MANUAL_DEPLOY: ${{ github.event_name == 'workflow_dispatch' }}
-          HELD: ${{ needs.dispatch-guard.outputs.prerelease == 'true' }}
           HUB_PUBLIC_URL: ${{ vars.HUB_PUBLIC_URL }}
           VPS2_SSH_HOST: ${{ secrets.VPS2_SSH_HOST }}
           VPS2_SSH_PORT: ${{ secrets.VPS2_SSH_PORT }}
         run: bash scripts/cd/deploy.sh
       - name: Pause after an interrupted install
-        if: (cancelled() || failure()) && steps.deploy.outputs.install_accepted == 'true'
+        if: (cancelled() || failure()) && steps.deploy.outputs.install_attempted == 'true' && steps.deploy.outputs.deployed != 'true'
+        timeout-minutes: 1
         env:
           VPS2_SSH_HOST: ${{ secrets.VPS2_SSH_HOST }}
           VPS2_SSH_PORT: ${{ secrets.VPS2_SSH_PORT }}
@@ -235,11 +237,13 @@ jobs:
 
   notify:
     name: notify
-    needs: [package, publish, dispatch-guard, deploy, promote]
+    needs: [check, package, publish, dispatch-guard, deploy, promote]
     if: >-
       always() && github.ref == 'refs/heads/main' && github.repository == 'skevetter/hub' &&
       (needs.deploy.result == 'failure' || needs.dispatch-guard.result == 'failure' || needs.promote.result == 'failure' ||
-      (needs.deploy.result == 'cancelled' && needs.deploy.outputs.install_accepted == 'true') ||
+      (github.event_name == 'push' && needs.check.result == 'failure') ||
+      (needs.deploy.result == 'cancelled' && needs.deploy.outputs.install_attempted == 'true' &&
+      needs.deploy.outputs.deployed != 'true') ||
       needs.publish.result == 'failure' || needs.publish.result == 'cancelled' || needs.package.result == 'failure' ||
       (needs.publish.result == 'success' && needs.package.outputs.held == 'true'))
     runs-on: ubuntu-latest

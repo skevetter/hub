@@ -28,6 +28,13 @@ const uniqueIndex = new RegExp(
   "iu",
 );
 
+const sqlTokens =
+  /"(?:[^"]|"")*"|(?<![\w$])[eE]'|'(?:[^'\\]|'')*\\|'(?:[^']|'')*'|--[^\n]*|\/\*[\s\S]*?\*\/|(?<![\w$])(\$(?:[a-zA-Z_]\w*)?\$)[\s\S]*?\1|;/gu;
+
+function ambiguousString(token) {
+  return /^[eE]'/u.test(token) || (token.startsWith("'") && token.endsWith("\\"));
+}
+
 function canonicalTable(name) {
   const parts = name.match(new RegExp(identifier, "gu"));
   return JSON.stringify(
@@ -64,13 +71,12 @@ function isUnsafe(statement, newTables, existingTables) {
 }
 
 function statements(sql) {
-  const tokens =
-    /"(?:[^"]|"")*"|'(?:[^']|'')*'|--[^\n]*|\/\*[\s\S]*?\*\/|(?<![\w$])(\$(?:[a-zA-Z_]\w*)?\$)[\s\S]*?\1|;/gu;
   const result = [];
   let statement = "";
   let offset = 0;
-  for (const match of sql.matchAll(tokens)) {
+  for (const match of sql.matchAll(sqlTokens)) {
     const token = match[0];
+    if (ambiguousString(token)) return null;
     statement += sql.slice(offset, match.index);
     offset = match.index + token.length;
     if (token === ";") {
@@ -85,7 +91,8 @@ function statements(sql) {
 }
 
 export function needsRollbackReview(sql, newTables = new Set(), existingTables = new Set()) {
-  return statements(sql).some((statement) => isUnsafe(statement, newTables, existingTables));
+  const parsed = statements(sql);
+  return !parsed || parsed.some((statement) => isUnsafe(statement, newTables, existingTables));
 }
 
 function migrationPaths(base, filter) {
@@ -95,11 +102,16 @@ function migrationPaths(base, filter) {
 
 function previouslyCreated(base) {
   if (!base) return new Set();
-  const found = migrationPaths(base, "M").flatMap((file) => {
-    const created = statements(git("show", `${base}:${file}`)).map((sql) => createTable.exec(sql));
-    return created.filter(Boolean).map((match) => canonicalTable(match[1]));
-  });
-  return new Set(found);
+  const found = new Set();
+  for (const file of migrationPaths(base, "M")) {
+    const parsed = statements(git("show", `${base}:${file}`));
+    if (!parsed) return null;
+    for (const sql of parsed) {
+      const created = createTable.exec(sql);
+      if (created) found.add(canonicalTable(created[1]));
+    }
+  }
+  return found;
 }
 
 if (import.meta.main && process.env.ROLLBACK_UNSAFE !== "true") {
@@ -112,7 +124,7 @@ if (import.meta.main && process.env.ROLLBACK_UNSAFE !== "true") {
   const existingTables = previouslyCreated(base);
   for (const file of migrationPaths(base, "AM")) {
     const sql = readFileSync(file, "utf8");
-    if (!needsRollbackReview(sql, newTables, existingTables)) continue;
+    if (existingTables && !needsRollbackReview(sql, newTables, existingTables)) continue;
     if (release) {
       console.log("true");
       process.exit(0);

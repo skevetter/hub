@@ -31,7 +31,7 @@ verify_release_files() (
   sha256sum --check --strict "$file.sha256"
   gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" \
     --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/main.yml" \
-    --source-ref refs/heads/main --source-digest "$DEPLOY_SHA"
+    --source-ref refs/heads/main --source-digest "$DEPLOY_SHA" --deny-self-hosted-runners
 )
 
 read_release() {

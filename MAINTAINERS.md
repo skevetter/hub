@@ -58,7 +58,7 @@ manually from `main` with its exact SHA.
 Automatic deploys take a backup, install, and check the service. A failed smoke check rolls back
 and pauses deployment. Mark incompatible migrations and persisted data changes `rollback-unsafe`
 on the PR. The pipeline publishes held releases as prereleases. It keeps the hold on subsequent
-releases until a successful manual deploy promotes a prerelease. Held deployments do not roll back
+releases until a successful manual deploy promotes a prerelease. Manual deployments do not roll back
 automatically. Only the repository owner can unpause. See the `cd-alert` issues for failed or held
 releases.
 
@@ -68,6 +68,8 @@ releases.
   can change that flag.
 - Store deploy secrets only in the `production` environment, never at repository level.
 - The `production` environment limits deployment to `main`.
+- A runner killed without running its signal traps can leave an accepted install unrecorded.
+  Use `cd-control status` to see the running version and reconcile it.
 
 ## Update public documentation
 

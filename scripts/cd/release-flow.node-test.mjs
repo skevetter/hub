@@ -30,7 +30,7 @@ if (verb === "release" && action === "create") {
   const expected = [
     "getpaseo-hub-1.0.1.tgz", "--repo", "skevetter/hub",
     "--signer-workflow", "skevetter/hub/.github/workflows/main.yml",
-    "--source-ref", "refs/heads/main", "--source-digest", env.DEPLOY_SHA,
+    "--source-ref", "refs/heads/main", "--source-digest", env.DEPLOY_SHA, "--deny-self-hosted-runners",
   ];
   if (JSON.stringify(args) !== JSON.stringify(expected) || env.BAD_ATTESTATION === "yes") {
     process.exitCode = 1;

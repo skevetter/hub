@@ -14,6 +14,17 @@ echo "$VPS2_SSH_HOST $RUNNER_TEMP/hub-deploy-key" >&2
 case "$command" in
   status) echo "{\\"ok\\":true,\\"commit\\":$RUNNING,\\"private\\":\\"$VPS2_SSH_HOST\\",\\"version\\":\\"1.0.0\\\\n$VPS2_SSH_HOST\\"}" ;;
   backup*) echo '{"ok":true,"entries":5,"bytes":99,"file":"/private/database.dump"}' ;;
+  install*)
+    if [[ "$REFUSE_INSTALL" == yes ]]; then echo '{"ok":false,"reason":"refused"}'; exit 2; fi
+    if [[ -n "$INTERRUPT_INSTALL" ]]; then
+      kill -s "$INTERRUPT_INSTALL" "$DEPLOY_PID"
+      for ((i=0; i<100; i++)); do
+        if grep -qx pause "$RUNNER_TEMP/calls"; then break; fi
+        sleep 0.02
+      done
+      printf '%s\\n' install-reply >> "$RUNNER_TEMP/calls"
+    fi
+    echo '{"ok":true}' ;;
   wait\\ 60)
     if [[ -n "$INTERRUPT" ]]; then kill -s "$INTERRUPT" "$DEPLOY_PID"; fi
     if ! grep -qx rollback "$RUNNER_TEMP/calls"; then
@@ -26,6 +37,7 @@ case "$command" in
     echo '{"ok":true,"state":"done"}' ;;
   wait*) echo '{"ok":true,"state":"done"}' ;;
   record*) if [[ "$RECORD_FAIL" == yes ]]; then echo '{"ok":false}'; exit 4; fi
+    if [[ "$INTERRUPT_RECORD" == yes ]]; then kill -TERM "$DEPLOY_PID"; fi
     echo '{"ok":true}' ;;
   smoke\\ 1.1.0)
     if [[ "$SMOKE_FAIL" == yes ]]; then echo '{"ok":false,"checks":{"local_health":false}}'; exit 3; fi
@@ -66,6 +78,7 @@ function execute(action, options = {}) {
     writeFileSync(outputPath, "");
     const result = spawnSync("bash", args, {
       encoding: "utf8",
+      timeout: 10_000,
       env: {
         ...process.env,
         PATH: `${temp}:${process.env.PATH}`,
@@ -101,7 +114,7 @@ test("deploys from a null running commit and records only after smoke", () => {
   const result = execute("deploy");
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.calls, [...deployCalls, "record"]);
-  assert.equal(result.output, "install_accepted=true\ndeployed=true\n");
+  assert.equal(result.output, "install_attempted=true\ndeployed=true\n");
 });
 
 test("skips a superseded commit before precheck", () => {
@@ -127,9 +140,35 @@ test("pauses on INT or TERM after the install is accepted", () => {
   ]) {
     const result = execute("deploy", { INTERRUPT });
     assert.equal(result.status, code, result.stderr);
-    assert.equal(result.output, "install_accepted=true\n");
+    assert.equal(result.output, "install_attempted=true\n");
     assert.deepEqual(result.calls, [...deployCalls.slice(0, 6), "pause"]);
   }
+});
+
+test("pauses on INT or TERM before the remote install replies", () => {
+  for (const [INTERRUPT_INSTALL, code] of [
+    ["INT", 130],
+    ["TERM", 143],
+  ]) {
+    const result = execute("deploy", { INTERRUPT_INSTALL });
+    assert.equal(result.status, code, result.stderr);
+    assert.equal(result.output, "install_attempted=true\n");
+    assert.deepEqual(result.calls, [...deployCalls.slice(0, 5), "pause", "install-reply"]);
+  }
+});
+
+test("clears the attempted flag without pausing when install is refused", () => {
+  const result = execute("deploy", { REFUSE_INSTALL: "yes" });
+  assert.equal(result.status, 2, result.stderr);
+  assert.equal(result.output, "install_attempted=true\ninstall_attempted=false\n");
+  assert.deepEqual(result.calls, deployCalls.slice(0, 5));
+});
+
+test("does not pause when cancellation arrives during a successful record", () => {
+  const result = execute("deploy", { INTERRUPT_RECORD: "yes" });
+  assert.equal(result.status, 143, result.stderr);
+  assert.equal(result.output, "install_attempted=true\ndeployed=true\n");
+  assert.deepEqual(result.calls, [...deployCalls, "record"]);
 });
 
 test("fails closed when git cannot establish ancestry", () => {
@@ -145,9 +184,11 @@ test("rolls back, waits, smokes and pauses after a failed smoke", () => {
 });
 
 test("pauses without rollback after a manual deployment fails smoke", () => {
-  const result = execute("deploy", { SMOKE_FAIL: "yes", MANUAL_DEPLOY: "true" });
-  assert.equal(result.status, 1);
-  assert.deepEqual(result.calls, [...deployCalls, "pause"]);
+  for (const HELD of ["false", "true"]) {
+    const result = execute("deploy", { SMOKE_FAIL: "yes", MANUAL_DEPLOY: "true", HELD });
+    assert.equal(result.status, 1);
+    assert.deepEqual(result.calls, [...deployCalls, "pause"]);
+  }
 });
 
 test("reports each refusal and fails if any probe is accepted", () => {

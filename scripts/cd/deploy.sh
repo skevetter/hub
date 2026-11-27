@@ -5,6 +5,11 @@ CD_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/cd/ssh.sh
 source "$CD_DIR/ssh.sh"
 
+install_attempted=false
+deployed=false
+recording=false
+interrupted=0
+
 logged() {
   local result code=0
   result=$(cd_call "$@") || code=$?
@@ -52,7 +57,7 @@ pause_failed() {
 }
 
 fail_deploy() {
-  if [[ "$1" == rollback && "${HELD:-$MANUAL_DEPLOY}" != true ]]; then
+  if [[ "$1" == rollback && "$MANUAL_DEPLOY" != true ]]; then
     rollback_release || :
   fi
   pause_failed || echo "Unable to pause deployment" >&2
@@ -64,13 +69,33 @@ smoke() {
 }
 
 mark_output() {
-  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf '%s=true\n' "$1" >> "$GITHUB_OUTPUT"; fi
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf '%s=%s\n' "$1" "${2:-true}" >> "$GITHUB_OUTPUT"; fi
 }
 
 handle_interruption() {
+  if [[ "$recording" == true ]]; then
+    interrupted="$1"
+    return
+  fi
   trap '' INT TERM
-  pause_failed || echo "Unable to pause deployment after interruption" >&2
+  if [[ "$install_attempted" == true && "$deployed" != true ]]; then
+    pause_failed || echo "Unable to pause deployment after interruption" >&2
+  fi
   exit "$1"
+}
+
+record_deployment() {
+  local code=0
+  # Finish handling the bounded record reply before deciding whether to pause.
+  recording=true
+  if logged record "$DEPLOY_VERSION" "$DEPLOY_SHA" >/dev/null; then
+    deployed=true
+    mark_output deployed || code=$?
+  fi
+  recording=false
+  if [[ "$interrupted" != 0 ]]; then handle_interruption "$interrupted"; fi
+  if [[ "$deployed" != true ]]; then fail_deploy pause; return; fi
+  return "$code"
 }
 
 finish_install() {
@@ -83,8 +108,7 @@ finish_install() {
     *) fail_deploy pause; return ;;
   esac
   smoke "$DEPLOY_VERSION" || { fail_deploy rollback; return; }
-  logged record "$DEPLOY_VERSION" "$DEPLOY_SHA" >/dev/null || { fail_deploy pause; return; }
-  mark_output deployed || fail_deploy pause
+  record_deployment
 }
 
 validate_release() {
@@ -112,8 +136,28 @@ check_running() {
   exit 0
 }
 
+install_release() {
+  local pid code=0
+  trap 'handle_interruption 130' INT
+  trap 'handle_interruption 143' TERM
+  mark_output install_attempted
+  install_attempted=true
+  # Waiting on a child lets Bash run the trap before the SSH reply arrives.
+  logged install "$DEPLOY_VERSION" "$DEPLOY_CHECKSUM" >/dev/null &
+  pid=$!
+  wait "$pid" || code=$?
+  case "$code" in
+    0) finish_install ;;
+    2)
+      install_attempted=false
+      mark_output install_attempted false
+      return 2 ;;
+    *) fail_deploy pause ;;
+  esac
+}
+
 deploy() {
-  local status running code=0
+  local status running
   validate_release
   status=$(logged status)
   running=$(jq -r '.commit // empty' <<< "$status")
@@ -121,16 +165,7 @@ deploy() {
   logged precheck "$DEPLOY_VERSION" "$DEPLOY_SHA" >/dev/null
   logged quiet 600 >/dev/null
   logged backup "$DEPLOY_VERSION" >/dev/null
-  logged install "$DEPLOY_VERSION" "$DEPLOY_CHECKSUM" >/dev/null || code=$?
-  case "$code" in
-    0)
-      trap 'handle_interruption 130' INT
-      trap 'handle_interruption 143' TERM
-      mark_output install_accepted || { fail_deploy pause; return; }
-      finish_install ;;
-    2) return 2 ;;
-    *) fail_deploy pause ;;
-  esac
+  install_release
 }
 
 probe() {

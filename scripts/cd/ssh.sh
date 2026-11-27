@@ -3,7 +3,16 @@
 cd_version='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
 
 cd_ssh() {
-  ssh -q -n -T -F /dev/null -p "$VPS2_SSH_PORT" -i "$RUNNER_TEMP/hub-deploy-key" \
+  local seconds=120
+  case "$1" in
+    status|precheck\ *|pause\ *) seconds=15 ;;
+    install\ *|rollback|record\ *) seconds=30 ;;
+    quiet\ *) seconds=630 ;;
+    wait\ 60) seconds=65 ;;
+    wait\ *) seconds=150 ;;
+  esac
+  timeout --foreground --kill-after=1 "$seconds" \
+    ssh -q -n -T -F /dev/null -p "$VPS2_SSH_PORT" -i "$RUNNER_TEMP/hub-deploy-key" \
     -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
     -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
     -o ClearAllForwardings=yes -o GlobalKnownHostsFile=/dev/null \

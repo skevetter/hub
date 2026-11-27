@@ -35,6 +35,18 @@ test("does not exempt existing tables when editing their original migration", ()
   assert.equal(needsRollbackReview(sql, new Set(), known), true);
 });
 
+test("holds escape strings and ordinary strings containing a backslash", () => {
+  for (const sql of [
+    String.raw`SELECT E'\'' ; DROP TABLE t; SELECT E'x';`,
+    "SELECT e'plain';",
+    String.raw`SELECT 'a\b';`,
+    "SELECT 'backslash\\",
+  ]) {
+    assert.equal(needsRollbackReview(sql), true, sql);
+  }
+  assert.equal(needsRollbackReview(String.raw`-- E'ignored\'` + "\nSELECT $$E'x\\y'$$;"), false);
+});
+
 test("accepts additive migrations and referential action clauses", () => {
   assert.equal(
     needsRollbackReview(`
