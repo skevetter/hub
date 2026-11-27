@@ -516,6 +516,23 @@ test("message text after a line that imitates a frame still blocks the retry", (
   );
 });
 
+test("only Vitest's own frame and excerpt formats are skipped", () => {
+  const message = "timeout exceeded when trying to connect";
+  const headersOf = (...lines) =>
+    logFailureHeaders(
+      [" FAIL  hook.test.ts > hook", `Error: ${message}`, ...lines, ""].join("\n"),
+    ).get("hook.test.ts");
+  const frame = " \u276F hook.test.ts:4:11";
+  assert.deepEqual(headersOf(frame, '      2| describe("hook", () => {', "       |   ^"), [
+    `Error: ${message}`,
+  ]);
+  assert.deepEqual(headersOf(frame, "    100| it(1)", "    1200| it(2)"), [`Error: ${message}`]);
+  const wrongHost = headersOf(" \u276F config/startup.yaml:12:7", "  12| endpoint: wrong-host");
+  assert.deepEqual(wrongHost, [`Error: ${message}\n  12| endpoint: wrong-host`]);
+  const noLocation = headersOf(" \u276F Configuration error: wrong endpoint", frame);
+  assert.deepEqual(noLocation, [`Error: ${message}\n \u276F Configuration error: wrong endpoint`]);
+});
+
 test("the cause pg-pool attaches to a connection timeout is part of that failure", () => {
   const timeout = "Error: Connection terminated due to connection timeout";
   const log = (cause) =>

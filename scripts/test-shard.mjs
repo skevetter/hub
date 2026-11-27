@@ -161,8 +161,8 @@ const SEPARATOR_LINE = /^\s*\u23AF{3,}/u;
 const HINT_LINE =
   /^If this is a long-running (?:test|hook), pass a timeout value as the last argument or configure it globally with "(?:testTimeout|hookTimeout)"\.$/u;
 const FRAME_LINE = /^\s+at\s.+(?::\d+:\d+|\(<anonymous>\))\)?\s*$/u;
-const REPORTER_FRAME = /^ \u276F /u;
-const EXCERPT_LINE = /^\s+\d*\|/u;
+const REPORTER_FRAME = /^ \u276F \S.*:\d+:\d+$/u;
+const EXCERPT_LINE = /^ {4}(?:[ \d]{3}|\d{4,})\|/u;
 
 /** A JSON failure message cut at its first V8 stack frame. Reporter text never goes through this. */
 function withoutStack(text) {
