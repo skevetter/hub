@@ -61,35 +61,13 @@ const PARTS = new Set([
 ]);
 function compile(recurrence: Recurrence) {
   const start = Temporal.PlainDateTime.from(recurrence.start, { overflow: "reject" });
-  const parts = new Map<string, string>();
-  for (const part of recurrence.rule.split(";")) {
-    const match = /^([A-Z]+)=([A-Z0-9,+-]+)$/u.exec(part);
-    if (match === null || !PARTS.has(match[1]!) || parts.has(match[1]!))
-      throw new Error("Use one RRULE with distinct, supported RFC 5545 fields.");
-    parts.set(match[1]!, match[2]!);
-  }
-  if (parts.has("COUNT") && parts.has("UNTIL")) throw new Error("Use COUNT or UNTIL, not both.");
-  const count = parts.has("COUNT") ? Number(parts.get("COUNT")) : null;
-  if (count !== null && (!Number.isSafeInteger(count) || count < 1 || count > 10000))
-    throw new Error("COUNT must be between 1 and 10000.");
-  const untilValue = parts.get("UNTIL");
-  if (untilValue !== undefined && !/^\d{8}T\d{6}Z$/u.test(untilValue))
-    throw new Error("UNTIL must be a UTC date-time, such as 20261231T235959Z.");
-  const until =
-    untilValue === undefined ? null : Temporal.Instant.from(untilValue).epochMilliseconds;
+  const parts = parseRuleParts(recurrence.rule);
+  const { count, until } = readRuleLimits(parts);
   const source = `DTSTART:${start.toString({ smallestUnit: "second" }).replaceAll(/[-:]/gu, "")}Z\nRRULE:${recurrence.rule}`;
   // Validate all rule combinations before stripping the limits applied to real instants below.
   new RRuleTemporal({ rruleString: source, strict: true }).options();
   validateRanges(parts);
-  // Make RFC DTSTART defaults explicit: Temporal month addition otherwise constrains day 31.
-  const frequency = parts.get("FREQ");
-  if (
-    (frequency === "MONTHLY" || frequency === "YEARLY") &&
-    !["BYMONTHDAY", "BYDAY", "BYYEARDAY", "BYWEEKNO"].some((key) => parts.has(key))
-  ) {
-    parts.set("BYMONTHDAY", String(start.day));
-    if (frequency === "YEARLY" && !parts.has("BYMONTH")) parts.set("BYMONTH", String(start.month));
-  }
+  applyCalendarDefaults(parts, start);
   parts.delete("COUNT");
   parts.delete("UNTIL");
   const evaluator = new RRuleTemporal({
@@ -101,15 +79,77 @@ function compile(recurrence: Recurrence) {
   return { evaluator, start, count, until };
 }
 
+function parseRuleParts(rule: string): Map<string, string> {
+  const parts = new Map<string, string>();
+  for (const part of rule.split(";")) {
+    const [, key, value] = /^([A-Z]+)=([A-Z0-9,+-]+)$/u.exec(part) ?? [];
+    if (key === undefined || value === undefined || !PARTS.has(key) || parts.has(key))
+      throw new Error("Use one RRULE with distinct, supported RFC 5545 fields.");
+    parts.set(key, value);
+  }
+  return parts;
+}
+
+function readRuleLimits(parts: Map<string, string>) {
+  if (parts.has("COUNT") && parts.has("UNTIL")) throw new Error("Use COUNT or UNTIL, not both.");
+  const countValue = parts.get("COUNT");
+  const count = countValue === undefined ? null : readCount(countValue);
+  const untilValue = parts.get("UNTIL");
+  if (untilValue !== undefined && !/^\d{8}T\d{6}Z$/u.test(untilValue))
+    throw new Error("UNTIL must be a UTC date-time, such as 20261231T235959Z.");
+  const until =
+    untilValue === undefined ? null : Temporal.Instant.from(untilValue).epochMilliseconds;
+  return { count, until };
+}
+
+function readCount(value: string): number {
+  const count = Number(value);
+  if (!Number.isSafeInteger(count) || count < 1 || count > 10000)
+    throw new Error("COUNT must be between 1 and 10000.");
+  return count;
+}
+
+function applyCalendarDefaults(parts: Map<string, string>, start: Temporal.PlainDateTime): void {
+  // Make RFC DTSTART defaults explicit: Temporal month addition otherwise constrains day 31.
+  const frequency = parts.get("FREQ");
+  if (
+    (frequency === "MONTHLY" || frequency === "YEARLY") &&
+    !["BYMONTHDAY", "BYDAY", "BYYEARDAY", "BYWEEKNO"].some((key) => parts.has(key))
+  ) {
+    parts.set("BYMONTHDAY", String(start.day));
+    if (frequency === "YEARLY" && !parts.has("BYMONTH")) parts.set("BYMONTH", String(start.month));
+  }
+}
+
+function cursorAfterGap(instant: Temporal.ZonedDateTime): Temporal.ZonedDateTime {
+  // Seek directly to the first valid wall time, even when a timezone skips an entire day.
+  const transition = instant.getTimeZoneTransition("next");
+  if (transition === null)
+    throw new TypeError("Cannot read properties of null (reading 'toPlainDateTime')");
+  return transition.toPlainDateTime().toZonedDateTime("UTC");
+}
+
+function exceedsLimits(
+  limits: ReturnType<typeof readRuleLimits>,
+  generated: number,
+  instant: Temporal.ZonedDateTime,
+): boolean {
+  return (
+    (limits.count !== null && generated > limits.count) ||
+    (limits.until !== null && instant.epochMilliseconds > limits.until)
+  );
+}
+
 /** RRULE expands wall times; this adapter owns timezone gaps, folds and finite limits. */
 export function nextOccurrence(recurrence: Recurrence, after: Date): Date | null {
-  const { evaluator, start, count, until } = compile(recurrence);
+  const compiled = compile(recurrence);
+  const { evaluator, start, count, until } = compiled;
   if (until !== null && after.getTime() >= until) return null;
   const localAfter = Temporal.Instant.fromEpochMilliseconds(after.getTime())
     .toZonedDateTimeISO(recurrence.timezone)
     .toPlainDateTime();
-  let cursor = (count === null ? localAfter : start).toZonedDateTime("UTC");
   let inclusive = count !== null;
+  let cursor = (inclusive ? start : localAfter).toZonedDateTime("UTC");
   let generated = 0;
   for (let attempts = 0; attempts < 20000; attempts++) {
     const candidate = evaluator.next(new Date(cursor.epochMilliseconds), inclusive);
@@ -121,14 +161,12 @@ export function nextOccurrence(recurrence: Recurrence, after: Date): Date | null
     const local = cursor.toPlainDateTime();
     const instant = local.toZonedDateTime(recurrence.timezone, { disambiguation: "earlier" });
     if (!instant.toPlainDateTime().equals(local)) {
-      // Seek directly to the first valid wall time, even when a timezone skips an entire day.
-      cursor = instant.getTimeZoneTransition("next")!.toPlainDateTime().toZonedDateTime("UTC");
+      cursor = cursorAfterGap(instant);
       inclusive = true;
       continue;
     }
     generated++;
-    if (count !== null && generated > count) return null;
-    if (until !== null && instant.epochMilliseconds > until) return null;
+    if (exceedsLimits(compiled, generated, instant)) return null;
     if (instant.epochMilliseconds > after.getTime()) return new Date(instant.epochMilliseconds);
   }
   throw new Error("Recurrence exceeds the evaluation limit.");
