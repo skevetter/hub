@@ -17,50 +17,9 @@ export function createGitHubLifecycle(
   let timer: ReturnType<typeof setInterval> | undefined;
   let running: Promise<void> | undefined;
 
-  async function drain(): Promise<void> {
-    for (;;) {
-      const pending = await database.pendingGitHubInstallationSyncs(owner);
-      if (pending.length === 0) return;
-      for (const selected of pending) {
-        await database.synchronizeGitHubInstallation(selected.installationId, async () => {
-          const [claim] = await database.pendingGitHubInstallationSyncs(owner, selected);
-          if (claim === undefined) return;
-          try {
-            const evidence = await client.getInstallation(claim.installationId);
-            if (evidence.status === "absent") {
-              await database.applyGitHubInstallationSync(owner, claim, {
-                status: "absent",
-                removeBinding: claim.removeBinding,
-              });
-              return;
-            }
-            const available =
-              evidence.identity.status === "suspended"
-                ? []
-                : await repositories.listInstallationRepositories({
-                    installationId: claim.installationId,
-                  });
-            await database.applyGitHubInstallationSync(owner, claim, {
-              status: "present",
-              identity: evidence.identity,
-              repositories: available,
-            });
-          } catch (error) {
-            await database.retryGitHubInstallationSync(owner, claim.installationSyncId);
-            reportFailure(error, {
-              operation: "github.lifecycle.synchronize",
-              component: "connections",
-              provider: "github",
-            });
-          }
-        });
-      }
-    }
-  }
-
   function wake(): void {
     if (running !== undefined) return;
-    running = drain()
+    running = drainGitHubInstallations(database, client, repositories, owner)
       .catch((error: unknown) => {
         reportFailure(error, {
           operation: "github.lifecycle.drain",
@@ -95,4 +54,50 @@ export function createGitHubLifecycle(
       await running;
     },
   };
+}
+
+async function drainGitHubInstallations(
+  database: Database,
+  client: Pick<GitHubConnectionClient, "getInstallation">,
+  repositories: Pick<GitHubConfigurationProvider, "listInstallationRepositories">,
+  owner: GitHubInstallationSyncOwner,
+): Promise<void> {
+  for (;;) {
+    const pending = await database.pendingGitHubInstallationSyncs(owner);
+    if (pending.length === 0) return;
+    for (const selected of pending) {
+      await database.synchronizeGitHubInstallation(selected.installationId, async () => {
+        const [claim] = await database.pendingGitHubInstallationSyncs(owner, selected);
+        if (claim === undefined) return;
+        try {
+          const evidence = await client.getInstallation(claim.installationId);
+          if (evidence.status === "absent") {
+            await database.applyGitHubInstallationSync(owner, claim, {
+              status: "absent",
+              removeBinding: claim.removeBinding,
+            });
+            return;
+          }
+          const available =
+            evidence.identity.status === "suspended"
+              ? []
+              : await repositories.listInstallationRepositories({
+                  installationId: claim.installationId,
+                });
+          await database.applyGitHubInstallationSync(owner, claim, {
+            status: "present",
+            identity: evidence.identity,
+            repositories: available,
+          });
+        } catch (error) {
+          await database.retryGitHubInstallationSync(owner, claim.installationSyncId);
+          reportFailure(error, {
+            operation: "github.lifecycle.synchronize",
+            component: "connections",
+            provider: "github",
+          });
+        }
+      });
+    }
+  }
 }

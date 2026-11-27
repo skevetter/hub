@@ -47,6 +47,44 @@ export function fakeLinearReplies(organizationId: string, database: Database) {
   };
   const connectionForLinearOrganization = async (id: string) =>
     id === connection.linearOrganizationId ? { ...connection } : undefined;
+  const state = createReplyState();
+  const client = createLinearApiClient({
+    connectionForLinearOrganization,
+    withLinearConnectionRefresh: database.withLinearConnectionRefresh.bind(database),
+    connectionClient: {
+      async refresh() {
+        throw new Error("unexpected token refresh");
+      },
+    },
+    async fetch(_url, init) {
+      if (typeof init?.body !== "string") throw new Error("expected a GraphQL request");
+      const { query, variables } = requestSchema.parse(JSON.parse(init.body));
+      if (query.includes("commentCreate("))
+        return createFakeComment(state, connection.appUserId, { query, variables });
+      if (query.includes("comment(id:")) {
+        state.calls.push("read-comment");
+        const comment = state.comments.get(variables.id ?? "");
+        return Response.json({ data: { comment: comment ?? null } });
+      }
+      throw new Error("unexpected Linear operation");
+    },
+  });
+  return {
+    client,
+    connection,
+    connectionForLinearOrganization,
+    comments: state.comments,
+    calls: state.calls,
+    writes: state.writes,
+    creates: state.creates,
+    createResponses: state.createResponses,
+    loseCreateResponse() {
+      state.loseResponse = true;
+    },
+  };
+}
+
+function createReplyState() {
   const comments = new Map([
     [
       "source-comment",
@@ -63,58 +101,32 @@ export function fakeLinearReplies(organizationId: string, database: Database) {
   const writes: string[] = [];
   const creates: { id: string; body: string }[] = [];
   const createResponses: Response[] = [];
-  let loseResponse = false;
-  const client = createLinearApiClient({
-    connectionForLinearOrganization,
-    withLinearConnectionRefresh: database.withLinearConnectionRefresh.bind(database),
-    connectionClient: {
-      async refresh() {
-        throw new Error("unexpected token refresh");
-      },
-    },
-    async fetch(_url, init) {
-      if (typeof init?.body !== "string") throw new Error("expected a GraphQL request");
-      const { query, variables } = requestSchema.parse(JSON.parse(init.body));
-      if (query.includes("commentCreate(")) {
-        const { id, issueId, body } = variables;
-        if (id === undefined || issueId === undefined || body === undefined)
-          throw new Error("reply mutation must use a reserved UUID");
-        if (!query.includes("id: $id, doNotSubscribeToIssue: true"))
-          throw new Error("reply mutation must use the reserved UUID and skip subscription");
-        calls.push("create");
-        creates.push({ id, body });
-        const rejected = createResponses.shift();
-        if (rejected !== undefined) return rejected;
-        writes.push(body);
-        comments.set(id, {
-          id,
-          issue: { id: issueId },
-          body,
-          archivedAt: null,
-          user: { id: connection.appUserId },
-        });
-        if (loseResponse) throw new Error("simulated response loss after Linear committed");
-        return Response.json({ data: { commentCreate: { success: true, comment: { id } } } });
-      }
-      if (query.includes("comment(id:")) {
-        calls.push("read-comment");
-        const comment = comments.get(variables.id ?? "");
-        return Response.json({ data: { comment: comment ?? null } });
-      }
-      throw new Error("unexpected Linear operation");
-    },
+  return { comments, calls, writes, creates, createResponses, loseResponse: false };
+}
+
+function createFakeComment(
+  state: ReturnType<typeof createReplyState>,
+  appUserId: string,
+  { query, variables }: z.infer<typeof requestSchema>,
+) {
+  const { calls, writes, creates, createResponses, comments } = state;
+  const { id, issueId, body } = variables;
+  if (id === undefined || issueId === undefined || body === undefined)
+    throw new Error("reply mutation must use a reserved UUID");
+  if (!query.includes("id: $id, doNotSubscribeToIssue: true"))
+    throw new Error("reply mutation must use the reserved UUID and skip subscription");
+  calls.push("create");
+  creates.push({ id, body });
+  const rejected = createResponses.shift();
+  if (rejected !== undefined) return rejected;
+  writes.push(body);
+  comments.set(id, {
+    id,
+    issue: { id: issueId },
+    body,
+    archivedAt: null,
+    user: { id: appUserId },
   });
-  return {
-    client,
-    connection,
-    connectionForLinearOrganization,
-    comments,
-    calls,
-    writes,
-    creates,
-    createResponses,
-    loseCreateResponse() {
-      loseResponse = true;
-    },
-  };
+  if (state.loseResponse) throw new Error("simulated response loss after Linear committed");
+  return Response.json({ data: { commentCreate: { success: true, comment: { id } } } });
 }

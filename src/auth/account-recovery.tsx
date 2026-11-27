@@ -1,6 +1,6 @@
 import { useMutation } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useState, type FormEvent } from "react";
+import { useCallback, useState, type SyntheticEvent } from "react";
 import { AuthCard, AuthLayout } from "../components/app/auth-layout.js";
 import { AuthActions, AuthForm } from "../components/app/auth-form.js";
 import { failureMessage } from "../components/app/failure-alert.js";
@@ -25,7 +25,7 @@ export function ForgotPasswordEntry({ onBack }: { onBack: () => void }) {
     },
   });
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       request.mutate({
         data: { email: formValue(new FormData(event.currentTarget), "email") },
@@ -48,38 +48,52 @@ export function ForgotPasswordEntry({ onBack }: { onBack: () => void }) {
         description="Enter your account email and we'll send a reset link if the account exists."
       >
         <ErrorSummary message={message} />
-        {sent ? (
-          <>
-            <StatusLine>
-              If an account exists for that email, a password reset link is on its way.
-            </StatusLine>
-            <AuthActions>
-              <Button type="button" size="lg" onClick={onBack}>
-                Back to sign in
-              </Button>
-            </AuthActions>
-          </>
-        ) : (
-          <AuthForm
-            label="Reset password"
-            busy={request.isPending}
-            submitLabel="Send reset link"
-            onSubmit={submit}
-            secondaryLabel="Back to sign in"
-            onSecondary={onBack}
-          >
-            <FormField
-              label="Email"
-              name="email"
-              id="forgot-password-email"
-              kind="email"
-              autoComplete="email"
-              required
-            />
-          </AuthForm>
-        )}
+        {sent
+          ? renderResetLinkSent(onBack)
+          : renderResetLinkForm(request.isPending, submit, onBack)}
       </AuthCard>
     </AuthLayout>
+  );
+}
+
+function renderResetLinkSent(onBack: () => void) {
+  return (
+    <>
+      <StatusLine>
+        If an account exists for that email, a password reset link is on its way.
+      </StatusLine>
+      <AuthActions>
+        <Button type="button" size="lg" onClick={onBack}>
+          Back to sign in
+        </Button>
+      </AuthActions>
+    </>
+  );
+}
+
+function renderResetLinkForm(
+  busy: boolean,
+  submit: (event: SyntheticEvent<HTMLFormElement>) => void,
+  onBack: () => void,
+) {
+  return (
+    <AuthForm
+      label="Reset password"
+      busy={busy}
+      submitLabel="Send reset link"
+      onSubmit={submit}
+      secondaryLabel="Back to sign in"
+      onSecondary={onBack}
+    >
+      <FormField
+        label="Email"
+        name="email"
+        id="forgot-password-email"
+        kind="email"
+        autoComplete="email"
+        required
+      />
+    </AuthForm>
   );
 }
 
@@ -183,7 +197,7 @@ export function PasswordResetEntry({
     },
   });
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       if (token === undefined) return;
       const data = new FormData(event.currentTarget);
@@ -201,38 +215,18 @@ export function PasswordResetEntry({
     [reset, token],
   );
   if (callbackError !== undefined || token === undefined) {
-    return (
-      <AuthLayout>
-        <AuthCard
-          titleId="password-reset-invalid-heading"
-          title="Reset link invalid or expired"
-          description="Request a new password reset link from the sign-in screen."
-        >
-          <AuthActions>
-            <Button type="button" size="lg" onClick={leaveAuthCallback}>
-              Back to sign in
-            </Button>
-          </AuthActions>
-        </AuthCard>
-      </AuthLayout>
-    );
+    return renderPasswordResetOutcome({
+      titleId: "password-reset-invalid-heading",
+      title: "Reset link invalid or expired",
+      description: "Request a new password reset link from the sign-in screen.",
+    });
   }
   if (complete) {
-    return (
-      <AuthLayout>
-        <AuthCard
-          titleId="password-reset-complete-heading"
-          title="Password reset"
-          description="Your new password is ready. You can use it to sign in."
-        >
-          <AuthActions>
-            <Button type="button" size="lg" onClick={leaveAuthCallback}>
-              Back to sign in
-            </Button>
-          </AuthActions>
-        </AuthCard>
-      </AuthLayout>
-    );
+    return renderPasswordResetOutcome({
+      titleId: "password-reset-complete-heading",
+      title: "Password reset",
+      description: "Your new password is ready. You can use it to sign in.",
+    });
   }
   const message =
     reset.isError || reset.data?.status === "error"
@@ -241,6 +235,18 @@ export function PasswordResetEntry({
           "Hub did not receive the password reset result. Check your connection and try again.",
         )
       : undefined;
+  return renderPasswordResetForm({ message, busy: reset.isPending, submit });
+}
+
+function renderPasswordResetForm({
+  message,
+  busy,
+  submit,
+}: {
+  message: string | undefined;
+  busy: boolean;
+  submit: (event: SyntheticEvent<HTMLFormElement>) => void;
+}) {
   return (
     <AuthLayout>
       <AuthCard
@@ -251,7 +257,7 @@ export function PasswordResetEntry({
         <ErrorSummary message={message} />
         <AuthForm
           label="Choose a new password"
-          busy={reset.isPending}
+          busy={busy}
           submitLabel="Save new password"
           onSubmit={submit}
         >
@@ -274,6 +280,28 @@ export function PasswordResetEntry({
             required
           />
         </AuthForm>
+      </AuthCard>
+    </AuthLayout>
+  );
+}
+
+function renderPasswordResetOutcome({
+  titleId,
+  title,
+  description,
+}: {
+  titleId: string;
+  title: string;
+  description: string;
+}) {
+  return (
+    <AuthLayout>
+      <AuthCard titleId={titleId} title={title} description={description}>
+        <AuthActions>
+          <Button type="button" size="lg" onClick={leaveAuthCallback}>
+            Back to sign in
+          </Button>
+        </AuthActions>
       </AuthCard>
     </AuthLayout>
   );

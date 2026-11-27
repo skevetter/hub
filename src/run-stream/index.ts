@@ -2,7 +2,7 @@ import type { Logger } from "pino";
 import type { OperationAuthenticator } from "../auth/operation-auth.js";
 import { ProductRequestError } from "../auth/organization-access.js";
 import type { AuthServer } from "../auth/server.js";
-import type { Database } from "../db/types.js";
+import type { AcceptedTriggerRunRecord, Database } from "../db/types.js";
 import { registerResponseLifecycle } from "../http/response-lifecycle.js";
 import { logger } from "../logger.js";
 import { resolveRouteTenant, isTenantRouteNotFoundError } from "../projects/access.js";
@@ -11,6 +11,7 @@ import type { RunProgressSettings } from "../run-progress/settings.js";
 import type { RunTimelineBus } from "../run-timeline/bus.js";
 import type { RunTimelineReconciler } from "../run-timeline/reconcile.js";
 import { isRunTimelineExpired, retentionCutoff } from "../run-timeline/retention.js";
+import type { RunTimelineEvent } from "../run-timeline/store.js";
 import { RunStreamNotifier } from "./notifier.js";
 import { controlEvent, RunStreamSubscriber, type StreamContext } from "./subscriber.js";
 
@@ -41,6 +42,14 @@ interface StreamInfrastructure {
 interface PreparedStream extends StreamContext {
   after: number;
   firstSeq: number | null;
+}
+
+interface OpenRunStream {
+  request: Request;
+  requestId: string;
+  access: StreamAccess;
+  prepared: PreparedStream;
+  infrastructure: StreamInfrastructure;
 }
 
 const errors = {
@@ -90,16 +99,16 @@ export class RunStream {
     if (!settings.runStreamEnabled) return this.failure(requestId, "not_found");
     if (request.method !== "GET") return this.failure(requestId, "method_not_allowed");
     if (this.closing) return this.failure(requestId, "shutting_down");
-    if (database === null || bus === undefined || reconciler === undefined)
+    const infrastructure = { database, bus, reconciler };
+    if (!hasInfrastructure(infrastructure))
       return this.failure(requestId, "infrastructure_unavailable");
     try {
       const access = await this.authorize(request);
       if (typeof access === "string") return this.failure(requestId, access);
-      const infrastructure = { database, bus, reconciler };
       const prepared = await this.prepare(request, runId, access.organizationId, infrastructure);
       if (typeof prepared === "string") return this.failure(requestId, prepared);
       if (this.closing) return this.failure(requestId, "shutting_down");
-      return this.open(request, requestId, access, prepared, infrastructure);
+      return this.open({ request, requestId, access, prepared, infrastructure });
     } catch (error) {
       this.report(error, requestId);
       return this.failure(requestId, "infrastructure_unavailable");
@@ -124,24 +133,13 @@ export class RunStream {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(runId))
       return "run_not_found";
     const run = await database.findTriggerRunForOrganization(organizationId, runId);
-    if (run?.outcome !== "accepted") return "run_not_found";
+    if (!isAcceptedRun(run)) return "run_not_found";
     let state = await database.readRunTimelineState(organizationId, run.id);
-    const expired = () =>
-      isRunTimelineExpired(
-        {
-          completedAt: run.completedAt,
-          expiredAt: state?.expiredAt ?? null,
-          payloadExpiredAt: run.payloadExpiredAt,
-        },
-        retentionCutoff(new Date(), this.options.settings.retentionDays),
-      );
+    const expired = () => this.timelineExpired(run, state);
     if (expired()) return "timeline_expired";
-    const raw =
-      new URL(request.url).searchParams.get("after") ?? request.headers.get("last-event-id");
-    let after = 0;
-    if (raw !== null) after = /^[0-9]+$/u.test(raw) ? Number(raw) : NaN;
-    if (!Number.isSafeInteger(after) || after < 0) return "invalid_request";
-    if (run.status !== "running" && state?.sealedSeq == null) {
+    const after = parseAfter(request);
+    if (after === undefined) return "invalid_request";
+    if (shouldReconcile(run, state)) {
       await reconciler.reconcileBeforeTerminal(organizationId, run.id);
       state = await database.readRunTimelineState(organizationId, run.id);
       if (expired()) return "timeline_expired";
@@ -151,18 +149,24 @@ export class RunStream {
       limit: 1,
     });
     const current = await database.findTriggerRunForOrganization(organizationId, runId);
-    if (current?.outcome !== "accepted") return "run_not_found";
+    if (!isAcceptedRun(current)) return "run_not_found";
     if (current.payloadExpiredAt != null) return "timeline_expired";
-    return { run: current, state, after, firstSeq: first[0]?.seq ?? null };
+    return { run: current, state, after, firstSeq: firstSequence(first) };
   }
 
-  private open(
-    request: Request,
-    requestId: string,
-    access: StreamAccess,
-    prepared: PreparedStream,
-    { database, bus, reconciler }: StreamInfrastructure,
-  ): Response {
+  private timelineExpired(run: AcceptedTriggerRunRecord, state: StreamContext["state"]): boolean {
+    return isRunTimelineExpired(
+      {
+        completedAt: run.completedAt,
+        expiredAt: state?.expiredAt ?? null,
+        payloadExpiredAt: run.payloadExpiredAt,
+      },
+      retentionCutoff(new Date(), this.options.settings.retentionDays),
+    );
+  }
+
+  private open({ request, requestId, access, prepared, infrastructure }: OpenRunStream): Response {
+    const { database, reconciler } = infrastructure;
     const { settings } = this.options;
     const runId = prepared.run.id;
     const credentialKey = JSON.stringify([access.kind, access.credentialId]);
@@ -175,12 +179,7 @@ export class RunStream {
     )
       return this.failure(requestId, "too_many_streams");
     const notifierKey = JSON.stringify([access.organizationId, runId]);
-    let notifier = this.notifiers.get(notifierKey);
-    if (notifier === undefined) {
-      notifier = new RunStreamNotifier(database, bus, access.organizationId, runId);
-      this.notifiers.set(notifierKey, notifier);
-    }
-    const shared = notifier;
+    const shared = this.notifier(infrastructure, access.organizationId, runId, notifierKey);
     shared.references += 1;
     this.credentials.set(credentialKey, credentialCount + 1);
     this.organizations.set(access.organizationId, organizationCount + 1);
@@ -197,12 +196,8 @@ export class RunStream {
       reauthorize: () => access.reauthorize(),
       release: (reason, durationMs, eventsSent) => {
         this.subscribers.delete(subscriber);
-        const remainingCredentials = this.credentials.get(credentialKey)! - 1;
-        if (remainingCredentials === 0) this.credentials.delete(credentialKey);
-        else this.credentials.set(credentialKey, remainingCredentials);
-        const remainingOrganizations = this.organizations.get(access.organizationId)! - 1;
-        if (remainingOrganizations === 0) this.organizations.delete(access.organizationId);
-        else this.organizations.set(access.organizationId, remainingOrganizations);
+        decrement(this.credentials, credentialKey);
+        decrement(this.organizations, access.organizationId);
         if (--shared.references === 0) {
           shared.close();
           this.notifiers.delete(notifierKey);
@@ -222,18 +217,20 @@ export class RunStream {
       },
     });
     this.subscribers.add(subscriber);
-    const response = new Response(subscriber.body, {
-      headers: {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache, no-transform",
-        "x-accel-buffering": "no",
-        "x-request-id": requestId,
-      },
-    });
-    return registerResponseLifecycle(response, {
-      onFinish: () => subscriber.finish("end"),
-      onAbort: () => subscriber.finish("abort"),
-    });
+    return streamResponse(subscriber, requestId);
+  }
+
+  private notifier(
+    { database, bus }: StreamInfrastructure,
+    organizationId: string,
+    runId: string,
+    key: string,
+  ): RunStreamNotifier {
+    const existing = this.notifiers.get(key);
+    if (existing !== undefined) return existing;
+    const notifier = new RunStreamNotifier(database, bus, organizationId, runId);
+    this.notifiers.set(key, notifier);
+    return notifier;
   }
 
   private report(error: unknown, requestId: string): void {
@@ -255,12 +252,7 @@ export class RunStream {
       const credentials = this.options.credentials;
       if (credentials === undefined) return "infrastructure_unavailable";
       const result = await credentials.authorize(request, "runs:read");
-      if (result.status === "unauthorized") return "unauthorized";
-      if (result.status === "forbidden") return "insufficient_scope";
-      return {
-        ...result.access,
-        reauthorize: () => credentials.reauthorize(result.access, "runs:read"),
-      };
+      return credentialAccess(credentials, result);
     }
     const { auth, database } = this.options;
     if (auth === null || database === null) return "unauthorized";
@@ -287,4 +279,65 @@ export class RunStream {
       throw error;
     }
   }
+}
+
+function hasInfrastructure(
+  input: Pick<RunStreamOptions, "database" | "bus" | "reconciler">,
+): input is StreamInfrastructure {
+  return input.database !== null && input.bus !== undefined && input.reconciler !== undefined;
+}
+
+function parseAfter(request: Request): number | undefined {
+  const raw =
+    new URL(request.url).searchParams.get("after") ?? request.headers.get("last-event-id");
+  let after = 0;
+  if (raw !== null) after = /^[0-9]+$/u.test(raw) ? Number(raw) : NaN;
+  return Number.isSafeInteger(after) && after >= 0 ? after : undefined;
+}
+
+function isAcceptedRun(
+  run: Awaited<ReturnType<Database["findTriggerRunForOrganization"]>>,
+): run is AcceptedTriggerRunRecord {
+  return run?.outcome === "accepted";
+}
+
+function shouldReconcile(run: AcceptedTriggerRunRecord, state: StreamContext["state"]): boolean {
+  return run.status !== "running" && state?.sealedSeq == null;
+}
+
+function firstSequence(rows: RunTimelineEvent[]): number | null {
+  return rows[0]?.seq ?? null;
+}
+
+function decrement(counts: Map<string, number>, key: string): void {
+  const remaining = Number(counts.get(key)) - 1;
+  if (remaining === 0) counts.delete(key);
+  else counts.set(key, remaining);
+}
+
+function streamResponse(subscriber: RunStreamSubscriber, requestId: string): Response {
+  const response = new Response(subscriber.body, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      "x-accel-buffering": "no",
+      "x-request-id": requestId,
+    },
+  });
+  return registerResponseLifecycle(response, {
+    onFinish: () => subscriber.finish("end"),
+    onAbort: () => subscriber.finish("abort"),
+  });
+}
+
+function credentialAccess(
+  credentials: OperationAuthenticator,
+  result: Awaited<ReturnType<OperationAuthenticator["authorize"]>>,
+): StreamAccess | "unauthorized" | "insufficient_scope" {
+  if (result.status === "unauthorized") return "unauthorized";
+  if (result.status === "forbidden") return "insufficient_scope";
+  return {
+    ...result.access,
+    reauthorize: () => credentials.reauthorize(result.access, "runs:read"),
+  };
 }

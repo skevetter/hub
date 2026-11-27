@@ -12,23 +12,23 @@ export function readDatabasePoolOptions(
   environment: Readonly<Record<string, string | undefined>>,
 ): Required<PostgresPoolOptions> {
   return {
-    max: readInteger(environment, POOL_MAX_VARIABLE, 1, 100, DEFAULT_POOL_MAX),
-    acquireTimeoutMs: readInteger(
-      environment,
-      ACQUIRE_TIMEOUT_VARIABLE,
-      1_000,
-      60_000,
-      DEFAULT_ACQUIRE_TIMEOUT_MS,
-    ),
+    max: readInteger(environment, POOL_MAX_VARIABLE, {
+      min: 1,
+      max: 100,
+      fallback: DEFAULT_POOL_MAX,
+    }),
+    acquireTimeoutMs: readInteger(environment, ACQUIRE_TIMEOUT_VARIABLE, {
+      min: 1_000,
+      max: 60_000,
+      fallback: DEFAULT_ACQUIRE_TIMEOUT_MS,
+    }),
   };
 }
 
 function readInteger(
   environment: Readonly<Record<string, string | undefined>>,
   name: string,
-  min: number,
-  max: number,
-  fallback: number,
+  { min, max, fallback }: { min: number; max: number; fallback: number },
 ): number {
   const raw = environment[name]?.trim();
   if (raw === undefined || raw === "") return fallback;

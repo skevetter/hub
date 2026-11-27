@@ -30,6 +30,79 @@ const ORGANIZATION = "capture-organization";
 const PAGE = { afterSeq: 0, limit: 5110 };
 const captures = new Set<RunTimeline>();
 
+function urlPrivacyGroups() {
+  const groups: {
+    name: string;
+    useful: string | null;
+    samples: { name: string; value: string; secret: string }[];
+  }[] = [];
+  for (const [index, variant] of USERINFO_WHITESPACE.entries()) {
+    const samples = [];
+    for (let field = 0; field < 4; field++)
+      samples.push(
+        userinfoWhitespaceCase(
+          USERINFO_SCHEMES[(index + field) % USERINFO_SCHEMES.length]!,
+          variant,
+        ),
+      );
+    groups.push({ name: variant.name, useful: null, samples });
+  }
+  for (const sample of URL_USERINFO_STORAGE_CASES)
+    groups.push({
+      name: sample.name,
+      useful: null,
+      samples: [sample, sample, sample, sample],
+    });
+  for (const benign of BENIGN_URL_CASES) {
+    const sample = { ...benign, secret: "" };
+    groups.push({
+      name: sample.name,
+      useful: sample.useful,
+      samples: [sample, sample, sample, sample],
+    });
+  }
+  return groups;
+}
+
+function assertStoredUrlFields(
+  rows: Awaited<ReturnType<Database["listRunTimelineEvents"]>>,
+  name: string,
+  useful: string | null,
+): void {
+  for (const [kind, field] of [
+    ["run_started", "trigger"],
+    ["turn_failed", "error"],
+    ["turn_canceled", "reason"],
+    ["step_finished", "failure"],
+    ["run_finished", "failure"],
+  ]) {
+    const value = rows.find((row) => row.kind === kind)?.data[field!];
+    if (useful === null) {
+      assert.ok(value === "[redacted]", `whole-field marker for ${name} ${kind}`);
+    } else {
+      assert.ok(
+        typeof value === "string" && value.includes(useful),
+        `useful URL for ${name} ${kind}`,
+      );
+    }
+  }
+}
+
+function assertNoStoredFragments(
+  stored: string,
+  samples: readonly { name: string; secret: string }[],
+): void {
+  for (const sample of samples) {
+    for (let offset = 0; offset <= sample.secret.length - 8; offset += 1) {
+      assert.equal(
+        stored.includes(sample.secret.slice(offset, offset + 8)),
+        false,
+        `credential fragment retained for ${sample.name}`,
+      );
+    }
+  }
+}
+
 async function fixture(
   stepIds = ["work"],
   database: Database = createMemoryDatabase({ organizationIds: [ORGANIZATION] }),
@@ -342,36 +415,7 @@ describe("RunTimeline capture", () => {
           bus: new RunTimelineBus(),
           reportFailure,
         });
-        const groups: {
-          name: string;
-          useful: string | null;
-          samples: { name: string; value: string; secret: string }[];
-        }[] = [];
-        for (const [index, variant] of USERINFO_WHITESPACE.entries()) {
-          const samples = [];
-          for (let field = 0; field < 4; field++)
-            samples.push(
-              userinfoWhitespaceCase(
-                USERINFO_SCHEMES[(index + field) % USERINFO_SCHEMES.length]!,
-                variant,
-              ),
-            );
-          groups.push({ name: variant.name, useful: null, samples });
-        }
-        for (const sample of URL_USERINFO_STORAGE_CASES)
-          groups.push({
-            name: sample.name,
-            useful: null,
-            samples: [sample, sample, sample, sample],
-          });
-        for (const benign of BENIGN_URL_CASES) {
-          const sample = { ...benign, secret: "" };
-          groups.push({
-            name: sample.name,
-            useful: sample.useful,
-            samples: [sample, sample, sample, sample],
-          });
-        }
+        const groups = urlPrivacyGroups();
         for (const { name, useful, samples } of groups) {
           const run = await createRun(["work"], samples[0]!.value);
           const [execution] = await link(run);
@@ -399,36 +443,12 @@ describe("RunTimeline capture", () => {
           });
           await reconciler.reconcile(ORGANIZATION, run.id);
           const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE);
-          for (const [kind, field] of [
-            ["run_started", "trigger"],
-            ["turn_failed", "error"],
-            ["turn_canceled", "reason"],
-            ["step_finished", "failure"],
-            ["run_finished", "failure"],
-          ]) {
-            const value = rows.find((row) => row.kind === kind)?.data[field!];
-            if (useful === null) {
-              assert.ok(value === "[redacted]", `whole-field marker for ${name} ${kind}`);
-            } else {
-              assert.ok(
-                typeof value === "string" && value.includes(useful),
-                `useful URL for ${name} ${kind}`,
-              );
-            }
-          }
+          assertStoredUrlFields(rows, name, useful);
           const stored = JSON.stringify({
             rows,
             state: await database.readRunTimelineState(ORGANIZATION, run.id),
           });
-          for (const sample of samples) {
-            for (let offset = 0; offset <= sample.secret.length - 8; offset += 1) {
-              assert.equal(
-                stored.includes(sample.secret.slice(offset, offset + 8)),
-                false,
-                `credential fragment retained for ${sample.name}`,
-              );
-            }
-          }
+          assertNoStoredFragments(stored, samples);
           timeline.release(execution.id);
         }
         assert.equal(reportFailure.mock.calls.length, 0);

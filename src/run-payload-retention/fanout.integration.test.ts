@@ -160,8 +160,7 @@ async function seedReceipt(
   database: Database,
   seedEvidence: SeedEvidence,
   projectId: string,
-  event: TestEvent,
-  workflows: readonly ReturnType<typeof workflow>[],
+  { event, workflows }: { event: TestEvent; workflows: readonly ReturnType<typeof workflow>[] },
 ) {
   const pinned = await insertRevision(database, projectId, configuration(workflows));
   await database.activateProjectConfigurationRevision(projectId, pinned.id, []);
@@ -232,7 +231,7 @@ async function verifyMatrix(database: Database, seedEvidence: SeedEvidence) {
       workflows: readonly ReturnType<typeof workflow>[],
       names: readonly string[],
     ) => {
-      const receipt = await seedReceipt(database, seedEvidence, project.id, event, workflows);
+      const receipt = await seedReceipt(database, seedEvidence, project.id, { event, workflows });
       const matches = await providers[event.provider].match(receipt);
       assert.deepEqual(
         typeof matches === "string" ? [] : matches.map(({ triggerName }) => triggerName),
@@ -295,9 +294,10 @@ async function verifyMatrix(database: Database, seedEvidence: SeedEvidence) {
   ];
   const before = await database.scanRunPayloads(null, CUTOFF, 100, true);
   for (const event of unresolvedEvents) {
-    const receipt = await seedReceipt(database, seedEvidence, project.id, event, [
-      workflow("linear.issue_assigned", linearActor),
-    ]);
+    const receipt = await seedReceipt(database, seedEvidence, project.id, {
+      event,
+      workflows: [workflow("linear.issue_assigned", linearActor)],
+    });
     const id = await persistBranch(database, receipt, "primary");
     assert.equal(await database.expireRunPayloadChunk(id, CUTOFF, NOW), "skipped");
   }

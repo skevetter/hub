@@ -16,23 +16,37 @@ type PilotTurnSession = Pick<
   "id" | "organizationId" | "origin" | "profileId" | "profileVersion" | "startedByUserId"
 >;
 
+interface AuthorizeBoundPilotTurnOptions {
+  findBinding: PilotBindingStore["find"];
+  grant: PilotTurnGrant | undefined;
+  session: PilotTurnSession;
+  commandId: string;
+  expectedBindingGeneration?: number | undefined;
+}
+
+function matchesTurnSession(grant: PilotTurnGrant, session: PilotTurnSession) {
+  return (
+    grant.authority.organizationId === session.organizationId &&
+    grant.authority.profileId === session.profileId &&
+    grant.authority.ownerUserId === session.startedByUserId &&
+    grant.profileVersion === session.profileVersion &&
+    session.origin === "linear"
+  );
+}
+
 /** The grant comes from the locally admitted command, never the Stop envelope. */
-export async function authorizeBoundPilotTurn(
-  findBinding: PilotBindingStore["find"],
-  grant: PilotTurnGrant | undefined,
-  session: PilotTurnSession,
-  commandId: string,
-  expectedBindingGeneration?: number,
-): Promise<boolean> {
+export async function authorizeBoundPilotTurn({
+  findBinding,
+  grant,
+  session,
+  commandId,
+  expectedBindingGeneration,
+}: AuthorizeBoundPilotTurnOptions): Promise<boolean> {
   if (
     !grant ||
     grant.sessionId !== session.id ||
     grant.commandId !== commandId ||
-    grant.authority.organizationId !== session.organizationId ||
-    grant.authority.profileId !== session.profileId ||
-    grant.authority.ownerUserId !== session.startedByUserId ||
-    grant.profileVersion !== session.profileVersion ||
-    session.origin !== "linear" ||
+    !matchesTurnSession(grant, session) ||
     (expectedBindingGeneration !== undefined &&
       expectedBindingGeneration !== grant.bindingGeneration)
   )
@@ -68,11 +82,11 @@ export async function authorizePilotTurnRefresh(
   );
   return (
     session !== undefined &&
-    (await authorizeBoundPilotTurn(
-      (authority, origin) => findBinding(authority, origin, query),
+    (await authorizeBoundPilotTurn({
+      findBinding: (authority, origin) => findBinding(authority, origin, query),
       grant,
       session,
-      grant.commandId,
-    ))
+      commandId: grant.commandId,
+    }))
   );
 }
