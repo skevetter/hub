@@ -182,7 +182,7 @@ test("push path classification includes changes from prior pushes since the newe
   save("src/e2e/contract.ts", "e2e change");
   const previous = push("previous push");
   git("update-ref", "refs/tags/v9.0.0-rc.1", previous);
-  const tip = push("latest push", "fix: test release", "src/notes.md");
+  const tip = push("latest push", "fix: test release", "src/notes.test.ts");
   git("update-ref", "refs/tags/v10.0.0", push("unreachable push"));
   git("checkout", "--detach", tip);
   const classify = () =>
