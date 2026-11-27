@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { diffPaths, shaPattern } from "./git.mjs";
+import { diffPaths, latestTag, shaPattern } from "./git.mjs";
 
 const shared = /^(?:package(?:-lock)?\.json|\.npmrc|\.github\/workflows\/(?:ci|nightly)\.yml)$/u;
 const ui =
@@ -23,8 +23,12 @@ function reachable(base) {
   return spawnSync("git", ["merge-base", "--is-ancestor", base, "HEAD"]).status === 0;
 }
 
+export function classify(fallback, sinceRelease) {
+  const tag = sinceRelease ? latestTag() : "";
+  return changedFlags(tag ? diffPaths(tag) : reachable(fallback) ? diffPaths(fallback) : null);
+}
+
 if (import.meta.main) {
-  const base = process.argv[2] ?? "";
-  const flags = changedFlags(reachable(base) ? diffPaths(base) : null);
+  const flags = classify(process.argv[2] ?? "", process.argv[3] === "true");
   for (const [name, value] of Object.entries(flags)) console.log(`${name}=${value}`);
 }

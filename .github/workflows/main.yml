@@ -25,6 +25,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       base: ${{ github.event.before }}
+      release-base: true
 
   package:
     name: package
@@ -42,6 +43,7 @@ jobs:
       base_tag: ${{ steps.plan.outputs.base_tag }}
       version: ${{ steps.plan.outputs.version }}
       held: ${{ steps.plan.outputs.held }}
+      hold_reason: ${{ steps.plan.outputs.hold_reason }}
       checksum: ${{ steps.pack.outputs.checksum }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -116,7 +118,7 @@ jobs:
         run: |
           bash scripts/cd/package.sh publish "$VERSION" "$RUNNER_TEMP/hub-package"
           if [[ "$HELD" == true ]]; then
-            echo "::notice::Release held because it includes a rollback-unsafe change"
+            echo "::notice::Published a held prerelease"
           fi
 
   dispatch-guard:
@@ -156,14 +158,14 @@ jobs:
       (github.event_name == 'push' && needs.publish.result == 'success' && needs.package.outputs.held == 'false'))
     runs-on: ubuntu-latest
     environment: production
-    # Worst case: 33m polling (2 x 15 x 66s), 10m31s quiet, about 9m for
-    # other SSH calls, both external smokes and fallback pause. The rest is for setup.
+    # The job-wide cap includes quiet, install and rollback. Slow SSH exchanges can exhaust it before all polls finish.
     timeout-minutes: 55
     permissions:
       contents: read
     outputs:
       deployed: ${{ steps.deploy.outputs.deployed }}
       install_attempted: ${{ steps.deploy.outputs.install_attempted }}
+      outcome: ${{ steps.deploy.outputs.outcome }}
     concurrency:
       group: deploy-production
       cancel-in-progress: false
@@ -195,6 +197,7 @@ jobs:
           DEPLOY_VERSION: ${{ needs.dispatch-guard.outputs.version || needs.package.outputs.version }}
           DEPLOY_CHECKSUM: ${{ needs.dispatch-guard.outputs.checksum || needs.package.outputs.checksum }}
           MANUAL_DEPLOY: ${{ github.event_name == 'workflow_dispatch' }}
+          PRERELEASE: ${{ needs.dispatch-guard.outputs.prerelease == 'true' }}
           HUB_PUBLIC_URL: ${{ vars.HUB_PUBLIC_URL }}
           VPS2_SSH_HOST: ${{ secrets.VPS2_SSH_HOST }}
           VPS2_SSH_PORT: ${{ secrets.VPS2_SSH_PORT }}
@@ -263,13 +266,11 @@ jobs:
           node-version: "24"
       - name: Open or update the deployment alert
         env:
-          HELD: ${{ needs.publish.result == 'success' && needs.package.outputs.held == 'true' }}
+          OUTCOME: ${{ (needs.check.result == 'failure' && 'check-failed') || (needs.publish.result == 'success' && needs.package.outputs.held == 'true' && 'held') || needs.deploy.outputs.outcome || (needs.deploy.result == 'cancelled' && 'interrupted') || '' }}
+          HOLD_REASON: ${{ needs.package.outputs.hold_reason }}
+          ALERT_SHA: ${{ inputs.sha || github.sha }}
           VERSION: ${{ needs.package.outputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          message="The release or deployment did not complete."
-          if [[ "$HELD" == true ]]; then
-            message="Release v$VERSION is held for a rollback-unsafe change. Start it manually with SHA $GITHUB_SHA."
-          fi
           bash scripts/cd/notify.sh "Hub CD needs attention" \
-            "$message $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" "$OUTCOME"

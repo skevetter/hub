@@ -43,11 +43,17 @@ case "$command" in
     if [[ "$SMOKE_FAIL" == yes ]]; then echo '{"ok":false,"checks":{"local_health":false}}'; exit 3; fi
     echo '{"ok":true,"checks":{"local_health":true}}' ;;
   rollback) echo '{"ok":true,"to":"1.0.0"}' ;;
+  smoke\\ 1.0.0)
+    if [[ "$ROLLBACK_SMOKE_FAIL" == yes ]]; then echo '{"ok":false}'; exit 3; fi
+    echo '{"ok":true}' ;;
   unknown|precheck\\ 0.0.1*|000*)
     if [[ "$ACCEPT" != yes ]]; then
       printf '{"ok":false,"reason":"%s"}\\n' "\${REFUSAL:-refused}"
       exit 2
     fi
+    echo '{"ok":true}' ;;
+  precheck*)
+    if [[ "$PAUSED_PRECHECK" == yes ]]; then echo '{"ok":false,"reason":"paused"}'; exit 2; fi
     echo '{"ok":true}' ;;
   *) echo '{"ok":true}' ;;
 esac
@@ -140,7 +146,7 @@ test("pauses on INT or TERM after the install is accepted", () => {
   ]) {
     const result = execute("deploy", { INTERRUPT });
     assert.equal(result.status, code, result.stderr);
-    assert.equal(result.output, "install_attempted=true\n");
+    assert.equal(result.output, "install_attempted=true\noutcome=interrupted\n");
     assert.deepEqual(result.calls, [...deployCalls.slice(0, 6), "pause"]);
   }
 });
@@ -152,7 +158,7 @@ test("pauses on INT or TERM before the remote install replies", () => {
   ]) {
     const result = execute("deploy", { INTERRUPT_INSTALL });
     assert.equal(result.status, code, result.stderr);
-    assert.equal(result.output, "install_attempted=true\n");
+    assert.equal(result.output, "install_attempted=true\noutcome=interrupted\n");
     assert.deepEqual(result.calls, [...deployCalls.slice(0, 5), "pause", "install-reply"]);
   }
 });
@@ -181,14 +187,26 @@ test("rolls back, waits, smokes and pauses after a failed smoke", () => {
   const result = execute("deploy", { SMOKE_FAIL: "yes" });
   assert.equal(result.status, 1);
   assert.deepEqual(result.calls, [...deployCalls, "rollback", "wait", "smoke", "pause"]);
+  assert.match(result.output, /outcome=rolled-back\n/u);
+  const failed = execute("deploy", { SMOKE_FAIL: "yes", ROLLBACK_SMOKE_FAIL: "yes" });
+  assert.equal(failed.status, 1);
+  assert.match(failed.output, /outcome=rollback-failed\n/u);
 });
 
-test("pauses without rollback after a manual deployment fails smoke", () => {
-  for (const HELD of ["false", "true"]) {
-    const result = execute("deploy", { SMOKE_FAIL: "yes", MANUAL_DEPLOY: "true", HELD });
+test("rolls back a dispatched stable release but never a held prerelease", () => {
+  for (const PRERELEASE of ["false", "true"]) {
+    const result = execute("deploy", { SMOKE_FAIL: "yes", MANUAL_DEPLOY: "true", PRERELEASE });
     assert.equal(result.status, 1);
-    assert.deepEqual(result.calls, [...deployCalls, "pause"]);
+    const rollback = PRERELEASE === "true" ? [] : ["rollback", "wait", "smoke"];
+    assert.deepEqual(result.calls, [...deployCalls, ...rollback, "pause"]);
   }
+});
+
+test("reports a paused precheck without attempting install", () => {
+  const result = execute("deploy", { PAUSED_PRECHECK: "yes" });
+  assert.equal(result.status, 2);
+  assert.equal(result.output, "outcome=paused-precheck\n");
+  assert.deepEqual(result.calls, ["status", "precheck"]);
 });
 
 test("reports each refusal and fails if any probe is accepted", () => {
@@ -208,6 +226,7 @@ test("polls exit 5 exactly 15 times, then pauses without rollback", () => {
   const result = execute("deploy", { WAIT: "running" });
   assert.equal(result.status, 1);
   assert.deepEqual(result.calls, [...deployCalls.slice(0, 5), ...Array(15).fill("wait"), "pause"]);
+  assert.match(result.output, /outcome=install-timeout\n/u);
 });
 
 test("recovers from a terminal install failure and pauses on ambiguous failures", () => {
@@ -226,6 +245,7 @@ test("recovers from a terminal install failure and pauses on ambiguous failures"
   const record = execute("deploy", { RECORD_FAIL: "yes" });
   assert.equal(record.status, 1);
   assert.deepEqual(record.calls, [...deployCalls, "record", "pause"]);
+  assert.match(record.output, /outcome=record-failed\n/u);
 });
 
 function call(...args) {

@@ -4,7 +4,7 @@ set -euo pipefail
 rollback_baseline() {
   local releases tags tag legacy=""
   releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-    --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name') || return
+    --jq '.[] | select(.draft == false) | if .prerelease then "held:" + .tag_name else .tag_name end') || return
   tags=$(node scripts/cd/git.mjs merged) || return
   while IFS= read -r tag; do
     [[ -n "$tag" ]] || continue
@@ -14,12 +14,15 @@ rollback_baseline() {
     fi
     if [[ "$tag" == v0.* && -z "$legacy" ]]; then legacy=$tag; fi
   done <<< "$tags"
-  printf '%s\n' "$legacy"
+  if [[ -n "$legacy" ]] && ! grep -Fxq -- "held:$legacy" <<< "$releases"; then
+    printf 'legacy:%s\n' "$legacy"
+  else
+    printf '%s\n' "$legacy"
+  fi
 }
 
 rollback_unsafe() {
-  local baseline scan sha matches commits
-  baseline=$(rollback_baseline) || return
+  local baseline="$1" scan sha matches commits
   scan=$(BASE_SHA="$baseline" ROLLBACK_UNSAFE=false node scripts/cd/check-migrations.mjs --release) || return
   if [[ "$scan" == true ]]; then
     echo true
@@ -40,7 +43,7 @@ rollback_unsafe() {
 }
 
 plan() {
-  local last tag ship held=false
+  local last tag ship baseline held=false hold_reason=""
   last=$(node scripts/cd/git.mjs latest)
   ship=$(node scripts/cd/ship-paths.mjs)
   if [[ "$GITHUB_REF" == refs/heads/main && "$ship" == false ]]; then
@@ -50,9 +53,17 @@ plan() {
   fi
   tag=$(node scripts/cd/next-version.mjs)
   if [[ "$GITHUB_REF" == refs/heads/main && "$GITHUB_REPOSITORY" == skevetter/hub ]]; then
-    held=$(rollback_unsafe)
+    baseline=$(rollback_baseline)
+    if [[ "$baseline" == legacy:* ]]; then
+      held=true
+      hold_reason="legacy-baseline"
+      echo "::notice::Release held: first release after the legacy baseline"
+    else
+      held=$(rollback_unsafe "$baseline")
+    fi
   fi
-  printf 'ship=true\nbase_tag=%s\nversion=%s\nheld=%s\n' "$last" "${tag#v}" "$held" >> "$GITHUB_OUTPUT"
+  printf 'ship=true\nbase_tag=%s\nversion=%s\nheld=%s\nhold_reason=%s\n' \
+    "$last" "${tag#v}" "$held" "$hold_reason" >> "$GITHUB_OUTPUT"
 }
 
 pack() {

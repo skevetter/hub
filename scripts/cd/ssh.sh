@@ -7,8 +7,10 @@ cd_ssh() {
   case "$1" in
     status|precheck\ *|pause\ *) seconds=15 ;;
     install\ *|rollback|record\ *) seconds=30 ;;
+    backup\ *) seconds=330 ;;
+    smoke\ *) seconds=150 ;;
     quiet\ *) seconds=630 ;;
-    wait\ 60) seconds=65 ;;
+    wait\ 60) seconds=100 ;;
     wait\ *) seconds=150 ;;
   esac
   timeout --foreground --kill-after=1 "$seconds" \

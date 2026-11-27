@@ -49,7 +49,7 @@ rollback_release() {
     echo "Rollback did not complete" >&2
     return 1
   fi
-  smoke "$to" || echo "Rollback smoke failed" >&2
+  smoke "$to" || { echo "Rollback smoke failed" >&2; return 1; }
 }
 
 pause_failed() {
@@ -57,9 +57,11 @@ pause_failed() {
 }
 
 fail_deploy() {
-  if [[ "$1" == rollback && "$MANUAL_DEPLOY" != true ]]; then
-    rollback_release || :
+  local outcome="${2:-}"
+  if [[ "$1" == rollback && "${PRERELEASE:-false}" != true ]]; then
+    if rollback_release; then outcome=rolled-back; else outcome=rollback-failed; fi
   fi
+  if [[ -n "$outcome" ]]; then mark_output outcome "$outcome" || :; fi
   pause_failed || echo "Unable to pause deployment" >&2
   return 1
 }
@@ -79,6 +81,7 @@ handle_interruption() {
   fi
   trap '' INT TERM
   if [[ "$install_attempted" == true && "$deployed" != true ]]; then
+    mark_output outcome interrupted || :
     pause_failed || echo "Unable to pause deployment after interruption" >&2
   fi
   exit "$1"
@@ -94,7 +97,7 @@ record_deployment() {
   fi
   recording=false
   if [[ "$interrupted" != 0 ]]; then handle_interruption "$interrupted"; fi
-  if [[ "$deployed" != true ]]; then fail_deploy pause; return; fi
+  if [[ "$deployed" != true ]]; then fail_deploy pause record-failed; return; fi
   return "$code"
 }
 
@@ -104,7 +107,7 @@ finish_install() {
   case "$code" in
     0) ;;
     3) fail_deploy rollback; return ;;
-    5) echo "Install still running after 15 polls" >&2; fail_deploy pause; return ;;
+    5) echo "Install still running after 15 polls" >&2; fail_deploy pause install-timeout; return ;;
     *) fail_deploy pause; return ;;
   esac
   smoke "$DEPLOY_VERSION" || { fail_deploy rollback; return; }
@@ -156,13 +159,22 @@ install_release() {
   esac
 }
 
+precheck() {
+  local reply code=0
+  reply=$(logged precheck "$DEPLOY_VERSION" "$DEPLOY_SHA") || code=$?
+  if [[ "$code" == 2 ]] && jq -e '.reason == "paused"' <<< "$reply" >/dev/null; then
+    mark_output outcome paused-precheck
+  fi
+  return "$code"
+}
+
 deploy() {
   local status running
   validate_release
   status=$(logged status)
   running=$(jq -r '.commit // empty' <<< "$status")
   if [[ -n "$running" ]]; then check_running "$running"; fi
-  logged precheck "$DEPLOY_VERSION" "$DEPLOY_SHA" >/dev/null
+  precheck
   logged quiet 600 >/dev/null
   logged backup "$DEPLOY_VERSION" >/dev/null
   install_release

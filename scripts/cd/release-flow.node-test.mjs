@@ -16,6 +16,20 @@ const { join } = require("node:path");
 const env = process.env;
 const [verb, action, ...args] = process.argv.slice(2);
 const command = [action, ...args].join(" ");
+appendFileSync(join(env.RUNNER_TEMP, "gh-calls"), verb + " " + command + "\\n");
+if (verb === "issue" && action === "list") {
+  console.log(JSON.stringify([{ title: "Hub CD needs attention", number: 42 }]));
+  process.exit(0);
+}
+if (verb === "issue" && action === "comment") {
+  appendFileSync(join(env.RUNNER_TEMP, "comments"), args[args.indexOf("--body") + 1] + "\\n");
+  process.exit(0);
+}
+if (command.includes("/issues/42/comments?")) {
+  console.log(JSON.stringify([{ body: "older page", user: { login: "github-actions[bot]" } }]));
+  console.log(env.PREVIOUS_COMMENTS || "[]");
+  process.exit(0);
+}
 if (verb === "release" && action === "create") {
   const [tag] = args;
   execFileSync("git", ["update-ref", "refs/tags/" + tag, args[args.indexOf("--target") + 1]]);
@@ -97,6 +111,7 @@ function setupFixture({ dir, save, git, exec }) {
     RUNNER_TEMP: dir,
     GITHUB_OUTPUT: join(dir, "outputs"),
     GITHUB_REPOSITORY: "skevetter/hub",
+    GITHUB_SERVER_URL: "https://github.com",
     GITHUB_REF: "refs/heads/main",
     EXPECTED_CHECKSUM: checksum,
     RELEASES: JSON.stringify([{ tag_name: "v1.0.0", draft: false, prerelease: false }]),
@@ -141,6 +156,44 @@ function writeArtifact(dir, version) {
   writeFileSync(join(dir, file), "artifact");
   writeFileSync(join(dir, file + ".sha256"), checksum + "  " + file + "\n");
 }
+
+test("holds the legacy cutover without migration or per-commit scans", (t) => {
+  const { dir, run, push, git, save } = fixture(t);
+  git("update-ref", "refs/tags/v0.11.0", git("rev-parse", "HEAD"));
+  git("update-ref", "-d", "refs/tags/v1.0.0");
+  push("first fix");
+  save("scripts/cd/check-migrations.mjs", 'throw new Error("unexpected scan");');
+  const first = plan(run, { RELEASES: "[]" });
+  assert.deepEqual(first, {
+    ship: "true",
+    base_tag: "v0.11.0",
+    version: "1.0.0",
+    held: "true",
+    hold_reason: "legacy-baseline",
+  });
+  assert.equal(readFileSync(join(dir, "gh-calls"), "utf8").trim().split("\n").length, 1);
+  assert.match(readFileSync(join(dir, "gh-calls"), "utf8"), /\/releases\?/u);
+});
+
+test("push path classification includes changes from prior pushes since the newest reachable tag", (t) => {
+  const { dir, push, git, save } = fixture(t);
+  mkdirSync(join(dir, "src/e2e"));
+  save("src/card.tsx", "ui change");
+  save("src/e2e/contract.ts", "e2e change");
+  const previous = push("previous push");
+  git("update-ref", "refs/tags/v9.0.0-rc.1", previous);
+  const tip = push("latest push");
+  git("update-ref", "refs/tags/v10.0.0", push("unreachable push"));
+  git("checkout", "--detach", tip);
+  const classify = () =>
+    execFileSync("node", ["scripts/cd/changed-paths.mjs", previous, "true"], {
+      cwd: dir,
+      encoding: "utf8",
+    });
+  assert.equal(classify(), "ui=true\ne2e=true\nworkflows=false\n");
+  git("update-ref", "-d", "refs/tags/v1.0.0");
+  assert.equal(classify(), "ui=false\ne2e=false\nworkflows=false\n");
+});
 
 test("two successive main pushes plan against the previous publish and tag their tested SHAs", (t) => {
   const workflow = readFileSync(join(root, ".github/workflows/main.yml"), "utf8");
@@ -221,6 +274,41 @@ function release() {
     ],
   };
 }
+
+test("alerts link the short SHA and dedupe checks and paused prechecks against the last bot comment", (t) => {
+  const { dir, run, push } = fixture(t);
+  const sha = push("fix");
+  const runUrl = "https://github.com/skevetter/hub/actions/runs/123";
+  const comment = (...args) =>
+    readFileSync(join(dir, "comments"), "utf8")
+      .trim()
+      .split("\n")
+      .at(...args);
+  const notify = (outcome, previous = [], env = {}) => {
+    const result = run("notify", ["Hub CD needs attention", runUrl, outcome], {
+      PREVIOUS_COMMENTS: JSON.stringify(previous),
+      ...env,
+    });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  const bot = (body) => ({ body, user: { login: "github-actions[bot]" } });
+  notify("check-failed");
+  const first = comment(-1);
+  assert.ok(
+    first.includes(`[\`${sha.slice(0, 7)}\`](https://github.com/skevetter/hub/commit/${sha})`),
+  );
+  assert.match(first, /Required checks failed/u);
+  notify("check-failed", [bot(first)]);
+  notify("paused-precheck", [bot(first)]);
+  assert.equal(readFileSync(join(dir, "comments"), "utf8"), first + "\n");
+  notify("paused-precheck", [bot(first), bot("different SHA")]);
+  assert.match(comment(-1), /CD is paused/u);
+  notify("held", [], { VERSION: "1.0.0", HOLD_REASON: "legacy-baseline" });
+  assert.match(
+    comment(-1),
+    /first release after the legacy baseline.*cd-control status.*selftest.*unpause.*main\.yml/u,
+  );
+});
 
 test("dispatch requires a main ancestor, one tag, green CI, and a matching bot release", (t) => {
   const { run, push, git } = fixture(t);

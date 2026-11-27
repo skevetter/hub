@@ -50,7 +50,8 @@ GitHub Release with the tarball and its checksum. Main release runs serialize pl
 packing, and publishing. Publish attests the verified tarball. Manual deployment checks
 the downloaded checksum and attestation for the requested main commit.
 
-The release check compares the tested commit to the latest reachable `v*` tag. Changes limited
+Push path classification compares against the latest reachable stable-form `v*` tag, or the
+previous push SHA if none exists. Changes limited
 to the [no-ship paths](scripts/cd/ship-paths.mjs) skip the tag and deploy. If the last release was
 paused or failed after tagging, a no-ship push does not retry it. Start the published release
 manually from `main` with its exact SHA.
@@ -58,9 +59,23 @@ manually from `main` with its exact SHA.
 Automatic deploys take a backup, install, and check the service. A failed smoke check rolls back
 and pauses deployment. Mark incompatible migrations and persisted data changes `rollback-unsafe`
 on the PR. The pipeline publishes held releases as prereleases. It keeps the hold on subsequent
-releases until a successful manual deploy promotes a prerelease. Manual deployments do not roll back
-automatically. Only the repository owner can unpause. See the `cd-alert` issues for failed or held
+releases until a successful manual deploy promotes a prerelease. A held prerelease never rolls
+back automatically. A manual dispatch of a stable release can roll back. Only the repository owner
+can unpause. See the `cd-alert` issues for failed or held
 releases.
+
+### Deployment runbook
+
+1. The first release after the legacy baseline is held without scanning historical migrations or
+   PR labels. Run `cd-control status` and `selftest`, then `unpause`. Dispatch
+   [Main](.github/workflows/main.yml) from `main` with the held release's exact SHA.
+2. After an automatic rollback and pause, run `cd-control unpause`, then use **Re-run failed jobs**
+   on the run that holds the fix. Dispatching the SHA already recorded as running only runs smoke.
+3. The workflow refuses older releases. Roll forward with a revert, or have an administrator
+   run `rollback` through `sudo` on the host. A main push waits for the running main deploy,
+   whose job can take up to 55 minutes.
+4. With squash merges, put `!` in the Conventional Commit title for a major bump. The squash
+   commit has no breaking-change footer.
 
 ### Accepted limits
 

@@ -8,6 +8,9 @@ on:
       base:
         type: string
         default: ""
+      release-base:
+        type: boolean
+        default: false
       nightly:
         type: boolean
         default: false
@@ -44,7 +47,8 @@ jobs:
         id: paths
         env:
           BASE_SHA: ${{ inputs.base || github.event.pull_request.base.sha }}
-        run: node scripts/cd/changed-paths.mjs "$BASE_SHA" >> "$GITHUB_OUTPUT"
+          RELEASE_BASE: ${{ inputs.release-base }}
+        run: node scripts/cd/changed-paths.mjs "$BASE_SHA" "$RELEASE_BASE" >> "$GITHUB_OUTPUT"
 
   static:
     name: static
