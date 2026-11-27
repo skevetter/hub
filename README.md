@@ -107,7 +107,8 @@ Open `PASEO_HUB_APP_URL`, sign in with the bootstrap account, and replace its te
 paseo hub connect https://hub.example.com
 ```
 
-The image is published as `ghcr.io/getpaseo/hub:latest`.
+The upstream image is `ghcr.io/getpaseo/hub:latest`. This fork publishes tarballs on its
+[GitHub Releases](https://github.com/skevetter/hub/releases) page instead of publishing an image.
 
 See the [self-hosting guide](https://paseo.sh/docs/hub/self-hosting) for production deployment details.
 For Linear setup and workflows, see the public [Linear app](https://paseo.sh/docs/hub/self-hosting/linear-app) and [Linear triggers](https://paseo.sh/docs/hub/triggers/linear) guides.

@@ -1,227 +1,322 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_call:
+    inputs:
+      base:
+        type: string
+        default: ""
+      release-base:
+        type: boolean
+        default: false
+      nightly:
+        type: boolean
+        default: false
+
+permissions: {}
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-permissions:
-  contents: read
-
-# Replace this marker with the accepted companion commit immediately after the
-# companion PR creator commits it. Source-built jobs deliberately fail until it
-# is one exact 40-character SHA; mutable refs and repository variables are forbidden.
 env:
   PASEO_E2E_COMMIT: 2b3559b107243306986176b80beb0e779f9fe53e
 
 jobs:
-  typecheck:
+  changes:
+    name: changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      ui: ${{ steps.paths.outputs.ui }}
+      e2e: ${{ steps.paths.outputs.e2e }}
+      workflows: ${{ steps.paths.outputs.workflows }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Check Docker build definition
-        run: docker build --check .
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          node-version: "22"
-          cache: "npm"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
-          cache: "npm"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-  format:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
-          cache: "npm"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Check formatting
-        run: npm run format:check
-
-  test:
-    runs-on: ubuntu-latest
-    env:
-      RUN_RUNG_E_E2E: ${{ vars.RUN_RUNG_E_E2E }}
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
+          persist-credentials: false
           fetch-depth: 0
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "22"
-          cache: "npm"
+          node-version: "24"
+      - name: Classify paths
+        id: paths
+        env:
+          BASE_SHA: ${{ inputs.base || github.event.pull_request.base.sha }}
+          RELEASE_BASE: ${{ inputs.release-base }}
+        run: node scripts/cd/changed-paths.mjs "$BASE_SHA" "$RELEASE_BASE" >> "$GITHUB_OUTPUT"
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install E2E agent CLIs
-        run: npm install -g @getpaseo/cli opencode-ai
-
-      - name: Build
-        run: npm run build
-
-      - name: Run tests
-        run: npm test
-
-  migrations:
+  static:
+    name: static
+    if: ${{ !inputs.nightly }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          node-version: "22"
-          cache: "npm"
-      - run: npm ci
-      - name: Check Drizzle migrations for drift
-        run: npm run db:check
-
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "22"
+          node-version: "24"
           cache: "npm"
       - run: npm ci
-      - name: Build production application
-        run: npm run build
-
-  browser-e2e:
-    runs-on: ubuntu-latest
-    env:
-      PASEO_E2E_WORKTREE: ${{ github.workspace }}/paseo-source
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Require the exact Paseo companion commit
+      - run: docker build --check .
+      - run: npm run typecheck
+      - run: npm run lint
+      - name: Strict lint
+        env:
+          BASE_SHA: ${{ inputs.base || github.event.pull_request.base.sha }}
         run: |
-          [[ "$PASEO_E2E_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "::error::Fill PASEO_E2E_COMMIT with the accepted companion commit before review"
-            exit 1
-          }
-
-      - name: Check out exact Paseo source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+          if [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$BASE_SHA^{commit}"; then
+            npm run lint:strict -- --base "$BASE_SHA"
+          else
+            npm run lint:strict
+          fi
+      - run: npm run format:check
+      - run: npm run build
+      - run: npm run db:check
+      - name: Check migration rollback compatibility
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ROLLBACK_UNSAFE: ${{ contains(github.event.pull_request.labels.*.name, 'rollback-unsafe') }}
+        run: node scripts/cd/check-migrations.mjs
+      - run: npm run test:scripts
+      - run: npm pack --dry-run
+      - name: Run built-only tests
+        env:
+          TEST_SHARD_REPORT_DIR: ${{ runner.temp }}/built-only
+        run: npm run test:parallel -- --built-only
+      - name: Upload built-only report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          repository: getpaseo/paseo
-          ref: ${{ env.PASEO_E2E_COMMIT }}
-          path: paseo-source
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
-          cache: "npm"
-
-      - name: Build exact Paseo source
-        working-directory: paseo-source
-        run: |
-          npm ci
-          npm run build:server
-
-      - run: npm ci
-      - name: Install Chromium
-        run: npx playwright install --with-deps chromium
-      - name: Run built-app browser tests
-        run: npm run test:e2e:browser
+          name: unit-built-only
+          path: |
+            ${{ runner.temp }}/built-only/built-only.json
+            ${{ runner.temp }}/built-only/built-only.summary.json
+            ${{ runner.temp }}/built-only/vitest.log
+            ${{ runner.temp }}/built-only/vitest.retry-*.log
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Check shard coverage
+        run: npm run test:parallel -- --check-coverage
 
   docker-smoke:
+    name: docker-smoke
+    if: ${{ !inputs.nightly }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Build and smoke-test production image
-        run: npm run docker:smoke
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - run: npm run docker:smoke
 
-  hub-e2e:
+  unit:
+    name: unit (${{ matrix.index }})
+    if: ${{ !inputs.nightly }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2, 3, 4, 5, 6]
+        total: [6]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+          cache: "npm"
+      - run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Run unit shard
+        env:
+          TEST_SHARD_INDEX: ${{ matrix.index }}
+          TEST_SHARD_TOTAL: ${{ matrix.total }}
+          TEST_SHARD_REPORT_DIR: ${{ runner.temp }}/shard
+        run: npm run test:parallel
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: unit-shard-${{ matrix.index }}
+          path: |
+            ${{ runner.temp }}/shard/shard-${{ matrix.index }}.json
+            ${{ runner.temp }}/shard/shard-${{ matrix.index }}.summary.json
+            ${{ runner.temp }}/shard/vitest.log
+            ${{ runner.temp }}/shard/vitest.retry-*.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  browser:
+    name: browser (${{ matrix.index }})
+    needs: changes
+    if: ${{ inputs.nightly || needs.changes.outputs.ui == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2, 3]
     env:
       PASEO_E2E_WORKTREE: ${{ github.workspace }}/paseo-source
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+          cache: "npm"
       - name: Require the exact Paseo companion commit
         run: |
           [[ "$PASEO_E2E_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
             echo "::error::Fill PASEO_E2E_COMMIT with the accepted companion commit before review"
             exit 1
           }
-
       - name: Check out exact Paseo source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: getpaseo/paseo
           ref: ${{ env.PASEO_E2E_COMMIT }}
           path: paseo-source
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+          persist-credentials: false
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: paseo-cache
         with:
-          node-version: "22"
-          cache: "npm"
+          path: |
+            paseo-source/node_modules
+            paseo-source/packages/*/node_modules
+            paseo-source/packages/*/dist
+          key: paseo-server-${{ runner.os }}-${{ runner.arch }}-node24-${{ env.PASEO_E2E_COMMIT }}
+      - name: Build exact Paseo source
+        if: steps.paseo-cache.outputs.cache-hit != 'true'
+        working-directory: paseo-source
+        run: |
+          npm ci
+          npm run build:server
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Run built-app browser shard
+        env:
+          SHARD: ${{ matrix.index }}/3
+        run: npm run test:e2e:browser -- --shard "$SHARD"
 
+  hub-e2e:
+    name: hub-e2e
+    needs: changes
+    if: ${{ inputs.nightly || needs.changes.outputs.e2e == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      PASEO_E2E_WORKTREE: ${{ github.workspace }}/paseo-source
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+          cache: "npm"
+      - name: Require the exact Paseo companion commit
+        run: |
+          [[ "$PASEO_E2E_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::Fill PASEO_E2E_COMMIT with the accepted companion commit before review"
+            exit 1
+          }
+      - name: Check out exact Paseo source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: getpaseo/paseo
+          ref: ${{ env.PASEO_E2E_COMMIT }}
+          path: paseo-source
+          persist-credentials: false
       - name: Build exact Paseo source
         working-directory: paseo-source
         run: |
           npm ci
           npm run build:server
-
-      - name: Install Hub dependencies
-        run: npm ci
-
+      - run: npm ci
       - name: Install provider CLIs for bundle validation
         run: npm install -g @anthropic-ai/claude-code@2.1.226 @openai/codex@0.144.0
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+      - run: npm run test:e2e:hub:source
 
-      - name: Install Chromium
-        run: npx playwright install --with-deps chromium
+  workflow-lint:
+    name: workflow-lint
+    needs: changes
+    if: ${{ !inputs.nightly && needs.changes.outputs.workflows == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: Download pinned workflow linters
+        working-directory: ${{ runner.temp }}
+        run: |
+          actionlint='actionlint_1.7.7_linux_amd64.tar.gz'
+          zizmor='zizmor-x86_64-unknown-linux-gnu.tar.gz'
+          curl -fsSLO "https://github.com/rhysd/actionlint/releases/download/v1.7.7/$actionlint"
+          curl -fsSLO "https://github.com/zizmorcore/zizmor/releases/download/v1.11.0/$zizmor"
+          printf '%s  %s\n' \
+            023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757 "$actionlint" \
+            da35e666827cbb1e6ca98b18b7969657b9f186467bfebfa25e730aac527c36f8 "$zizmor" |
+            sha256sum --check --strict
+          tar -xzf "$actionlint" actionlint
+          tar -xzf "$zizmor" ./zizmor
+      - name: Lint workflows
+        run: |
+          "$RUNNER_TEMP/actionlint"
+          "$RUNNER_TEMP/zizmor" --offline .github/workflows
+          shellcheck -x scripts/cd/*.sh
 
-      - name: Build Hub production application
-        run: npm run build
-
-      - name: Run Hub E2E against source-built Paseo
-        run: npm run test:e2e:hub:source
+  required:
+    name: required
+    needs: [changes, static, docker-smoke, unit, browser, hub-e2e, workflow-lint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: Check required results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          NIGHTLY: ${{ inputs.nightly || false }}
+        run: node scripts/cd/required-checks.mjs

@@ -1,0 +1,276 @@
+name: Main
+
+on:
+  push:
+    branches: [main, build39/base]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact checked commit of a published release
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'release-main' || format('main-run-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: check
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      base: ${{ github.event.before }}
+      release-base: true
+
+  package:
+    name: package
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    defaults:
+      run:
+        working-directory: hub-package-source
+    outputs:
+      ship: ${{ steps.plan.outputs.ship }}
+      base_tag: ${{ steps.plan.outputs.base_tag }}
+      version: ${{ steps.plan.outputs.version }}
+      held: ${{ steps.plan.outputs.held }}
+      hold_reason: ${{ steps.plan.outputs.hold_reason }}
+      checksum: ${{ steps.pack.outputs.checksum }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          path: hub-package-source
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: Plan release
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/cd/package.sh plan
+      - if: steps.plan.outputs.ship == 'true'
+        run: npm ci
+      - name: Pack and verify the tested commit
+        if: steps.plan.outputs.ship == 'true'
+        id: pack
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          bash scripts/cd/package.sh pack "$VERSION" "$RUNNER_TEMP/hub-package"
+          read -r checksum _ < "$RUNNER_TEMP/hub-package/getpaseo-hub-$VERSION.tgz.sha256"
+          printf 'checksum=%s\n' "$checksum" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.plan.outputs.ship == 'true'
+        with:
+          name: hub-tarball
+          path: ${{ runner.temp }}/hub-package/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: package
+    if: github.repository == 'skevetter/hub' && github.ref == 'refs/heads/main' && needs.package.outputs.ship == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hub-tarball
+          path: ${{ runner.temp }}/hub-package/
+      - name: Verify the downloaded artifact
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+          EXPECTED_CHECKSUM: ${{ needs.package.outputs.checksum }}
+        run: bash scripts/cd/package.sh verify "$VERSION" "$RUNNER_TEMP/hub-package"
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: ${{ runner.temp }}/hub-package/getpaseo-hub-${{ needs.package.outputs.version }}.tgz
+      - name: Publish the checked tarball
+        env:
+          BASE_TAG: ${{ needs.package.outputs.base_tag }}
+          VERSION: ${{ needs.package.outputs.version }}
+          HELD: ${{ needs.package.outputs.held }}
+          EXPECTED_CHECKSUM: ${{ needs.package.outputs.checksum }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/cd/package.sh publish "$VERSION" "$RUNNER_TEMP/hub-package"
+          if [[ "$HELD" == true ]]; then
+            echo "::notice::Published a held prerelease"
+          fi
+
+  dispatch-guard:
+    name: dispatch-guard
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'skevetter/hub'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    outputs:
+      version: ${{ steps.dispatch.outputs.version }}
+      checksum: ${{ steps.dispatch.outputs.checksum }}
+      prerelease: ${{ steps.dispatch.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: Verify the existing release and CI results
+        id: dispatch
+        env:
+          DEPLOY_SHA: ${{ inputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/cd/dispatch.sh
+
+  deploy:
+    name: deploy
+    needs: [package, publish, dispatch-guard]
+    if: >-
+      !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'skevetter/hub' &&
+      ((github.event_name == 'workflow_dispatch' && needs.dispatch-guard.result == 'success') ||
+      (github.event_name == 'push' && needs.publish.result == 'success' && needs.package.outputs.held == 'false'))
+    runs-on: ubuntu-latest
+    environment: production
+    # The job-wide cap includes quiet, install and rollback. Slow SSH exchanges can exhaust it before all polls finish.
+    timeout-minutes: 55
+    permissions:
+      contents: read
+    outputs:
+      deployed: ${{ steps.deploy.outputs.deployed }}
+      install_attempted: ${{ steps.deploy.outputs.install_attempted }}
+      outcome: ${{ steps.deploy.outputs.outcome }}
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Require a production deploy event
+        run: |
+          [[ "$GITHUB_REPOSITORY" == skevetter/hub && "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: Write SSH credentials
+        env:
+          VPS2_SSH_PRIVATE_KEY: ${{ secrets.VPS2_SSH_PRIVATE_KEY }}
+          VPS2_SSH_KNOWN_HOSTS: ${{ secrets.VPS2_SSH_KNOWN_HOSTS }}
+        run: |
+          umask 077
+          [[ -n "$VPS2_SSH_PRIVATE_KEY" && -n "$VPS2_SSH_KNOWN_HOSTS" ]]
+          printf '%s\n' "$VPS2_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/hub-deploy-key"
+          printf '%s\n' "$VPS2_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/hub-deploy-known-hosts"
+      - name: Deploy and verify
+        id: deploy
+        env:
+          DEPLOY_SHA: ${{ inputs.sha || github.sha }}
+          DEPLOY_VERSION: ${{ needs.dispatch-guard.outputs.version || needs.package.outputs.version }}
+          DEPLOY_CHECKSUM: ${{ needs.dispatch-guard.outputs.checksum || needs.package.outputs.checksum }}
+          MANUAL_DEPLOY: ${{ github.event_name == 'workflow_dispatch' }}
+          PRERELEASE: ${{ needs.dispatch-guard.outputs.prerelease == 'true' }}
+          HUB_PUBLIC_URL: ${{ vars.HUB_PUBLIC_URL }}
+          VPS2_SSH_HOST: ${{ secrets.VPS2_SSH_HOST }}
+          VPS2_SSH_PORT: ${{ secrets.VPS2_SSH_PORT }}
+        run: bash scripts/cd/deploy.sh
+      - name: Pause after an interrupted install
+        if: (cancelled() || failure()) && steps.deploy.outputs.install_attempted == 'true' && steps.deploy.outputs.deployed != 'true'
+        timeout-minutes: 1
+        env:
+          VPS2_SSH_HOST: ${{ secrets.VPS2_SSH_HOST }}
+          VPS2_SSH_PORT: ${{ secrets.VPS2_SSH_PORT }}
+        run: bash scripts/cd/deploy.sh pause-failed || echo "::warning::Unable to pause deployment"
+      - name: Remove SSH credentials
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/hub-deploy-key" "$RUNNER_TEMP/hub-deploy-known-hosts"
+
+  promote:
+    name: promote
+    needs: [dispatch-guard, deploy]
+    if: >-
+      !cancelled() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+      github.repository == 'skevetter/hub' && needs.dispatch-guard.result == 'success' &&
+      needs.deploy.result == 'success' && needs.deploy.outputs.deployed == 'true' &&
+      needs.dispatch-guard.outputs.prerelease == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: promote-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: Promote the verified prerelease
+        env:
+          VERSION: ${{ needs.dispatch-guard.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --prerelease=false
+
+  notify:
+    name: notify
+    needs: [check, package, publish, dispatch-guard, deploy, promote]
+    if: >-
+      always() && github.ref == 'refs/heads/main' && github.repository == 'skevetter/hub' &&
+      (needs.deploy.result == 'failure' || needs.dispatch-guard.result == 'failure' || needs.promote.result == 'failure' ||
+      (github.event_name == 'push' && needs.check.result == 'failure') ||
+      (needs.deploy.result == 'cancelled' && needs.deploy.outputs.install_attempted == 'true' &&
+      needs.deploy.outputs.deployed != 'true') ||
+      needs.publish.result == 'failure' || needs.publish.result == 'cancelled' || needs.package.result == 'failure' ||
+      (needs.publish.result == 'success' && needs.package.outputs.held == 'true'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    concurrency:
+      group: cd-alert-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: Open or update the deployment alert
+        env:
+          OUTCOME: ${{ (needs.check.result == 'failure' && 'check-failed') || (needs.publish.result == 'success' && needs.package.outputs.held == 'true' && 'held') || needs.deploy.outputs.outcome || (needs.deploy.result == 'cancelled' && 'interrupted') || '' }}
+          HOLD_REASON: ${{ needs.package.outputs.hold_reason }}
+          ALERT_SHA: ${{ inputs.sha || github.sha }}
+          VERSION: ${{ needs.package.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/cd/notify.sh "Hub CD needs attention" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" "$OUTCOME"

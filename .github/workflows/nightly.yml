@@ -1,0 +1,43 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions: {}
+
+jobs:
+  check:
+    name: check
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      nightly: true
+
+  notify:
+    name: notify
+    needs: check
+    if: always() && github.repository == 'skevetter/hub' && (needs.check.result == 'failure' || needs.check.result == 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    concurrency:
+      group: cd-alert-nightly
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: Open or update the nightly alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/cd/notify.sh "Hub nightly checks failed" \
+            "Browser or Hub E2E checks failed. $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

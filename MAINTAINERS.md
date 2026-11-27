@@ -6,13 +6,24 @@ This guide covers repository operations for maintainers. Product usage belongs i
 
 ## Verify a change
 
-The required checks match the jobs in [CI](.github/workflows/ci.yml):
+1. Pull requests run [CI](.github/workflows/ci.yml): static checks, Docker smoke, and six
+   unit shards. Static builds Hub, checks migrations and packaging, runs script tests and
+   the built-only tests, and confirms the six shards and built-only tests cover every test
+   file exactly once. Static runs both regular lint and strict lint. Strict lint checks
+   applicable changed files against the comparison base.
+2. On pull requests, UI paths also trigger three browser shards, Hub integration paths
+   trigger Hub E2E, and workflow paths trigger workflow and shell lint. The required check
+   checks the results for the jobs that apply.
+3. [Nightly](.github/workflows/nightly.yml) runs all three browser shards and Hub E2E
+   regardless of changed paths. It skips static checks, Docker smoke, unit shards, and
+   workflow lint.
 
 ```sh
 npm run typecheck
 npm run lint
+npm run lint:strict
 npm run format:check
-npm test
+npm run test:parallel
 npm run db:check
 npm run build
 npm run docker:smoke
@@ -30,50 +41,71 @@ uses Oxfmt, not Prettier.
 
 ## Publish a release
 
-A Hub release is three artifacts: the `@getpaseo/hub` npm package, a multi-architecture
-container image, and a GitHub Release. npm is published locally; the tag publishes the other two.
-A release is not done until all three are out.
+[Main](.github/workflows/main.yml) checks the pushed commit and packs that exact commit in a
+scratch checkout. The version comes from Conventional Commits. The checkout's version stays
+unchanged. The package job extracts the tarball, runs `npm ci --omit=dev --legacy-peer-deps`,
+and checks the production tree against the bundled shrinkwrap before
+it can be published. The build branch produces a workflow artifact. Only `main` creates a tag and
+GitHub Release with the tarball and its checksum. Main release runs serialize planning,
+packing, and publishing. Publish attests the verified tarball. Manual deployment checks
+the downloaded checksum and attestation for the requested main commit.
 
-1. Update the version in `package.json` and `package-lock.json`.
-2. Add a matching `## <version> - YYYY-MM-DD` section to `CHANGELOG.md`. The changelog describes
-   the self-hosted release, so leave out changes that only affect the hosted service: plans,
-   pricing, trials, billing, and hosted usage limits.
-3. Run the release checks. `release:check` verifies release metadata, types, lint, formatting, the
-   production build, and the npm package contents.
+Push path classification compares against the latest reachable stable-form `v*` tag, or the
+previous push SHA if none exists. Changes limited
+to the [no-ship paths](scripts/cd/ship-paths.mjs) skip the tag and deploy. If the last release was
+paused or failed after tagging, a no-ship push does not retry it. Start the published release
+manually from `main` with its exact SHA.
 
-   ```sh
-   npm run release:check
-   ```
+Automatic deploys take a backup, install, and check the service. A failed smoke check rolls back
+and pauses deployment. Mark incompatible migrations and persisted data changes `rollback-unsafe`
+on the PR. The pipeline publishes held releases as prereleases. It keeps the hold on subsequent
+releases until a successful manual deploy promotes a prerelease. A held prerelease never rolls
+back automatically. A manual dispatch of a stable release can roll back automatically. Only the
+repository owner can run `cd-control rollback` or `unpause`. See the `cd-alert` issues for failed
+or held releases.
 
-4. Commit the release preparation to `main` and push it.
-5. Publish npm from that clean `main` checkout, then verify the public package from a directory
-   outside the repository. Open the URL Hub prints, and stop it with Ctrl+C once the first-run
-   page loads.
+### Deployment runbook
 
-   ```sh
-   npm whoami
-   npm publish --access public
-   npm view @getpaseo/hub version
-   cd "$(mktemp -d)" && npx @getpaseo/hub@<version>
-   ```
+Check the Actions run list after dispatching `rollback` or `unpause`. GitHub may cancel an older
+pending job in the same concurrency group when a newer one queues. An owner control can replace a
+pending deploy, and a later deploy can replace a pending owner control.
 
-6. Create an annotated tag on the release commit and push it:
+1. The first release after the legacy baseline is held without scanning historical migrations or
+   PR labels. Run `cd-control status` and `selftest`, then `unpause`. Dispatch
+   [Main](.github/workflows/main.yml) from `main` with the held release's exact SHA.
+2. If the first deploy or a later held release fails before it is recorded, dispatch `rollback`
+   in [CD control](.github/workflows/cd-control.yml) from `main`. The job waits for recovery and
+   runs host smoke on the restored version, which can be the bootstrap build. Check the step
+   summary. The job re-applies and verifies the pause even if rollback fails. If it cannot
+   confirm the pause, check `cd-control status` and pause deploys before proceeding.
+3. If the workflow is unavailable, an administrator can run
+   `sudo /usr/local/sbin/hub-deploy-root rollback` on the host. Run
+   `sudo /usr/local/sbin/hub-deploy-root wait 60` until it reports `done`; stop on `failed`.
+   Then run `sudo /usr/local/sbin/hub-deploy-root smoke <previous>` with the rollback reply's
+   `to` version. Leave deploys paused while investigating.
+4. Once the fix or revert is ready, run `cd-control unpause`, then use **Re-run failed jobs**
+   on the run that holds the fix. The workflow refuses older releases. Dispatching the SHA
+   already recorded as running only runs smoke.
+5. With squash merges, put `!` in the Conventional Commit title for a major bump. The squash
+   commit has no breaking-change footer.
 
-   ```sh
-   git tag -a v<version> <commit> -m "Paseo Hub v<version>"
-   git push origin v<version>
-   ```
+### Accepted limits
 
-The tag must match both `package.json` and the changelog section. A tag push runs only the
-[Release](.github/workflows/release.yml) workflow; it does not rerun the main CI suite. The
-workflow publishes `ghcr.io/getpaseo/hub:<version>`, updates `latest` for stable releases, and
-creates or updates the GitHub Release from the matching changelog section. Prereleases do not
-move `latest`.
+- Holds are stored in the GitHub Release prerelease flag. Anyone with repository write access
+  can change that flag.
+- If the newest legacy `v0.*` tag is itself a held prerelease, it becomes the legacy scan
+  baseline and its own migrations are not scanned.
+- Path classification trusts release tags. The settings step applies a ruleset that protects
+  `v*` tags.
+- A runner killed without running its signal traps can leave an accepted install unrecorded.
+  Use `cd-control status` to see the running version and reconcile it.
 
-Before announcing the release, verify the GitHub Release, anonymous access to both image tags, and
-that `npm view @getpaseo/hub dist-tags` shows the new version as `latest`. Later changes to the
-current changelog section update the existing release notes through
-[Release Notes Sync](.github/workflows/release-notes-sync.yml).
+### GitHub settings checklist
+
+- [ ] Store deploy secrets only in the `production` environment, never at repository level.
+- [ ] In the `production` environment, set **Deployment branches and tags** to
+      **Selected branches and tags** and allow only the branch `main`. A workflow edited on another
+      branch must not be able to use the production secrets.
 
 ## Update public documentation
 
