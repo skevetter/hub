@@ -16,6 +16,8 @@ import {
   logFailureHeaders,
   parseShardSelection,
   redactDeep,
+  redactReport,
+  redactText,
   retryAnnotations,
   retryableFiles,
   runShardJob,
@@ -585,9 +587,55 @@ test("a short env value cannot rewrite file names or report keys", async (t) => 
   ]);
 });
 
+test("report redaction survives non-string messages and scrubs snapshot data", () => {
+  const scrubber = { values: ["s3cr3t-value"], roots: ["/repo"] };
+  const report = {
+    success: false,
+    snapshot: { uncheckedKeysByFile: [{ filePath: "/repo/a.test.ts", keys: ["k-s3cr3t-value"] }] },
+    testResults: [
+      {
+        name: "a.test.ts",
+        status: "failed",
+        message: "boom s3cr3t-value",
+        assertionResults: [
+          { status: "failed", failureMessages: [null, "at /repo/a.test.ts s3cr3t-value"] },
+        ],
+      },
+    ],
+  };
+  const saved = JSON.stringify(redactReport(report, scrubber));
+  assert.ok(!saved.includes("s3cr3t-value") && !saved.includes("/repo"));
+  assert.match(saved, /"failureMessages":\[null,"at \.\/a\.test\.ts \[redacted\]"\]/u);
+});
+
+test("env values are redacted before the root path and URL parts count as values", () => {
+  const values = sensitiveValues(
+    {
+      DATABASE_URL: ["postgres://", "app", ":", "pw%21123", "@db.internal.example:5432/x"].join(""),
+      SEED: "123456789",
+    },
+    "h",
+  );
+  for (const part of ["db.internal.example", "pw!123", "app", "123456789"]) {
+    assert.ok(values.includes(part), part);
+  }
+  const text = redactText("file:/repo/x?key=abc at /repo/y", {
+    values: ["file:/repo/x?key=abc"],
+    roots: ["/repo"],
+  });
+  assert.equal(text, "[redacted] at ./y");
+});
+
+test("a named project prefix on the FAIL line still names the file", () => {
+  const log = [" FAIL  |integration| a.test.ts > suite", "Error: Hook timed out in 5ms.", ""].join(
+    "\n",
+  );
+  assert.deepEqual(logFailureHeaders(log).get("a.test.ts"), ["Error: Hook timed out in 5ms."]);
+});
+
 test("redaction covers short values and object keys but not trivial values", () => {
   assert.deepEqual(sensitiveValues({ SHORT_SECRET: "abc", PATH: "/usr/bin:/bin" }, "h"), ["abc"]);
-  assert.deepEqual(sensitiveValues({ A_TOKEN: "ab", B_TOKEN: "true", C_TOKEN: "12345" }, "h"), []);
+  assert.deepEqual(sensitiveValues({ A_TOKEN: "ab", B_TOKEN: "true", C_TOKEN: "1234" }, "h"), []);
   const scrubber = { values: ["secret-value"] };
   assert.deepEqual(redactDeep({ "k-secret-value": ["x-secret-value"] }, scrubber), {
     "k-[redacted]": ["x-[redacted]"],

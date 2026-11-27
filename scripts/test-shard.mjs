@@ -1,4 +1,11 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join, relative } from "node:path";
@@ -8,7 +15,7 @@ export const RETRY_CAP = 5;
 export const DEFAULT_SHARD_TOTAL = 6;
 const MAX_SHARD_TOTAL = 100;
 const MIN_REDACTED_LENGTH = 3;
-const TRIVIAL_VALUE = /^(?:\d+|true|false|yes|no|on|off|null|undefined)$/iu;
+const TRIVIAL_VALUE = /^(?:\d{1,4}|true|false|yes|no|on|off|null|undefined)$/iu;
 const SHARD_PATTERN = /^([1-9]\d*)\/([1-9]\d*)$/u;
 const COUNT_PATTERN = /^[1-9]\d*$/u;
 const SENSITIVE_NAME =
@@ -131,7 +138,7 @@ export function coverageProblems(files, { groups, builtOnly, total }) {
 
 const ANSI_PATTERN = /\u001B\[[0-9;]*m/gu;
 const FAIL_LINE =
-  /^\s*FAIL\s+(?:\[[^\]]*\]\s+)?(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+(?:>|\[).*)?\s*$/u;
+  /^\s*FAIL\s+(?:(?:\[[^\]]*\]|\|[^|]*\|)\s*)?(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+(?:>|\[).*)?\s*$/u;
 const SEPARATOR_LINE = /^\s*\u23AF{3,}/u;
 const HINT_LINE = /^If this is a long-running (?:test|hook)/u;
 
@@ -244,11 +251,21 @@ function isSensitiveName(name) {
   return SENSITIVE_NAME.test(name) || HOST_NAMES.includes(name);
 }
 
+function urlParts(value) {
+  try {
+    const { hostname: name, username, password } = new URL(value);
+    return [name, decodeURIComponent(username), decodeURIComponent(password)];
+  } catch {
+    return [];
+  }
+}
+
 export function sensitiveValues(env = process.env, host = hostname()) {
   const named = Object.entries(env)
     .filter(([name]) => isSensitiveName(name))
     .map(([, value]) => value);
-  return [...new Set([...named, host])]
+  const parts = named.filter((value) => typeof value === "string").flatMap(urlParts);
+  return [...new Set([...named, ...parts, host])]
     .filter(
       (value) =>
         typeof value === "string" &&
@@ -258,10 +275,10 @@ export function sensitiveValues(env = process.env, host = hostname()) {
     .sort((a, b) => b.length - a.length);
 }
 
-/** Replaces env values with [redacted] and the repository root with a dot. */
-export function redactText(text, { values, root }) {
-  const local = root ? text.split(root).join(".") : text;
-  return values.reduce((result, value) => result.split(value).join("[redacted]"), local);
+/** Replaces env values with [redacted], then each repository root path with a dot. */
+export function redactText(text, { values, roots = [] }) {
+  const hidden = values.reduce((result, value) => result.split(value).join("[redacted]"), text);
+  return roots.reduce((result, root) => result.split(root).join("."), hidden);
 }
 
 export function redactDeep(value, scrubber) {
@@ -326,30 +343,24 @@ export function stepSummary({ title, line, report, root, retried }) {
   return `${lines.join("\n")}\n`;
 }
 
-function redactStrings(list, scrubber) {
-  return list.map((item) => redactText(item, scrubber));
+function redactEntry(entry, scrubber, keep) {
+  return Object.fromEntries(
+    Object.entries(entry).map(([key, value]) => [
+      key,
+      keep.includes(key) ? value : redactDeep(value, scrubber),
+    ]),
+  );
 }
 
-function redactAssertion(entry, scrubber) {
-  const copy = { ...entry };
-  for (const key of ["title", "fullName"]) {
-    if (typeof copy[key] === "string") copy[key] = redactText(copy[key], scrubber);
-  }
-  for (const key of ["ancestorTitles", "failureMessages"]) {
-    if (Array.isArray(copy[key])) copy[key] = redactStrings(copy[key], scrubber);
-  }
-  if (copy.meta) copy.meta = redactDeep(copy.meta, scrubber);
-  return copy;
-}
-
-/** Redacts the free-text fields only, so short env values cannot rewrite file names or keys. */
+/** Redacts every value except the structural ones, so short env values cannot rewrite names. */
 export function redactReport(report, scrubber) {
   const testResults = report.testResults.map((entry) => ({
-    ...entry,
-    ...(typeof entry.message === "string" && { message: redactText(entry.message, scrubber) }),
-    assertionResults: (entry.assertionResults ?? []).map((item) => redactAssertion(item, scrubber)),
+    ...redactEntry(entry, scrubber, ["name", "status"]),
+    assertionResults: (entry.assertionResults ?? []).map((item) =>
+      redactEntry(item, scrubber, ["status"]),
+    ),
   }));
-  return { ...report, testResults };
+  return { ...redactEntry(report, scrubber, ["testResults"]), testResults };
 }
 
 /** Report file names relative to the repository, so artifacts carry no runner paths. */
@@ -456,6 +467,14 @@ export function retryAnnotations(result) {
   }
   return lines;
 }
+function rootPaths(root) {
+  try {
+    return [...new Set([root, realpathSync(root)])];
+  } catch {
+    return [root];
+  }
+}
+
 function summaryRecord({ title, label, files, result, line }) {
   return {
     title,
@@ -498,7 +517,7 @@ export async function runShardJob(options) {
   for (const file of result.failedFiles) print(`  ${title}: ${plainLine(file)}`);
   for (const annotation of retryAnnotations(result)) print(annotation);
   const exitCode = result.tooManyRetries ? 1 : result.exitCode;
-  const scrubber = { values: sensitiveValues(options.env, options.host), root };
+  const scrubber = { values: sensitiveValues(options.env, options.host), roots: rootPaths(root) };
   if (reportDir) {
     const summary = summaryRecord({ title, label, files: files.length, result, line });
     const logs = result.logs.map((path, index) => [
