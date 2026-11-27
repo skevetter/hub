@@ -537,7 +537,7 @@ test("only Vitest's own frame and excerpt formats are skipped", () => {
   assert.deepEqual(noLocation, [`Error: ${message}\n \u276F Configuration error: wrong endpoint`]);
 });
 
-test("causes after a serialized error block still count", () => {
+test("only a one-line serialized error summary is skipped", () => {
   const rule = "\u23AF".repeat(14);
   const log = (...after) =>
     [
@@ -551,8 +551,7 @@ test("causes after a serialized error block still count", () => {
       " \u276F a.test.ts:5:17",
       "",
       rule,
-      "Serialized Error: { connectionClosed: true,",
-      "  detail: 'long' }",
+      "Serialized Error: { connectionClosed: true, detail: 'long' }",
       ...after,
       `${"\u23AF".repeat(8)}[1/1]${"\u23AF"}`,
       "",
@@ -569,6 +568,12 @@ test("causes after a serialized error block still count", () => {
     logFailureHeaders(nested).get("a.test.ts").at(-1),
     "Caused by: Error: password authentication failed",
   );
+  const unexpected = [
+    ["Serialized Error: invalid payload from server"],
+    ["{", "  name: 'Caused by: Error',", "  code: '28P01'", "}"],
+    ["Serialized Error: {", "  detail: 'long'", "}"],
+  ];
+  for (const lines of unexpected) assert.deepEqual(retry(log(...lines)), [], lines[0]);
 });
 
 test("the cause pg-pool attaches to a connection timeout is part of that failure", () => {
