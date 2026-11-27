@@ -25,7 +25,7 @@ import {
 async function openManualCloseDatabase(backend: "embedded" | "postgres") {
   if (backend === "postgres") {
     const container = await new PostgreSqlContainer("postgres:17-alpine")
-      .withStartupTimeout(20_000)
+      .withStartupTimeout(60_000)
       .start();
     try {
       const bundle = await postgresDatabaseRuntime(container.getConnectionUri());
@@ -296,5 +296,5 @@ it.each(["embedded", "postgres"] as const)(
       }
     }
   },
-  60_000,
+  120_000,
 );

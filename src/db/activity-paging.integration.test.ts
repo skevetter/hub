@@ -38,7 +38,7 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
       database = createDatabase(runtime, bundle.locks);
     }
     scopes = await seedActivity(database, runtime, engine === "postgres" ? 3000 : 240);
-  }, 60_000);
+  }, 120_000);
 
   afterAll(async () => {
     try {

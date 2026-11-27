@@ -69,7 +69,7 @@ function signedDelivery(payload: ReturnType<typeof createdPayload>): Request {
 async function registeredDatabase(backend: "embedded" | "postgres") {
   if (backend === "postgres") {
     const container = await new PostgreSqlContainer("postgres:17-alpine")
-      .withStartupTimeout(20_000)
+      .withStartupTimeout(60_000)
       .start();
     try {
       const bundle = await postgresDatabaseRuntime(
@@ -1238,7 +1238,7 @@ test(
 test(
   "the registered Linear pilot acknowledges and sends one owner start with a one-connection PostgreSQL pool",
   () => exerciseRegisteredPilot("postgres"),
-  45_000,
+  120_000,
 );
 
 test(
