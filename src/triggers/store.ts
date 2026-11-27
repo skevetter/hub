@@ -1,3 +1,4 @@
+import { OrganizationTriggerNotFoundError } from "../db/errors.js";
 import type {
   Database,
   OrganizationTriggerRecord,
@@ -58,7 +59,7 @@ export class OrganizationTriggerStore {
     trigger: OrganizationTriggerRecord,
   ): Promise<OrganizationTriggerRevisionRecord> {
     if (trigger.organizationId !== this.organizationId) {
-      throw new Error("organization trigger not found");
+      throw new OrganizationTriggerNotFoundError();
     }
     const revision = await this.database.findOrganizationTriggerRevision(
       trigger.id,

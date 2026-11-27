@@ -10,7 +10,11 @@ import {
   runStatusesFor,
 } from "../triggers/run-status.js";
 import { MemorySurfaceStore } from "../surfaces/memory-store.js";
-import { TriggerNameConflictError } from "./errors.js";
+import {
+  OrganizationTriggerNotFoundError,
+  ProjectSlugConflictError,
+  TriggerNameConflictError,
+} from "./errors.js";
 import {
   linearRoutesForConnection,
   linearTriggerRoutesLock,
@@ -5680,7 +5684,7 @@ class MemoryDatabase implements Database {
         (project) => project.organizationId === input.organizationId && project.slug === input.slug,
       )
     ) {
-      throw new Error("project slug already exists");
+      throw new ProjectSlugConflictError();
     }
     const now = new Date();
     const project: ProjectRecord = {
@@ -6375,7 +6379,7 @@ class MemoryDatabase implements Database {
     const existing =
       input.triggerId === undefined ? undefined : this.organizationTriggers.get(input.triggerId);
     if (existing !== undefined && existing.organizationId !== input.organizationId) {
-      throw new Error("organization trigger not found");
+      throw new OrganizationTriggerNotFoundError();
     }
     if (
       Array.from(this.organizationTriggers.values()).some(

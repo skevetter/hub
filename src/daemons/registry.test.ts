@@ -10,6 +10,7 @@ import { classifyFailure } from "../failures/index.js";
 import { HubDaemonHelloSchema } from "../hub/protocol.js";
 import { createLogger } from "../logger.js";
 import { assertOneFailure, FailureLogStream } from "../test-utils/failure-logs.js";
+import { DaemonDisconnectedError } from "./disconnected-error.js";
 import { DaemonResponseLostError } from "./protocol.js";
 import { ActiveDaemonRegistry, createDaemonUpgradeHandler } from "./registry.js";
 import { DaemonRegistryHarness } from "./test-utils/daemon-registry-harness.js";
@@ -366,6 +367,21 @@ describe("daemon socket deadlines", () => {
     assert.equal(isPending(snapshotId), false);
     assert.equal(isPending(refreshId), false);
     assert.equal(vi.getTimerCount(), 0);
+  });
+
+  it("fails a request that loses its daemon as an upstream failure, not an internal one", async () => {
+    const { connection, registry, daemon } = setupProviderRead();
+    const rejected = assert.rejects(
+      connection.getProviderSnapshot({}),
+      (error) =>
+        error instanceof DaemonDisconnectedError &&
+        error.message === "daemon disconnected" &&
+        classifyFailure(error) === "upstreamUnavailable",
+    );
+
+    registry.accept(daemon, unopenedSocket());
+
+    await rejected;
   });
 
   it.each(["disconnect", "stop"] as const)("clears the provider deadline on %s", async (event) => {
