@@ -52,6 +52,7 @@ interface ShutdownContext {
   stopRuntime: () => Promise<void>;
   options: ShutdownOptions;
   connections: Connections;
+  logger: ShutdownLogger;
 }
 
 interface Deadlines {
@@ -64,10 +65,11 @@ export function createServerShutdown(
   stopRuntime: () => Promise<void>,
   options: ShutdownOptions,
 ): () => Promise<boolean> {
+  const logger = options.logger ?? defaultLogger;
   const connections = trackConnections(server);
   let shutdown: Promise<boolean> | undefined;
   return () => {
-    shutdown ??= runShutdown({ server, stopRuntime, options, connections });
+    shutdown ??= runShutdown({ server, stopRuntime, options, connections, logger });
     return shutdown;
   };
 }
@@ -96,8 +98,7 @@ function trackConnections(server: Server): Connections {
 }
 
 async function runShutdown(context: ShutdownContext): Promise<boolean> {
-  const { server, stopRuntime, options, connections } = context;
-  const logger = options.logger ?? defaultLogger;
+  const { server, stopRuntime, options, connections, logger } = context;
   const started = performance.now();
   const pending = new Set<string>();
   const stage = createStage(logger, pending);
