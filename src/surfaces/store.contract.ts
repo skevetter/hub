@@ -620,38 +620,14 @@ export function surfaceStoreContract(
       // Exhaustively replay the 11 binary input dimensions in numeric order.
       for (let mask = 0; mask < 2_048; mask++) {
         const flag = (bit: number) => (mask & (1 << bit)) !== 0;
-        const key: BindingKey = {
-          organizationId: flag(0) ? right.organizationId : left.organizationId,
-          workspaceId: flag(1) ? right.connection.linearOrganizationId : binding.workspaceId,
-          applicationId: flag(2) ? "other-app" : binding.applicationId,
-          appUserId: flag(3) ? "other-actor" : binding.appUserId,
-          nativeSessionId: flag(4) ? "other-native" : binding.nativeSessionId,
-        };
-        const generation = flag(5) ? 1 : 2;
-        const exact = (mask & 31) === 0;
-        await assertGeneratedSurfaceReads(
-          database,
-          mask,
-          key,
-          generation,
-          exact ? [binding.sessionId, alternate.id] : [],
-          identity.providerUserId,
-          left.userId,
-          flag(7) ? installation(right) : undefined,
-        );
-        if (!exact || (mask & 1_792) !== 0) {
-          assert.equal(
-            await database.supersedeSurfaceBinding({
-              ...binding,
-              ...key,
-              expectedGeneration: flag(8) ? 2 : generation,
-              sessionId: flag(8) ? otherSession.id : alternate.id,
-              policyRevision: flag(9) ? 15 : 1,
-              teamId: flag(10) ? "out-of-scope" : binding.teamId,
-            }),
-            undefined,
-          );
-        }
+        await checkGeneratedSurfaceCase(database, mask, flag, {
+          left,
+          right,
+          binding,
+          alternate,
+          identity,
+          otherSession,
+        });
       }
       assert.equal((await database.findSurfaceBinding(binding))?.generation, 2);
       assert.equal(await database.findSurfaceBindingGeneration(binding, 3), undefined);
@@ -659,15 +635,103 @@ export function surfaceStoreContract(
   });
 }
 
-async function assertGeneratedSurfaceReads(
+interface GeneratedSurfaceCase {
+  left: SurfaceTenant;
+  right: SurfaceTenant;
+  binding: BindingInput;
+  alternate: { id: string };
+  identity: { providerUserId: string };
+  otherSession: { id: string };
+}
+
+async function checkGeneratedSurfaceCase(
   database: Database,
   mask: number,
-  key: BindingKey,
-  generation: number,
-  expectedSessions: string[],
-  providerUserId: string,
-  leftUserId: string,
-  disabledInstallation: LinearInstallation | undefined,
+  flag: (bit: number) => boolean,
+  { left, right, binding, alternate, identity, otherSession }: GeneratedSurfaceCase,
+) {
+  const key = generatedBindingKey(flag, { left, right, binding });
+  const generation = flag(5) ? 1 : 2;
+  const exact = (mask & 31) === 0;
+  await assertGeneratedSurfaceReads(database, {
+    mask,
+    key,
+    generation,
+    expectedSessions: exact ? [binding.sessionId, alternate.id] : [],
+    providerUserId: identity.providerUserId,
+    leftUserId: left.userId,
+    disabledInstallation: flag(7) ? installation(right) : undefined,
+  });
+  if (!exact || (mask & 1_792) !== 0) {
+    await assertGeneratedSurfaceWrite(database, flag, {
+      binding,
+      key,
+      generation,
+      alternate,
+      otherSession,
+    });
+  }
+}
+
+function generatedBindingKey(
+  flag: (bit: number) => boolean,
+  { left, right, binding }: Pick<GeneratedSurfaceCase, "left" | "right" | "binding">,
+): BindingKey {
+  return {
+    organizationId: flag(0) ? right.organizationId : left.organizationId,
+    workspaceId: flag(1) ? right.connection.linearOrganizationId : binding.workspaceId,
+    applicationId: flag(2) ? "other-app" : binding.applicationId,
+    appUserId: flag(3) ? "other-actor" : binding.appUserId,
+    nativeSessionId: flag(4) ? "other-native" : binding.nativeSessionId,
+  };
+}
+
+async function assertGeneratedSurfaceWrite(
+  database: Database,
+  flag: (bit: number) => boolean,
+  {
+    binding,
+    key,
+    generation,
+    alternate,
+    otherSession,
+  }: Pick<GeneratedSurfaceCase, "binding" | "alternate" | "otherSession"> & {
+    key: BindingKey;
+    generation: number;
+  },
+) {
+  assert.equal(
+    await database.supersedeSurfaceBinding({
+      ...binding,
+      ...key,
+      expectedGeneration: flag(8) ? 2 : generation,
+      sessionId: flag(8) ? otherSession.id : alternate.id,
+      policyRevision: flag(9) ? 15 : 1,
+      teamId: flag(10) ? "out-of-scope" : binding.teamId,
+    }),
+    undefined,
+  );
+}
+
+async function assertGeneratedSurfaceReads(
+  database: Database,
+  {
+    mask,
+    key,
+    generation,
+    expectedSessions,
+    providerUserId,
+    leftUserId,
+    disabledInstallation,
+  }: {
+    mask: number;
+    key: BindingKey;
+    generation: number;
+    expectedSessions: string[];
+    providerUserId: string;
+    leftUserId: string;
+    disabledInstallation: LinearInstallation | undefined;
+  },
 ) {
   assert.equal(
     (await database.findSurfaceBinding(key))?.sessionId,

@@ -5,7 +5,7 @@ import type {
   ProviderApplicationIdentity,
   ProviderApplicationVerifier,
 } from "../index.js";
-import { ProviderVerificationError } from "../index.js";
+import { ProviderVerificationError } from "./verification-error.js";
 
 const githubIdentitySchema = z.object({
   id: z.union([z.number(), z.string()]),

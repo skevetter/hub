@@ -218,7 +218,7 @@ export class RunTimelineRepository {
           [input.triggerRunId],
         )
       ).rowCount !== 0;
-    if (timelineBudgetExceeded(state, input.kind, 0, maxEvents, notice)) {
+    if (timelineBudgetExceeded({ state, kind: input.kind, bytes: 0, maxEvents, notice })) {
       await this.drop(transaction, input, state, notice);
       return { reason: "cap" };
     }
@@ -252,7 +252,9 @@ export class RunTimelineRepository {
     );
     const event = inserted.rows[0];
     if (event === undefined) return { seq: state.eventCount, inserted: false };
-    if (timelineBudgetExceeded(state, input.kind, event.bytes, maxEvents, notice)) {
+    if (
+      timelineBudgetExceeded({ state, kind: input.kind, bytes: event.bytes, maxEvents, notice })
+    ) {
       await transaction.query("rollback to savepoint timeline_append");
       await this.drop(transaction, input, state, notice);
       return { reason: "cap" };

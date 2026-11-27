@@ -59,55 +59,25 @@ export function createSlackSocketInstallationVerifier(
         });
         await connection.close(Math.max(10, Math.min(500, timeoutMs / 4)), "verified");
 
-        const auth = await slackJson(
-          fetch,
-          `${api}/auth.test`,
-          botToken,
-          AuthTestSchema,
+        const auth = await slackJson({
+          request: fetch,
+          url: `${api}/auth.test`,
+          token: botToken,
+          schema: AuthTestSchema,
           transaction,
-        );
+        });
         const scopes = parseScopes(auth.response.headers.get("x-oauth-scopes"));
-        if (!auth.value.ok) throw verificationError(auth.value.error, auth.response.status);
-        if (
-          auth.value.team_id === undefined ||
-          auth.value.team === undefined ||
-          auth.value.user_id === undefined ||
-          auth.value.bot_id === undefined
-        ) {
-          throw new ProviderVerificationError("invalidResponse", auth.response.status);
-        }
-        if (SLACK_REQUIRED_BOT_SCOPES.some((scope) => !scopes.includes(scope))) {
-          throw new ProviderVerificationError("permissionMissing", auth.response.status, {
-            subject: "botToken",
-          });
-        }
-        const info = await slackJson(
-          fetch,
-          `${api}/bots.info?${new URLSearchParams({ bot: auth.value.bot_id })}`,
-          botToken,
-          BotInfoSchema,
+        assertSlackAuth(auth.value, auth.response, scopes);
+
+        const info = await slackJson({
+          request: fetch,
+          url: `${api}/bots.info?${new URLSearchParams({ bot: auth.value.bot_id })}`,
+          token: botToken,
+          schema: BotInfoSchema,
           transaction,
-        );
-        if (!info.value.ok || info.value.bot === undefined) {
-          throw verificationError(info.value.error, info.response.status);
-        }
-        if (
-          info.value.bot.app_id !== connection.appId ||
-          info.value.bot.user_id !== auth.value.user_id ||
-          info.value.bot.id !== auth.value.bot_id
-        ) {
-          throw new ProviderVerificationError("credentialsRejected", undefined, {
-            subject: "identityMismatch",
-          });
-        }
-        return {
-          appId: connection.appId,
-          teamId: auth.value.team_id,
-          teamName: auth.value.team,
-          botUserId: auth.value.user_id,
-          botAccessToken: botToken,
-          scopes,
-        };
+        });
+        verifySlackBotIdentity(info.value, info.response, auth.value, connection);
+        return verifiedSlackInstallation(connection.appId, auth.value, botToken, scopes);
       } catch (error) {
         if (error instanceof ProviderVerificationError) throw error;
         if (transaction.signal.aborted) throw new ProviderVerificationError("timeout");
@@ -120,13 +90,78 @@ export function createSlackSocketInstallationVerifier(
   };
 }
 
+function verifiedSlackInstallation(
+  appId: string,
+  auth: SlackAuthIdentity,
+  botToken: string,
+  scopes: string[],
+): VerifiedSlackSocketInstallation {
+  return {
+    appId,
+    teamId: auth.team_id,
+    teamName: auth.team,
+    botUserId: auth.user_id,
+    botAccessToken: botToken,
+    scopes,
+  };
+}
+
+type SlackAuth = z.infer<typeof AuthTestSchema>;
+type SlackAuthIdentity = {
+  [Key in "team_id" | "team" | "user_id" | "bot_id"]: NonNullable<SlackAuth[Key]>;
+};
+
+function assertSlackAuth(
+  value: SlackAuth,
+  response: Response,
+  scopes: string[],
+): asserts value is SlackAuth & SlackAuthIdentity {
+  if (!value.ok) throw verificationError(value.error, response.status);
+  if (
+    value.team_id === undefined ||
+    value.team === undefined ||
+    value.user_id === undefined ||
+    value.bot_id === undefined
+  ) {
+    throw new ProviderVerificationError("invalidResponse", response.status);
+  }
+  if (SLACK_REQUIRED_BOT_SCOPES.some((scope) => !scopes.includes(scope))) {
+    throw new ProviderVerificationError("permissionMissing", response.status, {
+      subject: "botToken",
+    });
+  }
+}
+
+function verifySlackBotIdentity(
+  value: z.infer<typeof BotInfoSchema>,
+  response: Response,
+  auth: SlackAuthIdentity,
+  connection: { appId: string },
+): void {
+  if (!value.ok || value.bot === undefined) throw verificationError(value.error, response.status);
+  if (
+    value.bot.app_id !== connection.appId ||
+    value.bot.user_id !== auth.user_id ||
+    value.bot.id !== auth.bot_id
+  ) {
+    throw new ProviderVerificationError("credentialsRejected", undefined, {
+      subject: "identityMismatch",
+    });
+  }
+}
+
+interface SlackJsonOptions<T> {
+  request: typeof fetch;
+  url: string;
+  token: string;
+  schema: z.ZodType<T>;
+  transaction: AbortController;
+}
+
 async function slackJson<T>(
-  request: typeof fetch,
-  url: string,
-  token: string,
-  schema: z.ZodType<T>,
-  transaction: AbortController,
+  options: SlackJsonOptions<T>,
 ): Promise<{ value: T; response: Response }> {
+  const { request, url, token, schema, transaction } = options;
   let response: Response;
   try {
     response = await request(url, {

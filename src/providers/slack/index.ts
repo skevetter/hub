@@ -86,13 +86,47 @@ export function createSlackRegistration(
   options: CreateSlackRegistrationOptions,
 ): ProviderRegistration {
   const configuration = options.configuration ?? null;
-  if (configuration === null || options.publicBaseUrl === undefined) {
+  if (configuration === null || !hasSlackOrigin(options)) {
     return emptySlackRegistration(options);
   }
 
-  const connectionClient =
-    configuration.transport === "webhook"
-      ? (options.connectionClient ??
+  const connectionClient = slackConnectionClientFor(options, configuration);
+  const database = options.database;
+  const events = slackEventSource(options, configuration, database);
+  if (database === null) {
+    return {
+      connection: slackConnectionStatus(true),
+      triggerProviders: [],
+      sources: [events],
+      outputs: [],
+      requests:
+        events.request === undefined ? [] : [{ name: "slack.events", handle: events.request }],
+    };
+  }
+
+  return configuredSlackRegistration({
+    options,
+    configuration,
+    database,
+    events,
+    connectionClient,
+  });
+}
+
+type SlackRegistrationWithOrigin = CreateSlackRegistrationOptions & { publicBaseUrl: string };
+
+function hasSlackOrigin(
+  options: CreateSlackRegistrationOptions,
+): options is SlackRegistrationWithOrigin {
+  return options.publicBaseUrl !== undefined;
+}
+
+function slackConnectionClientFor(
+  options: SlackRegistrationWithOrigin,
+  configuration: SlackRegistrationConfiguration,
+): SlackConnectionClient | undefined {
+  return configuration.transport === "webhook"
+    ? (options.connectionClient ??
         createSlackConnectionClient({
           appId: configuration.appId,
           clientId: configuration.clientId,
@@ -100,8 +134,14 @@ export function createSlackRegistration(
           publicBaseUrl: options.publicBaseUrl,
           ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
         }))
-      : undefined;
-  const database = options.database;
+    : undefined;
+}
+
+function slackEventSource(
+  options: SlackRegistrationWithOrigin,
+  configuration: SlackRegistrationConfiguration,
+  database: Database | null,
+): ReturnType<typeof createSlackEventSource> {
   const accept =
     database === null
       ? () => Promise.reject(new DatabaseUnavailableError())
@@ -116,22 +156,21 @@ export function createSlackRegistration(
             providerApplicationId: configuration.appId,
             providerConfigurationVersion: options.configurationVersion ?? 0,
           });
-  const events = createSlackEventSource({
+  return createSlackEventSource({
     configuration: { provider: "slack", ...configuration },
     accept,
     ...slackSocketOptions(options),
   });
-  if (database === null) {
-    return {
-      connection: slackConnectionStatus(true),
-      triggerProviders: [],
-      sources: [events],
-      outputs: [],
-      requests:
-        events.request === undefined ? [] : [{ name: "slack.events", handle: events.request }],
-    };
-  }
+}
 
+function configuredSlackRegistration(input: {
+  options: SlackRegistrationWithOrigin;
+  configuration: SlackRegistrationConfiguration;
+  database: Database;
+  events: ReturnType<typeof createSlackEventSource>;
+  connectionClient: SlackConnectionClient | undefined;
+}): ProviderRegistration {
+  const { options, configuration, database, events, connectionClient } = input;
   const bot =
     options.botClient ??
     createSlackBotClient({
@@ -139,23 +178,7 @@ export function createSlackRegistration(
         (await findSlackBindingForOrganization(database, organizationId, teamId))?.botAccessToken,
       ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     });
-  const connection =
-    options.auth === null
-      ? slackConnectionStatus(true)
-      : createSlackConnection(
-          {
-            database,
-            auth: options.auth,
-            applicationBaseUrl: options.applicationBaseUrl,
-            callbackOrigin: options.publicBaseUrl,
-            configurationVersion: options.configurationVersion ?? 0,
-            configuration,
-            expectedConfigurationVersion: options.expectedConfigurationVersion,
-            activateConfiguration: options.activateConfiguration ?? false,
-            onVerifiedInstallation: options.onVerifiedInstallation,
-          },
-          connectionClient,
-        );
+  const connection = configuredSlackConnection(options, configuration, database, connectionClient);
 
   return {
     configurationSnapshot: {
@@ -168,7 +191,7 @@ export function createSlackRegistration(
         createSlackTriggerProvider({
           configurationStoreForProject,
           billingUrlForOrganization: (organizationId) =>
-            organizationBillingUrl(database, options.publicBaseUrl!, organizationId),
+            organizationBillingUrl(database, options.publicBaseUrl, organizationId),
           ...(attachments === undefined ? {} : { attachments }),
           botUserIdForWorkspace: async (organizationId, teamId) =>
             (await findSlackBindingForOrganization(database, organizationId, teamId))?.botUserId,
@@ -189,6 +212,30 @@ export function createSlackRegistration(
     attachment: { provider: "slack", resolve: createSlackAttachmentResolver(bot) },
     slackDelivery: { status: () => events.status(), retry: () => events.retry() },
   };
+}
+
+function configuredSlackConnection(
+  options: SlackRegistrationWithOrigin,
+  configuration: SlackRegistrationConfiguration,
+  database: Database,
+  connectionClient: SlackConnectionClient | undefined,
+): ProviderConnectionRegistration {
+  return options.auth === null
+    ? slackConnectionStatus(true)
+    : createSlackConnection(
+        {
+          database,
+          auth: options.auth,
+          applicationBaseUrl: options.applicationBaseUrl,
+          callbackOrigin: options.publicBaseUrl,
+          configurationVersion: options.configurationVersion ?? 0,
+          configuration,
+          expectedConfigurationVersion: options.expectedConfigurationVersion,
+          activateConfiguration: options.activateConfiguration ?? false,
+          onVerifiedInstallation: options.onVerifiedInstallation,
+        },
+        connectionClient,
+      );
 }
 
 function slackSocketOptions(
@@ -255,71 +302,79 @@ function createSlackConnection(
   options: SlackConnectionOptions,
   client: SlackConnectionClient | undefined,
 ): ProviderConnectionRegistration {
-  const start = async (request: Request): Promise<Response> => {
-    const rejected = options.auth.rejectCookieMutation(request);
-    if (rejected !== undefined) return rejected;
-    try {
-      const access = await manageConnectionAccess(options.auth, options.database, request);
-      if (client === undefined) {
-        return Response.json({ error: "provider_not_configured" }, { status: 409 });
-      }
-      const state = newConnectionState();
-      await options.database.startConnectionAttempt({
-        provider: "slack",
-        stateVerifier: stateHash(state),
-        access: connectionAccess(access),
-        lifetimeMinutes: CONNECTION_ATTEMPT_LIFETIME_MINUTES,
-        callbackOrigin: options.callbackOrigin,
-        configurationVersion: options.configurationVersion,
-        providerApplicationId: options.configuration.appId,
-        configurationSnapshot: { provider: "slack", ...options.configuration },
-        expectedConfigurationVersion: options.expectedConfigurationVersion ?? null,
-        activateConfiguration: options.activateConfiguration,
-      });
-      return Response.json({ url: client.authorizationUrl(state) });
-    } catch (error) {
-      return connectionActionFailure(error, "slack", "start");
-    }
-  };
-
-  const disconnect = async (request: Request): Promise<Response> => {
-    const rejected = options.auth.rejectCookieMutation(request);
-    if (rejected !== undefined) return rejected;
-    try {
-      const access = await manageConnectionAccess(options.auth, options.database, request);
-      const disconnected = await options.database.disconnectConnection(
-        "slack",
-        requiredConnectionId(request),
-        connectionAccess(access),
-      );
-      if (disconnected.provider === "slack" && disconnected.botAccessToken !== undefined) {
-        void client?.revoke(disconnected.botAccessToken).catch((error: unknown) => {
-          reportFailure(
-            error,
-            {
-              operation: "connection.disconnect.cleanup",
-              component: "connections",
-              provider: "slack",
-            },
-            { kind: "internal" },
-          );
-        });
-      }
-      return Response.json({ disconnected: true });
-    } catch (error) {
-      return connectionActionFailure(error, "slack", "disconnect");
-    }
-  };
-
   return {
     name: "slack",
     status: (connections) => slackStatus(client !== undefined, connections.slack),
     actions: {
-      start,
-      disconnect,
+      start: (request) => startSlackConnection(options, client, request),
+      disconnect: (request) => disconnectSlackConnection(options, client, request),
       callback: (request) => completeAuthorization(options, client, request),
     },
   };
+}
+
+async function startSlackConnection(
+  options: SlackConnectionOptions,
+  client: SlackConnectionClient | undefined,
+  request: Request,
+): Promise<Response> {
+  const rejected = options.auth.rejectCookieMutation(request);
+  if (rejected !== undefined) return rejected;
+  try {
+    const access = await manageConnectionAccess(options.auth, options.database, request);
+    if (client === undefined) {
+      return Response.json({ error: "provider_not_configured" }, { status: 409 });
+    }
+    const state = newConnectionState();
+    await options.database.startConnectionAttempt({
+      provider: "slack",
+      stateVerifier: stateHash(state),
+      access: connectionAccess(access),
+      lifetimeMinutes: CONNECTION_ATTEMPT_LIFETIME_MINUTES,
+      callbackOrigin: options.callbackOrigin,
+      configurationVersion: options.configurationVersion,
+      providerApplicationId: options.configuration.appId,
+      configurationSnapshot: { provider: "slack", ...options.configuration },
+      expectedConfigurationVersion: options.expectedConfigurationVersion ?? null,
+      activateConfiguration: options.activateConfiguration,
+    });
+    return Response.json({ url: client.authorizationUrl(state) });
+  } catch (error) {
+    return connectionActionFailure(error, "slack", "start");
+  }
+}
+
+async function disconnectSlackConnection(
+  options: SlackConnectionOptions,
+  client: SlackConnectionClient | undefined,
+  request: Request,
+): Promise<Response> {
+  const rejected = options.auth.rejectCookieMutation(request);
+  if (rejected !== undefined) return rejected;
+  try {
+    const access = await manageConnectionAccess(options.auth, options.database, request);
+    const disconnected = await options.database.disconnectConnection(
+      "slack",
+      requiredConnectionId(request),
+      connectionAccess(access),
+    );
+    if (disconnected.provider === "slack" && disconnected.botAccessToken !== undefined) {
+      void client?.revoke(disconnected.botAccessToken).catch((error: unknown) => {
+        reportFailure(
+          error,
+          {
+            operation: "connection.disconnect.cleanup",
+            component: "connections",
+            provider: "slack",
+          },
+          { kind: "internal" },
+        );
+      });
+    }
+    return Response.json({ disconnected: true });
+  } catch (error) {
+    return connectionActionFailure(error, "slack", "disconnect");
+  }
 }
 
 async function completeAuthorization(
@@ -366,44 +421,62 @@ async function completeAuthorization(
     await client.verifyInstallation(installation);
     if (!hasRequiredSlackScopes(installation.scopes)) throw new SlackBotVerificationError();
     const binding = slackBinding(state, access, installation);
-    if (attempt.activateConfiguration) {
-      if (options.onVerifiedInstallation === undefined) {
-        throw new Error("Slack installation handler unavailable");
-      }
-      await options.onVerifiedInstallation({
-        configuration: attempt.configurationSnapshot,
-        expectedConfigurationVersion: attempt.expectedConfigurationVersion ?? undefined,
-        callbackOrigin: attempt.callbackOrigin,
-        userId: attempt.userId,
-        installation,
-        binding,
-      });
-    } else {
-      await options.database.bindSlackConnection(binding);
-    }
+    await persistSlackInstallation({ options, attempt, installation, binding });
     return connectionResult(callbackOrigin, attempt.returnRoute, "slack_connected", "slack");
   } catch (error) {
-    if (error instanceof SlackBotVerificationError) {
-      reportFailure(
-        error,
-        {
-          operation: "connection.callback.bot_verification",
-          component: "connections",
-          provider: "slack",
-        },
-        { kind: "permissionMissing" },
-      );
-      return connectionResult(callbackOrigin, returnRoute, "slack_bot_failed", "slack");
+    return slackAuthorizationFailure(request, error, callbackOrigin, returnRoute);
+  }
+}
+
+function persistSlackInstallation(input: {
+  options: SlackConnectionOptions;
+  attempt: Awaited<ReturnType<Database["readConnectionAttempt"]>>;
+  installation: SlackInstallation;
+  binding: BindSlackConnectionInput;
+}): Promise<void> {
+  const { options, attempt, installation, binding } = input;
+  if (attempt.activateConfiguration) {
+    if (options.onVerifiedInstallation === undefined) {
+      throw new Error("Slack installation handler unavailable");
     }
-    return connectionCallbackFailure({
-      request,
-      error,
-      provider: "slack",
-      phase: "authorization",
-      applicationBaseUrl: callbackOrigin,
-      returnRoute,
+    return options.onVerifiedInstallation({
+      configuration: attempt.configurationSnapshot,
+      expectedConfigurationVersion: attempt.expectedConfigurationVersion ?? undefined,
+      callbackOrigin: attempt.callbackOrigin,
+      userId: attempt.userId,
+      installation,
+      binding,
     });
   }
+  return options.database.bindSlackConnection(binding);
+}
+
+function slackAuthorizationFailure(
+  request: Request,
+  error: unknown,
+  callbackOrigin: string,
+  returnRoute: string,
+): Response {
+  if (error instanceof SlackBotVerificationError) {
+    reportFailure(
+      error,
+      {
+        operation: "connection.callback.bot_verification",
+        component: "connections",
+        provider: "slack",
+      },
+      { kind: "permissionMissing" },
+    );
+    return connectionResult(callbackOrigin, returnRoute, "slack_bot_failed", "slack");
+  }
+  return connectionCallbackFailure({
+    request,
+    error,
+    provider: "slack",
+    phase: "authorization",
+    applicationBaseUrl: callbackOrigin,
+    returnRoute,
+  });
 }
 
 class SlackCallbackError extends Error {

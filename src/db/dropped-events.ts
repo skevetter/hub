@@ -78,9 +78,64 @@ export async function readDroppedEventPage(
     where ${droppedReceiptFilters(request, params)} and ${NO_RECEIPT_RUNS}`;
   const boundary = `($${params.length + 1}::timestamptz, $${params.length + 2}::uuid)`;
   const after = position?.direction === "after";
+  const result = await queryDroppedEventPage(
+    database,
+    { limit, position },
+    { params, scoped, boundary, after },
+  );
+  const hasMore = result.rows.length > limit;
+  const rows = result.rows.slice(0, limit);
+  if (after) rows.reverse();
+  const first = rows[0];
+  const last = rows.at(-1);
+  const keyOf = (row: NonNullable<typeof first>) => ({ createdAt: row.cursor_time, id: row.id });
+  const adjacent = async (row: NonNullable<typeof first>, comparison: "<" | ">") =>
+    (
+      await database.query(
+        `select 1 ${scoped} and (receipt.received_at, receipt.id) ${comparison} ${boundary}
+       order by receipt.received_at ${comparison === "<" ? "desc nulls first" : "asc nulls last"},
+                receipt.id ${comparison === "<" ? "desc nulls first" : "asc nulls last"} limit 1`,
+        [...params, row.cursor_time, row.id],
+      )
+    ).rows.length > 0;
+
+  return {
+    records: rows.map((row) => ({
+      id: row.id,
+      provider: droppedEventProvider(row),
+      source: row.source,
+      reason: displayedDropReason(row.reason),
+      triggerId: row.trigger_id,
+      workspaceOrRepo: row.workspace,
+      receivedAt: row.received_at.toISOString(),
+    })),
+    older: last !== undefined && (after ? await adjacent(last, "<") : hasMore) ? keyOf(last) : null,
+    newer:
+      first !== undefined &&
+      (after ? hasMore : position !== undefined && (await adjacent(first, ">")))
+        ? keyOf(first)
+        : null,
+  };
+}
+
+function queryDroppedEventPage(
+  database: QueryHandle,
+  { limit, position }: { limit: number; position: DroppedEventPageRequest["position"] },
+  {
+    params,
+    scoped,
+    boundary,
+    after,
+  }: {
+    params: readonly unknown[];
+    scoped: string;
+    boundary: string;
+    after: boolean;
+  },
+) {
   // Both keys are non-null. Preserve the exact order with the dropped-receipt indexes.
   const order = after ? "asc nulls last" : "desc nulls first";
-  const result = await database.query<{
+  return database.query<{
     id: string;
     provider: Provider;
     source: string;
@@ -121,39 +176,6 @@ export async function readDroppedEventPage(
       ? [...params, limit + 1]
       : [...params, position.key.createdAt, position.key.id, limit + 1],
   );
-  const hasMore = result.rows.length > limit;
-  const rows = result.rows.slice(0, limit);
-  if (after) rows.reverse();
-  const first = rows[0];
-  const last = rows.at(-1);
-  const keyOf = (row: NonNullable<typeof first>) => ({ createdAt: row.cursor_time, id: row.id });
-  const adjacent = async (row: NonNullable<typeof first>, comparison: "<" | ">") =>
-    (
-      await database.query(
-        `select 1 ${scoped} and (receipt.received_at, receipt.id) ${comparison} ${boundary}
-       order by receipt.received_at ${comparison === "<" ? "desc nulls first" : "asc nulls last"},
-                receipt.id ${comparison === "<" ? "desc nulls first" : "asc nulls last"} limit 1`,
-        [...params, row.cursor_time, row.id],
-      )
-    ).rows.length > 0;
-
-  return {
-    records: rows.map((row) => ({
-      id: row.id,
-      provider: droppedEventProvider(row),
-      source: row.source,
-      reason: displayedDropReason(row.reason),
-      triggerId: row.trigger_id,
-      workspaceOrRepo: row.workspace,
-      receivedAt: row.received_at.toISOString(),
-    })),
-    older: last !== undefined && (after ? await adjacent(last, "<") : hasMore) ? keyOf(last) : null,
-    newer:
-      first !== undefined &&
-      (after ? hasMore : position !== undefined && (await adjacent(first, ">")))
-        ? keyOf(first)
-        : null,
-  };
 }
 
 export async function readDroppedEventPresence(

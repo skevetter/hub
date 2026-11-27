@@ -262,6 +262,28 @@ describe("script steps in the durable workflow engine", () => {
     });
   });
 
+  it.each([
+    ["empty", ""],
+    ["long", "a".repeat(128 * 1024)],
+    ["token-like URL", "request failed at https://example.test/?token=synthetic-test-token"],
+    ["multiline", "first line\nsecond line\r\nthird line"],
+    ["unicode", "caf\u00e9 \u{1f680} e\u0301"],
+  ] as const)("records the original string rejection (%s)", async (_label, reason) => {
+    const context = await fixture();
+    const daemon = new FakeTerminalDaemon();
+    const clock = new FakeClock();
+    clock.sleep = async () => Promise.reject(reason);
+    const { handler, engine } = engineFor(context, { scriptRunner: runnerFor(daemon, clock) });
+    await handler(context.trigger);
+
+    const run = await untilSettled(context, engine);
+    const step = await onlyStep(context);
+    assert.equal(run.status, "failed");
+    assert.equal(step.status, "failed");
+    assert.equal(run.outcome === "accepted" && run.failureReason, `script failed: ${reason}`);
+    assert.equal(step.failureReason, `script failed: ${reason}`);
+  });
+
   it("records the terminal id as soon as it exists", async () => {
     const context = await fixture();
     const daemon = new FakeTerminalDaemon();

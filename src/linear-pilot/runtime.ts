@@ -623,7 +623,12 @@ function clientFor(state: RuntimeState, grant: Active, activity = grant.activity
       );
       return (
         found !== undefined &&
-        (await authorizeBoundPilotTurn(bindings.find, grant, found.session, grant.commandId))
+        (await authorizeBoundPilotTurn({
+          findBinding: bindings.find,
+          grant,
+          session: found.session,
+          commandId: grant.commandId,
+        }))
       );
     },
     authorizeRefresh: async (query, _binding, operation) =>
@@ -697,9 +702,15 @@ async function boundLiveSession(
     bindingGeneration: binding.generation,
     profileVersion: session.profileVersion,
   };
-  if (!(await authorizeBoundPilotTurn(bindings.find, grant, session, first.id, binding.generation)))
-    return undefined;
-  return { binding, session, grant };
+  return (await authorizeBoundPilotTurn({
+    findBinding: bindings.find,
+    grant,
+    session,
+    commandId: first.id,
+    expectedBindingGeneration: binding.generation,
+  }))
+    ? { binding, session, grant }
+    : undefined;
 }
 
 async function dispatchFollowUp(state: RuntimeState, delivery: RuntimeDelivery) {
@@ -912,13 +923,13 @@ function configureSessionHooks(state: RuntimeState): LinearPilotSessionHooks {
     authorizeStart: (...args) => authorizePilotStart(state, ...args),
     authorize(session, commandId, expectedBindingGeneration?: number) {
       return state.accepting
-        ? authorizeBoundPilotTurn(
-            bindings.find,
-            active.get(session.id),
+        ? authorizeBoundPilotTurn({
+            findBinding: bindings.find,
+            grant: active.get(session.id),
             session,
             commandId,
             expectedBindingGeneration,
-          )
+          })
         : Promise.resolve(false);
     },
     async onTerminal(terminal) {

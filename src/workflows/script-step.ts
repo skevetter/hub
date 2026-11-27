@@ -11,6 +11,7 @@ import { durableExecutionId } from "../daemons/lifecycle.js";
 import {
   ScriptRunAborted,
   type ScriptCleanupTarget,
+  type ScriptRunInput,
   type ScriptStepRunner,
 } from "../daemons/terminals/script.js";
 import { asTriggerContextValue, type TriggerProvider } from "../triggers/index.js";
@@ -76,6 +77,16 @@ interface ActiveScript {
   triggerKey: string;
 }
 
+type ScriptWakeupDatabase = Omit<Database, "releaseWorkflowWakeup"> & {
+  // The release forwards the stored lease even when it is null.
+  releaseWorkflowWakeup(
+    triggerRunId: string,
+    now: Date,
+    claimedLease: WorkflowWakeupRecord["leaseExpiresAt"],
+    retryAt?: Date,
+  ): Promise<void>;
+};
+
 /**
  * Runs script steps for the durable workflow engine. A script outlives the wakeup that starts it,
  * so each one is watched by a task of its own while the engine goes on with other runs. The step
@@ -124,14 +135,14 @@ export class ScriptStepRuntime {
     launch: ScriptStepLaunch,
     wakeup: WorkflowWakeupRecord,
   ): Promise<"deferred" | undefined> {
-    const { database } = this.options;
+    const database: ScriptWakeupDatabase = this.options.database;
     const { run, step, stepRun } = launch;
     if (this.options.runner === undefined) {
       await this.options.failRun(run.id, SCRIPT_RUNNER_UNAVAILABLE_REASON, step.id);
       return undefined;
     }
     if (this.options.canDispatchToDaemon?.(launch.daemonId) === false) {
-      await database.releaseWorkflowWakeup(run.id, this.options.now(), wakeup.leaseExpiresAt!);
+      await database.releaseWorkflowWakeup(run.id, this.options.now(), wakeup.leaseExpiresAt);
       return "deferred";
     }
     if (this.atCapacity(launch)) {
@@ -140,7 +151,7 @@ export class ScriptStepRuntime {
       await database.releaseWorkflowWakeup(
         run.id,
         now,
-        wakeup.leaseExpiresAt!,
+        wakeup.leaseExpiresAt,
         new Date(now.getTime() + CAP_RETRY_MS),
       );
       return "deferred";
@@ -162,6 +173,17 @@ export class ScriptStepRuntime {
       await database.deleteWorkflowWakeup(run.id);
       return undefined;
     }
+    this.recordTimelineStart(run, started);
+    if (!launch.runAlreadyStarted) await this.options.notifyStarted(run.id);
+    this.trackScript(launch, run, eventJson, timeoutMs);
+    await database.deleteWorkflowWakeup(run.id);
+    return undefined;
+  }
+
+  private recordTimelineStart(
+    run: AcceptedTriggerRunRecord,
+    started: { stepRun: WorkflowStepRunRecord },
+  ): void {
     try {
       this.options.timeline?.recordStepStart(
         {
@@ -173,7 +195,14 @@ export class ScriptStepRuntime {
     } catch (error) {
       this.options.report(error, "run.timeline.capture", { triggerRunId: run.id });
     }
-    if (!launch.runAlreadyStarted) await this.options.notifyStarted(run.id);
+  }
+
+  private trackScript(
+    launch: ScriptStepLaunch,
+    run: AcceptedTriggerRunRecord,
+    eventJson: string,
+    timeoutMs: number,
+  ): void {
     const controller = new AbortController();
     const done = this.watch(launch, eventJson, Math.max(timeoutMs, 0), controller.signal)
       .catch((error: unknown) =>
@@ -186,8 +215,6 @@ export class ScriptStepRuntime {
       daemonId: launch.daemonId,
       triggerKey: triggerKey(run),
     });
-    await database.deleteWorkflowWakeup(run.id);
-    return undefined;
   }
 
   private atCapacity(launch: ScriptStepLaunch): boolean {
@@ -210,14 +237,14 @@ export class ScriptStepRuntime {
     launch: ScriptStepLaunch,
     wakeup: WorkflowWakeupRecord,
   ): Promise<"deferred" | undefined> {
-    const { database } = this.options;
+    const database: ScriptWakeupDatabase = this.options.database;
     const { run, step, stepRun } = launch;
     if (this.isActive(run.id)) {
       await database.deleteWorkflowWakeup(run.id);
       return undefined;
     }
     if (this.options.canDispatchToDaemon?.(launch.daemonId) === false) {
-      await database.releaseWorkflowWakeup(run.id, this.options.now(), wakeup.leaseExpiresAt!);
+      await database.releaseWorkflowWakeup(run.id, this.options.now(), wakeup.leaseExpiresAt);
       return "deferred";
     }
     let reason = SCRIPT_INTERRUPTED_REASON;
@@ -371,41 +398,21 @@ export class ScriptStepRuntime {
     if (current?.status !== "running" || signal.aborted) return;
     let result;
     try {
-      result = await this.options.runner!.run(daemonId, {
+      const runner = this.options.runner;
+      if (runner === undefined)
+        throw new TypeError("Cannot read properties of undefined (reading 'run')");
+      result = await runner.run(daemonId, {
         cwd: launch.cwd,
         script: step.script,
         eventJson,
         name: scriptTerminalName(stepRun.id),
         timeoutMs,
         signal,
-        onTerminal: async ({ id, workspaceId }) => {
-          await this.persist(() =>
-            this.options.database.updateWorkflowScriptStep(stepRun.id, {
-              status: "running",
-              output: {
-                daemon_id: daemonId,
-                cwd: launch.cwd,
-                terminal_id: id,
-                ...(workspaceId === undefined ? {} : { workspace_id: workspaceId }),
-              },
-              at: this.options.now(),
-            }),
-          );
-        },
+        onTerminal: this.terminalRecorder(launch, daemonId, stepRun),
       });
     } catch (error) {
       if (error instanceof ScriptRunAborted) {
-        const ended = await this.options.database.findWorkflowStepRunById(stepRun.id);
-        if (ended?.status === "canceled" && error.cleanup !== undefined) {
-          const cleanup = error.cleanup;
-          await this.persist(() =>
-            this.options.database.setWorkflowScriptStepOutput(stepRun.id, {
-              ...EMPTY_RESULT,
-              ...(cleanup === null ? {} : { cleanup: cleanupRecord(daemonId, cleanup) }),
-            }),
-          );
-        }
-        return;
+        return this.recordAbortedScriptCleanup(stepRun, daemonId, error);
       }
       this.options.report(error, "workflow.script.run", {
         triggerRunId: run.id,
@@ -433,6 +440,45 @@ export class ScriptStepRuntime {
     }).catch((finishError: unknown) =>
       this.options.report(finishError, "workflow.script.finish", { triggerRunId: run.id }),
     );
+  }
+
+  private terminalRecorder(
+    launch: ScriptStepLaunch,
+    daemonId: string,
+    stepRun: WorkflowStepRunRecord,
+  ): NonNullable<ScriptRunInput["onTerminal"]> {
+    const onTerminal: NonNullable<ScriptRunInput["onTerminal"]> = async ({ id, workspaceId }) => {
+      await this.persist(() =>
+        this.options.database.updateWorkflowScriptStep(stepRun.id, {
+          status: "running",
+          output: {
+            daemon_id: daemonId,
+            cwd: launch.cwd,
+            terminal_id: id,
+            ...(workspaceId === undefined ? {} : { workspace_id: workspaceId }),
+          },
+          at: this.options.now(),
+        }),
+      );
+    };
+    return onTerminal;
+  }
+
+  private async recordAbortedScriptCleanup(
+    stepRun: WorkflowStepRunRecord,
+    daemonId: string,
+    error: ScriptRunAborted,
+  ): Promise<void> {
+    const ended = await this.options.database.findWorkflowStepRunById(stepRun.id);
+    if (ended?.status === "canceled" && error.cleanup !== undefined) {
+      const cleanup = error.cleanup;
+      await this.persist(() =>
+        this.options.database.setWorkflowScriptStepOutput(stepRun.id, {
+          ...EMPTY_RESULT,
+          ...(cleanup === null ? {} : { cleanup: cleanupRecord(daemonId, cleanup) }),
+        }),
+      );
+    }
   }
 
   /** A transient database error must not turn a script that ran into one that failed. */
@@ -496,8 +542,7 @@ export class ScriptStepRuntime {
     const { run, stepRun } = launch;
     const triggerContext: unknown = run.triggerContext;
     const providerName =
-      typeof triggerContext === "object" &&
-      triggerContext !== null &&
+      isObject(triggerContext) &&
       "provider" in triggerContext &&
       typeof triggerContext.provider === "string"
         ? triggerContext.provider
@@ -520,16 +565,15 @@ export class ScriptStepRuntime {
       );
     }
     // A manual run has no provider-side history to fetch; its own input is the event.
-    if (
-      providerName === "manual" &&
-      typeof triggerContext === "object" &&
-      triggerContext !== null &&
-      "event" in triggerContext
-    ) {
+    if (providerName === "manual" && isObject(triggerContext) && "event" in triggerContext) {
       return asTriggerContextValue(triggerContext.event);
     }
     throw new Error("trigger_context_materializer_unavailable");
   }
+}
+
+function isObject(value: unknown): value is object {
+  return typeof value === "object" && value !== null;
 }
 
 function triggerKey(run: AcceptedTriggerRunRecord): string {

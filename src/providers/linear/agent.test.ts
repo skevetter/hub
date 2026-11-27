@@ -857,6 +857,17 @@ function generatedActivityId(index: number) {
   return `b8bcd579-cad0-454e-9d1f-${index.toString(16).padStart(12, "0")}`;
 }
 
+function admissionError(
+  policy: boolean | undefined,
+  bindingMatches: boolean,
+  scopesMatch: boolean,
+) {
+  if (policy !== true) return "policy_required";
+  if (!bindingMatches) return "connection_not_owned";
+  if (!scopesMatch) return "scope_missing";
+  return undefined;
+}
+
 function* generatedAdmissionCases(
   connection: ReturnType<typeof linearAgentFixture>["a"],
   other: ReturnType<typeof linearAgentFixture>["b"],
@@ -877,14 +888,45 @@ function* generatedAdmissionCases(
   for (const binding of bindings) {
     for (const policy of [true, false, undefined]) {
       for (const scopes of scopeSets) {
-        let code: string | undefined;
-        if (policy !== true) code = "policy_required";
-        else if (binding !== exact) code = "connection_not_owned";
-        else if (scopes !== connection.scopes) code = "scope_missing";
+        const code = admissionError(policy, binding === exact, scopes === connection.scopes);
         yield { binding, policy, scopes, code };
       }
     }
   }
+}
+
+async function checkGeneratedAdmission({
+  api,
+  fixture,
+  shape,
+  index,
+  code,
+  caseCount,
+}: {
+  api: ReturnType<typeof createLinearAgentClient>;
+  fixture: ReturnType<typeof linearAgentFixture>;
+  shape: (typeof generatedActivityShapes)[number] | (typeof rejectedActivityShapes)[number];
+  index: number;
+  code: string | undefined;
+  caseCount: number;
+}) {
+  const generatedId = generatedActivityId(caseCount);
+  const before = fixture.calls.length;
+  const beforeLookups = fixture.lookups.length;
+  const expectedError = index < generatedActivityShapes.length ? code : "invalid_input";
+  const attempt = api.createActivity({ sessionId, activityId: generatedId, ...shape });
+  const label = `generated admission case ${caseCount}`;
+  if (expectedError !== undefined) {
+    await assert.rejects(attempt, { code: expectedError }, label);
+    assert.equal(fixture.calls.length, before, label);
+  } else {
+    assert.equal(await attempt, generatedId, label);
+    assert.equal(fixture.calls.length - before, 2, label);
+  }
+  if (expectedError === "policy_required" || expectedError === "invalid_input") {
+    assert.equal(fixture.lookups.length, beforeLookups, label);
+  }
+  return expectedError === undefined ? 0 : 1;
 }
 
 it("rejects generated unauthorized or malformed activity inputs before transport", async () => {
@@ -917,23 +959,14 @@ it("rejects generated unauthorized or malformed activity inputs before transport
         ...generatedActivityShapes,
         ...rejectedActivityShapes,
       ].entries()) {
-        const generatedId = generatedActivityId(++caseCount);
-        const before = fixture.calls.length;
-        const beforeLookups = fixture.lookups.length;
-        const expectedError = index < generatedActivityShapes.length ? code : "invalid_input";
-        const attempt = api.createActivity({ sessionId, activityId: generatedId, ...shape });
-        const label = `generated admission case ${caseCount}`;
-        if (expectedError !== undefined) {
-          await assert.rejects(attempt, { code: expectedError }, label);
-          assert.equal(fixture.calls.length, before, label);
-          rejectedCount += 1;
-        } else {
-          assert.equal(await attempt, generatedId, label);
-          assert.equal(fixture.calls.length - before, 2, label);
-        }
-        if (expectedError === "policy_required" || expectedError === "invalid_input") {
-          assert.equal(fixture.lookups.length, beforeLookups, label);
-        }
+        rejectedCount += await checkGeneratedAdmission({
+          api,
+          fixture,
+          shape,
+          index,
+          code,
+          caseCount: ++caseCount,
+        });
       }
     }
     assert.equal(fixture.refreshTokens.length, 0);
@@ -1000,12 +1033,16 @@ function generatedReadbackPayload(
   };
 }
 
+function* reconciliationVariants() {
+  for (const scenario of generatedReadbackCases) {
+    for (let variant = 0; variant < 5; variant += 1) yield scenario;
+  }
+}
+
 function* generatedReconciliationCases() {
   for (const workspace of ["a", "b"] as const) {
     for (const shape of generatedActivityShapes) {
-      for (const scenario of generatedReadbackCases) {
-        for (let variant = 0; variant < 5; variant += 1) yield { workspace, shape, scenario };
-      }
+      for (const scenario of reconciliationVariants()) yield { workspace, shape, scenario };
     }
   }
 }

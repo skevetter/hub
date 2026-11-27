@@ -120,6 +120,34 @@ function prng(seed: number) {
   };
 }
 
+function corruptAdmitInput(
+  input: PilotAdmitInput,
+  index: number,
+  random: () => number,
+  { bad, uuidBad }: { bad: string[]; uuidBad: string[] },
+) {
+  const pick = <T>(values: readonly T[]) => values[Math.floor(random() * values.length)]!;
+  // Oracle: what the packet says must reach the database, written independently of the code.
+  const corrupt = random() < 0.7;
+  if (!corrupt) return true;
+  const field = pick([
+    "nativeSessionId",
+    "issueId",
+    "teamId",
+    "actorProviderUserId",
+    "sessionId",
+    "actorSwap",
+    "teamOut",
+    "now",
+  ] as const);
+  if (field === "sessionId") input.sessionId = pick(uuidBad);
+  else if (field === "actorSwap") input.actorProviderUserId = "other-" + index;
+  else if (field === "teamOut") input.teamId = "team-z";
+  else if (field === "now") input.now = new Date(Number.NaN);
+  else input[field] = pick(bad);
+  return false;
+}
+
 const SEED = 20261121;
 
 describe("pilot binding validation", () => {
@@ -137,7 +165,6 @@ describe("pilot binding validation", () => {
 
   it("admits or refuses 2,000 generated inputs with no database access for refusals", async () => {
     const random = prng(SEED);
-    const pick = <T>(values: readonly T[]) => values[Math.floor(random() * values.length)]!;
     const bad = ["", "a\0b", "x".repeat(256), "\u00e9".repeat(128)];
     const uuidBad = ["", "not-a-uuid", randomUUID() + "0", randomUUID().replaceAll("-", "")];
     let valid = 0;
@@ -145,27 +172,7 @@ describe("pilot binding validation", () => {
     for (let index = 0; index < 2_000; index++) {
       const base = authority();
       const input: PilotAdmitInput = { ...origin(), sessionId: randomUUID(), now: new Date(0) };
-      // Oracle: what the packet says must reach the database, written independently of the code.
-      let expectValid = true;
-      const corrupt = random() < 0.7;
-      if (corrupt) {
-        const field = pick([
-          "nativeSessionId",
-          "issueId",
-          "teamId",
-          "actorProviderUserId",
-          "sessionId",
-          "actorSwap",
-          "teamOut",
-          "now",
-        ] as const);
-        if (field === "sessionId") input.sessionId = pick(uuidBad);
-        else if (field === "actorSwap") input.actorProviderUserId = "other-" + index;
-        else if (field === "teamOut") input.teamId = "team-z";
-        else if (field === "now") input.now = new Date(Number.NaN);
-        else input[field] = pick(bad);
-        expectValid = false;
-      }
+      const expectValid = corruptAdmitInput(input, index, random, { bad, uuidBad });
       const { calls, pilot } = recordingBackend();
       let result: PilotAdmitResult | undefined;
       let thrown: unknown;

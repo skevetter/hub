@@ -53,6 +53,74 @@ interface GraphqlCall {
   redirect: RequestRedirect | undefined;
 }
 
+interface GraphqlFixtureOptions {
+  calls: GraphqlCall[];
+  connections: Map<string, LinearConnectionRecord>;
+  respond: (operation: string, call: GraphqlCall) => unknown;
+  readViewer: () => ReturnType<typeof appViewer> | undefined;
+}
+
+function fixtureGraphqlFetch({
+  calls,
+  connections,
+  respond,
+  readViewer,
+}: GraphqlFixtureOptions): typeof fetch {
+  return async (url, init) => {
+    assert.equal(url, "https://api.linear.app/graphql");
+    assert.equal(init?.method, "POST");
+    assert.ok(typeof init?.body === "string");
+    const payload = z
+      .object({
+        query: z.string(),
+        variables: z.record(z.string(), z.unknown()),
+      })
+      .parse(JSON.parse(init.body));
+    const call = {
+      ...payload,
+      bearer: new Headers(init?.headers).get("authorization"),
+      redirect: init?.redirect,
+    };
+    calls.push(call);
+    const operation = /^(?:query|mutation) (\w+)/u.exec(call.query)?.[1];
+    assert.ok(operation);
+    if (operation === "PaseoAgentViewer") {
+      const override = readViewer();
+      const connection = [...connections.values()].find(
+        ({ accessToken }) => call.bearer === `Bearer ${accessToken}`,
+      );
+      assert.ok(connection);
+      return Response.json({ data: { viewer: override ?? appViewer(connection) } });
+    }
+    return Response.json(respond(operation, call));
+  };
+}
+
+function fixtureConnectionClient(
+  hubBaseUrl: string,
+  refreshTokens: string[],
+  readScopes: () => string[],
+) {
+  return createLinearConnectionClient({
+    clientId: "fake-shared-app",
+    clientSecret: "fake-app-secret",
+    publicBaseUrl: hubBaseUrl,
+    fetch: async (url, init) => {
+      assert.equal(url, "https://api.linear.app/oauth/token");
+      assert.ok(init?.body instanceof URLSearchParams);
+      const token = init.body.get("refresh_token");
+      assert.ok(token);
+      refreshTokens.push(token);
+      return Response.json({
+        access_token: "fake-rotated-access",
+        refresh_token: "fake-rotated-refresh",
+        expires_in: 3600,
+        scope: readScopes().join(","),
+      });
+    },
+  });
+}
+
 export function linearAgentFixture(
   respond: (operation: string, call: GraphqlCall) => unknown = () => {
     throw new Error("Unexpected GraphQL operation");
@@ -85,55 +153,15 @@ export function linearAgentFixture(
         }),
       );
     } satisfies Database["withLinearConnectionRefresh"],
-    fetch: async (url, init) => {
-      assert.equal(url, "https://api.linear.app/graphql");
-      assert.equal(init?.method, "POST");
-      assert.ok(typeof init?.body === "string");
-      const payload = z
-        .object({
-          query: z.string(),
-          variables: z.record(z.string(), z.unknown()),
-        })
-        .parse(JSON.parse(init.body));
-      const call = {
-        ...payload,
-        bearer: new Headers(init?.headers).get("authorization"),
-        redirect: init?.redirect,
-      };
-      calls.push(call);
-      const operation = /^(?:query|mutation) (\w+)/u.exec(call.query)?.[1];
-      assert.ok(operation);
-      if (operation === "PaseoAgentViewer") {
-        const override = viewerOverride;
-        const connection = [...connections.values()].find(
-          ({ accessToken }) => call.bearer === `Bearer ${accessToken}`,
-        );
-        assert.ok(connection);
-        return Response.json({ data: { viewer: override ?? appViewer(connection) } });
-      }
-      return Response.json(respond(operation, call));
-    },
+    fetch: fixtureGraphqlFetch({ calls, connections, respond, readViewer: () => viewerOverride }),
   } satisfies { fetch: typeof fetch; [key: string]: unknown };
   let viewerOverride: ReturnType<typeof appViewer> | undefined;
   let refreshScopes = pilotScopes;
-  const connectionClient = createLinearConnectionClient({
-    clientId: "fake-shared-app",
-    clientSecret: "fake-app-secret",
-    publicBaseUrl: options.hubBaseUrl,
-    fetch: async (url, init) => {
-      assert.equal(url, "https://api.linear.app/oauth/token");
-      assert.ok(init?.body instanceof URLSearchParams);
-      const token = init.body.get("refresh_token");
-      assert.ok(token);
-      refreshTokens.push(token);
-      return Response.json({
-        access_token: "fake-rotated-access",
-        refresh_token: "fake-rotated-refresh",
-        expires_in: 3600,
-        scope: refreshScopes.join(","),
-      });
-    },
-  });
+  const connectionClient = fixtureConnectionClient(
+    options.hubBaseUrl,
+    refreshTokens,
+    () => refreshScopes,
+  );
   return {
     a,
     b,

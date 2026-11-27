@@ -119,16 +119,8 @@ export async function expireGitHubSyncPayload(
         disposition: remaining.rowCount ? "locked" : "changed_or_missing",
       };
     }
-    const sync = (
-      await client.query<SyncRow>(
-        `select ${SYNC_COLUMNS},
-           case when sync.audit_link->>'kind' = 'none' then ${SYNC_HAS_COPY} else false end as "hasAnyCopy"
-         from github_installation_syncs sync where id = $1`,
-        [id],
-      )
-    ).rows[0]!;
-    const link = readSyncAuditLink(sync.auditLink);
-    const receiptId = link?.kind === "receipt" ? link.receiptId : undefined;
+    const { rows } = await readSyncForPayloadExpiry(client, id);
+    const { sync, receiptId } = syncExpiryEvidence(rows[0]);
     let copy: CopyRow | undefined;
     if (receiptId !== undefined) {
       const receiptLock = await client.query(
@@ -160,6 +152,22 @@ export async function expireGitHubSyncPayload(
     if (result.rowCount !== 1) throw new Error("sync expiry lost its locked sync");
     return { status: "expired", receiptCopy: copy !== undefined };
   });
+}
+
+function readSyncForPayloadExpiry(client: QueryHandle, id: string) {
+  return client.query<SyncRow>(
+    `select ${SYNC_COLUMNS},
+           case when sync.audit_link->>'kind' = 'none' then ${SYNC_HAS_COPY} else false end as "hasAnyCopy"
+         from github_installation_syncs sync where id = $1`,
+    [id],
+  );
+}
+
+function syncExpiryEvidence(sync: SyncRow | undefined) {
+  if (sync === undefined)
+    throw new TypeError("Cannot read properties of undefined (reading 'auditLink')");
+  const link = readSyncAuditLink(sync.auditLink);
+  return { sync, receiptId: link?.kind === "receipt" ? link.receiptId : undefined };
 }
 
 const CURSOR_EVIDENCE = `source, last_error as "lastError", last_error_at as "lastErrorAt",

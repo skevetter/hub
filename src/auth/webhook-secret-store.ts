@@ -162,14 +162,14 @@ export class WebhookSecretStore {
     if (masterKeyId === undefined || master === undefined) throw unavailable();
     const versionId = randomUUID();
     const salt = randomBytes(32).toString("base64url");
-    const signingSecret = deriveSigningSecret(
+    const signingSecret = deriveSigningSecret({
       master,
       masterKeyId,
       salt,
       organizationId,
-      id,
+      apiKeyId: id,
       versionId,
-    );
+    });
     await transaction.query(
       `insert into organization_webhook_secrets
          (organization_id, api_key_id, slot, version_id, master_key_id, salt)
@@ -277,14 +277,14 @@ export class WebhookSecretStore {
       const derive = (version: VersionRow) => {
         const master = this.settings.keyring.get(version.master_key_id);
         if (master === undefined) throw unavailable();
-        return deriveSigningSecret(
+        return deriveSigningSecret({
           master,
-          version.master_key_id,
-          version.salt,
-          key.organization_id,
-          key.id,
-          version.version_id,
-        );
+          masterKeyId: version.master_key_id,
+          salt: version.salt,
+          organizationId: key.organization_id,
+          apiKeyId: key.id,
+          versionId: version.version_id,
+        });
       };
       return previous === undefined ? [derive(current)] : [derive(current), derive(previous)];
     } catch {

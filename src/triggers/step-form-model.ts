@@ -94,6 +94,51 @@ export function staleRunIfError(
   return message !== undefined && STALE_REFERENCE.test(message) ? message : undefined;
 }
 
+const RESERVED_STEP_IDS: ReadonlySet<string> = new Set(["constructor", "prototype"]);
+
+/** IDs the form refuses because outputs are looked up by ID and these name built-in properties. */
+export function reservedStepIdError(id: string): string | undefined {
+  return RESERVED_STEP_IDS.has(id) ? `"${id}" is reserved. Choose another ID.` : undefined;
+}
+
+export function reservedStepIdErrors(steps: TriggerFormValue["steps"]): TriggerFieldErrors {
+  const errors: TriggerFieldErrors = {};
+  for (const [index, step] of steps.entries()) {
+    const message = reservedStepIdError(step.id);
+    if (message !== undefined) errors[stepFieldKey(index, "id")] = message;
+  }
+  return errors;
+}
+
+/** One line a collapsed step shows: the model it runs, or the first line of its script. */
+export function stepSummary(step: TriggerStepFormValue, modelLabel: string | undefined): string {
+  if (step.action === "script") {
+    const first = step.script
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line !== "");
+    return `Script: ${first ?? "empty"}`;
+  }
+  return `Agent: ${modelLabel ?? (step.agent === "" ? "not chosen" : step.agent)}`;
+}
+
+/**
+ * A step stays open while something on it needs the reader: a field the check flagged, a condition
+ * that reads a step which no longer runs first, or an ID the form refuses.
+ */
+export function stepNeedsAttention(
+  form: Pick<TriggerFormValue, "steps">,
+  errors: TriggerFieldErrors,
+  index: number,
+): boolean {
+  const prefix = `steps.${String(index)}.`;
+  return (
+    Object.keys(errors).some((key) => key.startsWith(prefix)) ||
+    staleRunIfError(form, index) !== undefined ||
+    reservedStepIdError(stepAt(form, index).id) !== undefined
+  );
+}
+
 const SAVE_STEP_ISSUE = /^steps\.(\d+)\.continuation: (.+)$/gmu;
 
 /**

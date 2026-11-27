@@ -219,16 +219,24 @@ export class RunTimelineQueue implements TimelineQueue {
         await work.operation();
         work.resolve?.();
       } catch (error) {
-        if (work.reject !== undefined) work.reject(error);
-        else this.report(error, queue.scope);
+        this.handleWorkFailure(queue, work, error);
       } finally {
-        if (work.ordinary) queue.ordinaryCount -= 1;
-        else queue.controlCount -= 1;
-        queue.head = work.next;
-        if (queue.head === undefined) queue.tail = undefined;
-        queue.executing = undefined;
+        this.finishWork(queue, work);
       }
     }
+  }
+
+  private handleWorkFailure(queue: PendingRun, work: TimelineWork, error: unknown): void {
+    if (work.reject !== undefined) work.reject(error);
+    else this.report(error, queue.scope);
+  }
+
+  private finishWork(queue: PendingRun, work: TimelineWork): void {
+    if (work.ordinary) queue.ordinaryCount -= 1;
+    else queue.controlCount -= 1;
+    queue.head = work.next;
+    if (queue.head === undefined) queue.tail = undefined;
+    queue.executing = undefined;
   }
 
   private hasDrops(queue: PendingRun): boolean {
@@ -239,15 +247,7 @@ export class RunTimelineQueue implements TimelineQueue {
     const batches = queue.batch === undefined ? 1 : 2;
     for (let remaining = batches; remaining > 0; remaining--) {
       if (!this.hasDrops(queue) || !queue.dropsReady || this.closed) return;
-      if (queue.batch === undefined) {
-        queue.batch = {
-          id: randomUUID(),
-          count: queue.dropped,
-          at: this.options.now?.() ?? new Date(),
-        };
-        queue.dropped = 0;
-      }
-      const batch = queue.batch;
+      const batch = this.ensureDropBatch(queue);
       const scheduled = queue.recoveryReady;
       queue.recoveryReady = false;
       if (scheduled) queue.recoveryAttempts += 1;
@@ -263,27 +263,55 @@ export class RunTimelineQueue implements TimelineQueue {
           batch.id,
         );
       } catch (error) {
-        if (this.stopping || this.closed || queue.recoveryAttempts >= 5) {
-          this.abandon(queue, batch.count);
-          queue.batch = undefined;
-          queue.recoveryAt = undefined;
-          queue.recoveryAttempts = 0;
-        } else {
-          queue.recoveryAt ??= performance.now() + 30000;
-          if (scheduled) queue.recoveryAt = performance.now() + 30000;
-        }
-        this.report(error, queue.scope);
+        this.handleDropFailure(queue, batch, scheduled, error);
         return;
       } finally {
         queue.inFlightDrops = 0;
       }
+      this.finishDropBatch(queue, result);
+    }
+  }
+
+  private ensureDropBatch(queue: PendingRun): DropBatch {
+    if (queue.batch === undefined) {
+      queue.batch = {
+        id: randomUUID(),
+        count: queue.dropped,
+        at: this.options.now?.() ?? new Date(),
+      };
+      queue.dropped = 0;
+    }
+    return queue.batch;
+  }
+
+  private handleDropFailure(
+    queue: PendingRun,
+    batch: DropBatch,
+    scheduled: boolean,
+    error: unknown,
+  ): void {
+    if (this.stopping || this.closed || queue.recoveryAttempts >= 5) {
+      this.abandon(queue, batch.count);
       queue.batch = undefined;
       queue.recoveryAt = undefined;
       queue.recoveryAttempts = 0;
-      queue.dropsReady = queue.dropped !== 0;
-      if (result !== undefined && (result.inserted || result.noticeSeq !== undefined))
-        this.options.bus.publish(queue.scope.triggerRunId, result.noticeSeq ?? result.seq);
+    } else {
+      queue.recoveryAt ??= performance.now() + 30000;
+      if (scheduled) queue.recoveryAt = performance.now() + 30000;
     }
+    this.report(error, queue.scope);
+  }
+
+  private finishDropBatch(
+    queue: PendingRun,
+    result: { seq: number; inserted: boolean; noticeSeq?: number } | undefined,
+  ): void {
+    queue.batch = undefined;
+    queue.recoveryAt = undefined;
+    queue.recoveryAttempts = 0;
+    queue.dropsReady = queue.dropped !== 0;
+    if (result !== undefined && (result.inserted || result.noticeSeq !== undefined))
+      this.options.bus.publish(queue.scope.triggerRunId, result.noticeSeq ?? result.seq);
   }
 
   private clearRecoveryTimer(): void {
@@ -352,21 +380,7 @@ export class RunTimelineQueue implements TimelineQueue {
 
   private discardPending(): void {
     for (const queue of this.queues.values()) {
-      const current = queue.executing;
-      let work = current === undefined ? queue.head : current.next;
-      if (current !== undefined) current.next = undefined;
-      queue.head = current;
-      queue.tail = current;
-      while (work !== undefined) {
-        if (work.ordinary) queue.ordinaryCount -= 1;
-        else {
-          queue.controlCount -= 1;
-          work.reject?.(new Error("Timeline capture flush exceeded its deadline"));
-        }
-        const next = work.next;
-        work.next = undefined;
-        work = next;
-      }
+      this.discardWaitingWork(queue);
       const retained = queue.inFlightDrops === 0 ? (queue.batch?.count ?? 0) : 0;
       this.abandon(queue, queue.dropped + retained);
       if (queue.inFlightDrops === 0) queue.batch = undefined;
@@ -378,6 +392,24 @@ export class RunTimelineQueue implements TimelineQueue {
     }
     if (this.stopping || this.closed) this.clearRecoveryTimer();
     else this.scheduleRecovery();
+  }
+
+  private discardWaitingWork(queue: PendingRun): void {
+    const current = queue.executing;
+    let work = current === undefined ? queue.head : current.next;
+    if (current !== undefined) current.next = undefined;
+    queue.head = current;
+    queue.tail = current;
+    while (work !== undefined) {
+      if (work.ordinary) queue.ordinaryCount -= 1;
+      else {
+        queue.controlCount -= 1;
+        work.reject?.(new Error("Timeline capture flush exceeded its deadline"));
+      }
+      const next = work.next;
+      work.next = undefined;
+      work = next;
+    }
   }
 
   private report(error: unknown, scope: TimelineRunScope): void {

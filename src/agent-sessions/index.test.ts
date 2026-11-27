@@ -35,7 +35,7 @@ async function fixture(
       replies.push({ executionId: input.agentExecutionId, context: input.outputContext });
     },
   });
-  const sessions = new AgentSessions(database, "secret", "https://hub.test", outputs, now);
+  const sessions = new AgentSessions(database, "secret", "https://hub.test", { outputs, now });
   const capabilities = createExecutionCapabilityServer({
     database,
     outputs,
@@ -46,11 +46,19 @@ async function fixture(
   });
   async function arrival(
     key: string | null | false = "conversation",
-    target = "daemon",
-    env: Record<string, string> = {},
-    prompt = "hello",
-    overrides: Partial<LaunchMachineIntent> = {},
-    standalone = false,
+    {
+      target = "daemon",
+      env = {},
+      prompt = "hello",
+      overrides,
+      standalone,
+    }: {
+      target?: string;
+      env?: Record<string, string>;
+      prompt?: string;
+      overrides?: Partial<LaunchMachineIntent>;
+      standalone?: boolean;
+    } = {},
   ) {
     const executionId = randomUUID();
     const intent: LaunchMachineIntent = {
@@ -215,7 +223,7 @@ test("new-agent policy isolates arrivals and incompatible targets fail without r
   expect((await a.dispatch()).agentId).not.toBe((await b.dispatch()).agentId);
   const first = await f.arrival();
   await first.dispatch();
-  const changed = await f.arrival("conversation", "different-daemon");
+  const changed = await f.arrival("conversation", { target: "different-daemon" });
   await expect(changed.dispatch()).rejects.toThrow("Continuation settings differ");
   expect(f.connection.creates).toHaveLength(3);
 });
@@ -223,8 +231,8 @@ test("new-agent policy isolates arrivals and incompatible targets fail without r
 test("ordinary launches use agent sessions and preserve long prompts without enabling continuation", async () => {
   const f = await fixture();
   const prompt = "Investigate this request.\n" + "Full request context. ".repeat(1_000);
-  const first = await f.arrival(false, "daemon", {}, prompt);
-  const second = await f.arrival(false, "daemon", {}, prompt);
+  const first = await f.arrival(false, { prompt });
+  const second = await f.arrival(false, { prompt });
   const a = await first.dispatch();
   const replay = await first.dispatch();
   const b = await second.dispatch();
@@ -246,9 +254,13 @@ test("steering keeps the active agent's scoped credentials instead of requiring 
     permissions: { contents: "write" as const },
     durationMs: 60 * 60 * 1000,
   };
-  const first = await f.arrival("conversation", "daemon", env, "first request", { github });
+  const first = await f.arrival("conversation", {
+    env,
+    prompt: "first request",
+    overrides: { github },
+  });
   const original = await first.dispatch();
-  const next = await f.arrival("conversation", "daemon", env, "follow-up", { github });
+  const next = await f.arrival("conversation", { env, prompt: "follow-up", overrides: { github } });
   expect(await next.dispatch()).toMatchObject({ agentId: original.agentId, action: "continued" });
   expect(f.connection.creates).toHaveLength(1);
   expect(f.connection.creates[0]?.env).toEqual({ GH_TOKEN: "scoped-github-token" });
@@ -258,10 +270,14 @@ test("steering keeps the active agent's scoped credentials instead of requiring 
 test("steering cannot extend the active agent's original max-runtime deadline", async () => {
   const f = await fixture();
   const deadlineAt = new Date("2030-01-01T01:00:00Z");
-  const first = await f.arrival("conversation", "daemon", {}, "first request", { deadlineAt });
+  const first = await f.arrival("conversation", {
+    prompt: "first request",
+    overrides: { deadlineAt },
+  });
   await first.dispatch();
-  const next = await f.arrival("conversation", "daemon", {}, "follow-up", {
-    deadlineAt: new Date("2030-01-01T01:30:00Z"),
+  const next = await f.arrival("conversation", {
+    prompt: "follow-up",
+    overrides: { deadlineAt: new Date("2030-01-01T01:30:00Z") },
   });
   await next.dispatch();
   expect((await f.execution(first.executionId)).deadlineAt).toEqual(deadlineAt);
@@ -276,11 +292,11 @@ test("a completed credentialed task gets a fresh agent and isolates the previous
     permissions: { contents: "write" as const },
     durationMs: 60 * 60 * 1000,
   };
-  const first = await f.arrival("conversation", "daemon", {}, "first", { github });
+  const first = await f.arrival("conversation", { prompt: "first", overrides: { github } });
   const original = await first.dispatch();
   await f.database.transitionAgentExecution(first.executionId, "succeeded");
   await f.sessions.releaseAuthority(await f.execution(first.executionId), async () => {});
-  const next = await f.arrival("conversation", "daemon", {}, "next task", { github });
+  const next = await f.arrival("conversation", { prompt: "next task", overrides: { github } });
   const fresh = await next.dispatch();
   expect(fresh.agentId).not.toBe(original.agentId);
   expect(f.connection.creates).toHaveLength(2);
@@ -292,7 +308,7 @@ test("a completed credentialed task gets a fresh agent and isolates the previous
 test("an expired credentialed launch still rotates its session in memory", async () => {
   const f = await fixture(() => Date.parse("2026-10-01T00:00:00Z"));
   const env = { TOKEN: "${{ paseo.connections.support.token }}" };
-  const first = await f.arrival("conversation", "daemon", env, "old launch", {}, true);
+  const first = await f.arrival("conversation", { env, prompt: "old launch", standalone: true });
   const original = await first.dispatch();
   const completed = await f.database.transitionAgentExecution(first.executionId, "succeeded");
   const sessionId = completed.execution.agentSessionId!;
@@ -304,7 +320,7 @@ test("an expired credentialed launch still rotates its session in memory", async
     launchIntent: null,
     usedTemporaryCredentials: true,
   });
-  const next = await f.arrival("conversation", "daemon", env);
+  const next = await f.arrival("conversation", { env });
   expect(await next.dispatch()).toMatchObject({ action: "created" });
   expect((await f.execution(next.executionId)).daemonAgentId).not.toBe(original.agentId);
   expect((await f.database.findAgentSession(sessionId))?.continuationKey).toBeNull();
@@ -386,13 +402,15 @@ test.each(credentialHistories)(
 test("a ping cannot send more work after the inherited deadline while timeout cleanup is pending", async () => {
   let now = Date.parse("2030-01-01T00:00:00Z");
   const f = await fixture(() => now);
-  const first = await f.arrival("conversation", "daemon", {}, "first", {
-    deadlineAt: new Date(now + 1000),
+  const first = await f.arrival("conversation", {
+    prompt: "first",
+    overrides: { deadlineAt: new Date(now + 1000) },
   });
   await first.dispatch();
   now += 1000;
-  const next = await f.arrival("conversation", "daemon", {}, "too late", {
-    deadlineAt: new Date(now + 1000),
+  const next = await f.arrival("conversation", {
+    prompt: "too late",
+    overrides: { deadlineAt: new Date(now + 1000) },
   });
   await expect(next.dispatch()).rejects.toThrow("execution_deadline_exceeded");
   expect(f.connection.deliveries).toHaveLength(1);

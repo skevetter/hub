@@ -122,6 +122,12 @@ export function createStripeBillingClient(stripeSecretKey: string): StripeBillin
       if (session.url === null) throw new Error("Stripe checkout session has no redirect URL");
       return { url: session.url };
     },
+    ...subscriptionOperations(stripe),
+  };
+}
+
+function subscriptionOperations(stripe: StripeSDK) {
+  return {
     async changeSubscriptionPrice(input: ChangeSubscriptionPriceInput): Promise<void> {
       // A plan change updates the existing subscription's single item onto the new price — never a
       // second subscription. Stripe needs the item id, so retrieve first, then swap its price.

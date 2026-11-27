@@ -26,11 +26,31 @@ export class TriggerSteps {
     await expect(this.page.getByRole("region", { name: /^Step \d+:/u })).toHaveCount(ids.length);
   }
 
+  /** A step that is not being edited is one line. Opening it closes the one that was open. */
+  async edit(position: number) {
+    const open = this.step(position).getByRole("button", {
+      name: `Edit step ${String(position)}`,
+      exact: true,
+    });
+    if (!(await open.isVisible())) return;
+    await open.click();
+    await expect(this.step(position).getByLabel("Step ID", { exact: true })).toBeFocused();
+  }
+
+  async expectSummary(position: number, summary: string, condition = false) {
+    const step = this.step(position);
+    await expect(step.getByText(summary, { exact: true })).toBeVisible();
+    await expect(step.getByText("Condition", { exact: true })).toHaveCount(condition ? 1 : 0);
+    await expect(step.getByLabel("Step ID", { exact: true })).toHaveCount(0);
+  }
+
   async rename(position: number, id: string) {
+    await this.edit(position);
     await this.step(position).getByLabel("Step ID", { exact: true }).fill(id);
   }
 
   async choose(position: number, label: string, value: string) {
+    await this.edit(position);
     await this.step(position).getByRole("combobox", { name: label, exact: true }).click();
     await this.page.locator(`[role="option"][data-value=${JSON.stringify(value)}]`).click();
   }
@@ -42,6 +62,7 @@ export class TriggerSteps {
   }
 
   async openConditions(position: number) {
+    await this.edit(position);
     const header = this.step(position).getByRole("button", { name: /^Condition/u });
     if ((await header.getAttribute("aria-expanded")) !== "true") await header.click();
   }
@@ -57,11 +78,13 @@ export class TriggerSteps {
   }
 
   async useScript(position: number, script: string) {
+    await this.edit(position);
     await this.step(position).getByRole("radio", { name: "Script", exact: true }).click();
     await this.step(position).getByLabel("Script", { exact: true }).fill(script);
   }
 
   async chooseContinuity(position: number, label: string) {
+    await this.edit(position);
     await this.step(position).getByRole("radio", { name: label, exact: true }).click();
   }
 
@@ -108,6 +131,7 @@ export class TriggerSteps {
       content:
         "*, *::before, *::after { transition: none !important; } .sticky { position: static !important; }",
     });
+    await this.edit(2);
     for (const viewport of VIEWPORTS) {
       await this.page.setViewportSize(viewport);
       for (const colorScheme of ["light", "dark"] as const) {

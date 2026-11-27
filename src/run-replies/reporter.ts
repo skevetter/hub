@@ -1,5 +1,5 @@
 import type { OnRunReplyAnswer } from "../daemons/reply-capture.js";
-import type { AcceptedTriggerRunRecord, Database } from "../db/types.js";
+import type { AcceptedTriggerRunRecord, Database, WorkflowStepRunRecord } from "../db/types.js";
 import type { FinalReplyAnswer } from "./format.js";
 import type { LinearRunReplyWriter } from "./linear.js";
 import type { RunReplyRecord, RunReplyScope } from "./store.js";
@@ -104,21 +104,17 @@ export class RunReplyReporter {
       return true;
     }
     const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
-    const last = steps.findLast((step) => step.agentExecutionId !== null);
-    const answer = last?.agentExecutionId == null ? undefined : answers.get(last.agentExecutionId);
+    const answer = finalCapturedAnswer(steps, answers);
     if (answer === undefined) return true;
-    const writer = this.options.writer();
-    if (answer === null || writer === undefined) {
-      await database.runReplies.finish({
-        ...scope,
-        from: "pending",
-        failure: answer === null ? "empty_answer" : "connection_unavailable",
-      });
+    const deliverable = prepareCapturedReply(answer, this.options.writer());
+    if ("failure" in deliverable) {
+      await database.runReplies.finish({ ...scope, from: "pending", failure: deliverable.failure });
       return true;
     }
+    const { writer } = deliverable;
     const signal = this.providerSignal();
     try {
-      await writer.post(run, answer, perHour, signal);
+      await writer.post(run, deliverable.answer, perHour, signal);
       return true;
     } catch (error) {
       if (!signal.aborted) throw error;
@@ -185,4 +181,21 @@ export class RunReplyReporter {
   private providerSignal(): AbortSignal {
     return AbortSignal.any([this.shutdown.signal, AbortSignal.timeout(PROVIDER_TIMEOUT_MS)]);
   }
+}
+
+function finalCapturedAnswer(
+  steps: readonly WorkflowStepRunRecord[],
+  answers: ReadonlyMap<string, FinalReplyAnswer | null>,
+) {
+  const last = steps.findLast((step) => step.agentExecutionId !== null);
+  return last?.agentExecutionId == null ? undefined : answers.get(last.agentExecutionId);
+}
+
+function prepareCapturedReply(
+  answer: FinalReplyAnswer | null,
+  writer: LinearRunReplyWriter | undefined,
+) {
+  if (answer === null) return { failure: "empty_answer" } as const;
+  if (writer === undefined) return { failure: "connection_unavailable" } as const;
+  return { answer, writer };
 }
