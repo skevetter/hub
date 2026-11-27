@@ -1,6 +1,6 @@
 /* oxlint-disable eslint-plugin-react-perf/jsx-no-new-function-as-prop, eslint-plugin-react-perf/jsx-no-new-object-as-prop, eslint-plugin-react-perf/jsx-no-new-array-as-prop, eslint-plugin-react-perf/jsx-no-jsx-as-prop -- the controls bind one trigger form */
 import { Plus } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { Card } from "../components/app/card.js";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
@@ -8,7 +8,6 @@ import { Disclosure } from "../components/app/disclosure.js";
 import { WarningAlert } from "../components/app/failure-alert.js";
 import { FormField } from "../components/app/form-field.js";
 import { RowActions } from "../components/app/row-actions.js";
-import { Badge } from "../components/ui/badge.js";
 import { Button } from "../components/ui/button.js";
 import { DropdownMenuItem } from "../components/ui/dropdown-menu.js";
 import {
@@ -28,6 +27,7 @@ import {
   StepLimitFields,
   StepScriptFields,
   agentStepDescription,
+  useFlaggedOpen,
   type StepAgentProps,
 } from "./step-fields.js";
 import {
@@ -195,11 +195,7 @@ export function StepCard(props: StepAgentProps & { hasDaemon: boolean; rows: Ste
   const menu = <StepMenu index={index} count={form.steps.length} name={name} rows={rows} />;
   const label = `Step ${String(index + 1)}: ${name}`;
   if (key !== rows.active && !stepNeedsAttention(form, errors, index)) {
-    return (
-      <Card label={label} title={name} action={menu}>
-        <StepSummary {...fields} rows={rows} />
-      </Card>
-    );
+    return <CollapsedStep {...fields} rows={rows} label={label} name={name} menu={menu} />;
   }
   const body = {
     ...fields,
@@ -226,28 +222,36 @@ export function StepCard(props: StepAgentProps & { hasDaemon: boolean; rows: Ste
   );
 }
 
-/** What a step that is not being edited shows: what it runs, and a way back in. */
-function StepSummary({ rows, ...fields }: StepAgentProps & { rows: StepRows }) {
+/** What a step that is not being edited shows, on one row: what it runs, and a way back in. */
+function CollapsedStep(
+  props: StepAgentProps & { rows: StepRows; label: string; name: string; menu: ReactNode },
+) {
+  const { rows, label, name, menu, ...fields } = props;
   const { form, index, providerCatalog } = fields;
   const step = stepAt(form, index);
   const model = selectedProviderModel(providerCatalog.entries, step.agent).model?.label;
+  const summary = stepSummary(step, model);
   return (
-    <div className="flex min-w-0 items-center gap-3">
-      <p className="min-w-0 flex-1 truncate font-mono text-sm text-muted-foreground">
-        {stepSummary(step, model)}
-      </p>
-      {step.runIf === "" ? null : <Badge variant="outline">Condition</Badge>}
+    <section
+      aria-label={label}
+      className="flex min-w-0 items-center gap-3 rounded-sm border bg-card px-6 py-3"
+    >
+      <h2 className="shrink-0 text-sm text-foreground">{name}</h2>
+      <p className="min-w-0 flex-1 truncate font-mono text-sm text-muted-foreground">{summary}</p>
+      {step.runIf === "" ? null : (
+        <span className="shrink-0 text-xs text-muted-foreground">Condition</span>
+      )}
       <Button
         type="button"
         variant="outline"
         size="sm"
-        aria-expanded={false}
         aria-label={`Edit step ${String(index + 1)}`}
         onClick={() => rows.open(index)}
       >
         Edit
       </Button>
-    </div>
+      {menu}
+    </section>
   );
 }
 
@@ -324,10 +328,7 @@ function StepConditionFields(props: StepAgentProps) {
   const ifError = errors[ifKey] ?? stale;
   const schemaError = errors[schemaKey];
   const flagged = ifError !== undefined || schemaError !== undefined;
-  const [open, setOpen] = useState(step.runIf !== "" || step.outputSchema !== "");
-  useEffect(() => {
-    if (flagged) setOpen(true);
-  }, [flagged]);
+  const [open, setOpen] = useFlaggedOpen(flagged, step.runIf !== "" || step.outputSchema !== "");
   const agent = step.action === "prompt";
   return (
     <Disclosure

@@ -107,12 +107,14 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
   });
 
   await test.step("an ID the form refuses is flagged on its step and stops the save", async () => {
+    const editorUrl = page.url();
     await steps.rename(3, "constructor");
     await expect(steps.step(3)).toContainText('"constructor" is reserved. Choose another ID.');
     await steps.submit();
     await expect(
       page.getByRole("alert").filter({ hasText: "This trigger is not ready to save" }),
     ).toBeVisible();
+    expect(page.url()).toBe(editorUrl);
     await steps.rename(3, "step-3");
     await expect(steps.step(3)).not.toContainText("is reserved");
   });
@@ -282,4 +284,36 @@ on:
     await steps.fillAgent(2, { agent: AGENT, mode: "full-access", prompt: "Then this." });
     await triggers.expectRefusedOnSubmit("This change would break a YAML alias.");
   });
+});
+
+test("a field flagged inside a section is visible when its collapsed step opens again", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const daemon = await hub.connectProviderDaemon("owner", "Acme");
+  const triggers = new OrganizationTriggers(page);
+  const steps = new TriggerSteps(page);
+  await triggers.open();
+  await triggers.startNew();
+  await triggers.configureManual({
+    name: "options-steps",
+    daemon,
+    cwd: "/workspace/acme",
+    agent: AGENT,
+    mode: "full-access",
+    thinking: "low",
+    prompt: "Plan it.",
+  });
+  await page.getByRole("button", { name: /^Advanced provider options/u }).click();
+  await page.getByLabel("Provider options (JSON)", { exact: true }).fill("{not json");
+  await steps.addStep();
+  await steps.expectSummary(1, "Agent: Gateway Model v1");
+  await steps.submit();
+  const options = steps.step(1).getByLabel("Provider options (JSON)", { exact: true });
+  await expect(options).toBeVisible();
+  await expect(steps.step(1).getByRole("alert")).toBeVisible();
+  await options.fill("{}");
+  await expect(steps.step(1).getByRole("alert")).toHaveCount(0);
 });
