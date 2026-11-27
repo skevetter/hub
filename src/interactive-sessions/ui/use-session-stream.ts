@@ -129,7 +129,7 @@ class SessionStream {
     });
     const source = new EventSource(`${this.path}?${query.toString()}`);
     this.source = source;
-    let initialGap = initial && snapshot.hubSeq > 0 && this.view.agent.cursor === null;
+    const initialGap = initial && snapshot.hubSeq > 0 && this.view.agent.cursor === null;
     const live = () => this.active && this.source === source;
 
     source.addEventListener("open", () => {
@@ -140,6 +140,33 @@ class SessionStream {
       if (!initial) void this.refresh();
     });
 
+    this.listenUpdates(source);
+    this.listenPresence(source, initialGap);
+    source.addEventListener("resync", () => {
+      if (!live()) return;
+      void this.resync();
+    });
+    this.listen(source, "shutdown", sessionEvents.shutdown, ({ reconnectMs }) => {
+      this.disconnect();
+      this.scheduleReconnect(Math.max(1000, Math.min(reconnectMs, 30_000)));
+    });
+    source.addEventListener("error", (event) => {
+      if (!live()) return;
+      if (
+        event instanceof MessageEvent &&
+        readEvent(sessionEvents.error, event)?.code === "reauth"
+      ) {
+        this.unavailable();
+        return;
+      }
+      this.disconnect();
+      this.failures += 1;
+      if (this.failures >= 3) this.startPolling();
+      this.scheduleReconnect(Math.min(1000 * 2 ** (this.failures - 1), 30_000));
+    });
+  }
+
+  private listenUpdates(source: Source) {
     this.listen(source, "agent", sessionEvents.agent, (item, cursor) => {
       const current = this.view.snapshot;
       if (current === null || cursor.agent === null) return;
@@ -176,6 +203,10 @@ class SessionStream {
       if (current !== null && cursor.hubSeq > current.hubSeq)
         this.publish({ snapshot: { ...current, ...access, hubSeq: cursor.hubSeq } });
     });
+  }
+
+  private listenPresence(source: Source, replayGap: boolean) {
+    let initialGap = replayGap;
     this.listen(source, "connection", sessionEvents.connection, ({ daemon }) => {
       const current = this.view.snapshot;
       if (current === null) return;
@@ -202,28 +233,6 @@ class SessionStream {
         this.publish({ agent: { ...this.view.agent, cursor: null }, loadingOlder: false });
       }
       void this.history();
-    });
-    source.addEventListener("resync", () => {
-      if (!live()) return;
-      void this.resync();
-    });
-    this.listen(source, "shutdown", sessionEvents.shutdown, ({ reconnectMs }) => {
-      this.disconnect();
-      this.scheduleReconnect(Math.max(1000, Math.min(reconnectMs, 30_000)));
-    });
-    source.addEventListener("error", (event) => {
-      if (!live()) return;
-      if (
-        event instanceof MessageEvent &&
-        readEvent(sessionEvents.error, event)?.code === "reauth"
-      ) {
-        this.unavailable();
-        return;
-      }
-      this.disconnect();
-      this.failures += 1;
-      if (this.failures >= 3) this.startPolling();
-      this.scheduleReconnect(Math.min(1000 * 2 ** (this.failures - 1), 30_000));
     });
   }
 
@@ -285,17 +294,7 @@ class SessionStream {
         return false;
       }
       if (result.status === "ok" && !("outcome" in result.data)) {
-        const current = this.view.snapshot;
-        const next = result.data;
-        // Connection frames have no durable sequence, so an older response must not revert one.
-        if (current !== null && presenceVersion !== this.presenceVersion) {
-          this.applySnapshot({
-            ...next,
-            session: { ...next.session, daemon: current.session.daemon },
-          });
-        } else {
-          this.applySnapshot(next);
-        }
+        this.applyRefreshedSnapshot(result.data, presenceVersion);
       }
     } catch {
       // Retain the last view until the service can be reached again.
@@ -303,26 +302,25 @@ class SessionStream {
     return this.active && generation === this.lifecycle;
   };
 
+  private applyRefreshedSnapshot(next: SessionSnapshot, presenceVersion: number) {
+    const current = this.view.snapshot;
+    // Connection frames have no durable sequence, so an older response must not revert one.
+    if (current !== null && presenceVersion !== this.presenceVersion) {
+      this.applySnapshot({
+        ...next,
+        session: { ...next.session, daemon: current.session.daemon },
+      });
+    } else {
+      this.applySnapshot(next);
+    }
+  }
+
   private applySnapshot(next: SessionSnapshot) {
     const prior = this.view.snapshot;
     if (prior === null || next.hubSeq < prior.hubSeq) return;
     const replaced = next.session.generation !== prior.session.generation;
-    const daemonBack =
-      next.session.daemon.connection === "online" && prior.session.daemon.connection === "offline";
-    const agentReady = prior.session.state === "starting" && next.session.state !== "starting";
-    const ended = next.session.state === "idle" && prior.session.state !== "idle";
-    let messages = prior.messages;
-    let announcement = ended ? "The agent's turn ended." : undefined;
-    if (next.messages !== prior.messages) {
-      const merged = new Map(prior.messages.map((message) => [message.commandId, message]));
-      for (const message of next.messages) {
-        if (message.status !== merged.get(message.commandId)?.status) {
-          announcement = deliveryAnnouncement(message.status) ?? announcement;
-        }
-        merged.set(message.commandId, message);
-      }
-      messages = [...merged.values()];
-    }
+    const historyNeeded = snapshotNeedsHistory(next, prior);
+    const { messages, announcement } = mergeSnapshotMessages(next, prior);
     this.publish(
       {
         snapshot: { ...next, messages },
@@ -354,7 +352,7 @@ class SessionStream {
       this.disconnect();
       this.scheduleReconnect(0);
     }
-    if (daemonBack || agentReady || replaced) void this.history();
+    if (historyNeeded || replaced) void this.history();
   }
 
   private applyMessage(seq: number, message: SessionMessage) {
@@ -452,7 +450,12 @@ class SessionStream {
       return;
     }
     const agent = mergeHistoryPage(current, page, before !== null);
-    const boundaries = this.view.missedUpdates
+    const boundaries = this.historyBoundaries(agent);
+    this.publish({ history: "ready", agent, boundaries, missedUpdates: false }, true);
+  }
+
+  private historyBoundaries(agent: AgentFeed) {
+    return this.view.missedUpdates
       ? [
           ...this.view.boundaries,
           {
@@ -463,8 +466,31 @@ class SessionStream {
           },
         ]
       : this.view.boundaries;
-    this.publish({ history: "ready", agent, boundaries, missedUpdates: false }, true);
   }
+}
+
+function snapshotNeedsHistory(next: SessionSnapshot, prior: SessionSnapshot): boolean {
+  const daemonBack =
+    next.session.daemon.connection === "online" && prior.session.daemon.connection === "offline";
+  const agentReady = prior.session.state === "starting" && next.session.state !== "starting";
+  return daemonBack || agentReady;
+}
+
+function mergeSnapshotMessages(next: SessionSnapshot, prior: SessionSnapshot) {
+  const ended = next.session.state === "idle" && prior.session.state !== "idle";
+  let messages = prior.messages;
+  let announcement = ended ? "The agent's turn ended." : undefined;
+  if (next.messages !== prior.messages) {
+    const merged = new Map(prior.messages.map((message) => [message.commandId, message]));
+    for (const message of next.messages) {
+      if (message.status !== merged.get(message.commandId)?.status) {
+        announcement = deliveryAnnouncement(message.status) ?? announcement;
+      }
+      merged.set(message.commandId, message);
+    }
+    messages = [...merged.values()];
+  }
+  return { messages, announcement };
 }
 
 function readEvent<T>(schema: z.ZodType<T>, event: MessageEvent<unknown>): T | undefined {
@@ -489,6 +515,9 @@ function deliveryAnnouncement(status: SessionMessage["status"]) {
       return "Message delivery failed.";
     case "superseded":
       return "Message was not sent.";
+    case "dispatching":
+    case "done":
+    case "pending":
     default:
       return undefined;
   }

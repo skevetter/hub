@@ -52,35 +52,7 @@ export function requiredExistingRun(id: string | undefined): string {
 export async function acceptWorkflowRun(client: QueryHandle, input: CreateAcceptedTriggerRunInput) {
   const replay = await markedReceiptAdmission(client, input);
   if (replay !== undefined) return replay;
-  const inserted = await client.query<{
-    id: string;
-    outcome: string;
-    status: string;
-    payload_expiry_state: string | null;
-  }>(
-    `insert into trigger_runs
-           (id, organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
-           configured_trigger_name, outcome, status,
-            prompt, inputs, values, trigger_context, output_context, deadline_at, deadline_kind, rejection, created_at, conversation)
-         values (coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6, 'accepted', 'running', $7, $8, '{}'::jsonb, $9, $10, $11, null, null, $12, $13)
-         on conflict (provider_event_receipt_id, project_id, configured_trigger_name) do nothing
-         returning *`,
-    [
-      input.id ?? null,
-      input.organizationId,
-      input.projectId,
-      input.configurationRevisionId,
-      input.providerEventReceiptId,
-      input.configuredTriggerName,
-      input.prompt,
-      input.inputs,
-      input.triggerContext,
-      input.outputContext,
-      input.deadlineAt,
-      input.createdAt ?? new Date(),
-      input.conversation ?? null,
-    ],
-  );
+  const inserted = await insertWorkflowRun(client, input);
   let run = inserted.rows[0];
   const created = run !== undefined;
   if (run === undefined) {
@@ -123,4 +95,36 @@ export async function acceptWorkflowRun(client: QueryHandle, input: CreateAccept
     [run.id, input.createdAt ?? new Date()],
   );
   return { id: run.id, created };
+}
+
+function insertWorkflowRun(client: QueryHandle, input: CreateAcceptedTriggerRunInput) {
+  return client.query<{
+    id: string;
+    outcome: string;
+    status: string;
+    payload_expiry_state: string | null;
+  }>(
+    `insert into trigger_runs
+           (id, organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
+           configured_trigger_name, outcome, status,
+            prompt, inputs, values, trigger_context, output_context, deadline_at, deadline_kind, rejection, created_at, conversation)
+         values (coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6, 'accepted', 'running', $7, $8, '{}'::jsonb, $9, $10, $11, null, null, $12, $13)
+         on conflict (provider_event_receipt_id, project_id, configured_trigger_name) do nothing
+         returning *`,
+    [
+      input.id ?? null,
+      input.organizationId,
+      input.projectId,
+      input.configurationRevisionId,
+      input.providerEventReceiptId,
+      input.configuredTriggerName,
+      input.prompt,
+      input.inputs,
+      input.triggerContext,
+      input.outputContext,
+      input.deadlineAt,
+      input.createdAt ?? new Date(),
+      input.conversation ?? null,
+    ],
+  );
 }

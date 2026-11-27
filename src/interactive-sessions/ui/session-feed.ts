@@ -63,12 +63,7 @@ export function mergeHistoryPage(feed: AgentFeed, page: History, older = false):
     (page.endCursor === null || compareAgentPosition(current.cursor, page.endCursor) > 0)
       ? current.cursor
       : page.endCursor;
-  const extendsEarlier =
-    older || (current.before !== null && first !== undefined && first <= current.before.seq);
-  const canSetBefore =
-    current.rows.length === 0 ||
-    current.rows.every(({ projected }) => !projected) ||
-    extendsEarlier;
+  const canSetBefore = canSetHistoryBefore(current, first, older);
   const pageBefore = page.hasOlder ? page.startCursor : null;
   return {
     epoch: page.epoch,
@@ -78,6 +73,14 @@ export function mergeHistoryPage(feed: AgentFeed, page: History, older = false):
       compareAgentPosition(left.item, right.item),
     ),
   };
+}
+
+function canSetHistoryBefore(current: AgentFeed, first: number | undefined, older: boolean) {
+  const extendsEarlier =
+    older || (current.before !== null && first !== undefined && first <= current.before.seq);
+  return (
+    current.rows.length === 0 || current.rows.every(({ projected }) => !projected) || extendsEarlier
+  );
 }
 
 export function sessionCursor(hubSeq: number, agent: AgentCursor | null): string {
@@ -95,6 +98,11 @@ export function parseSessionCursor(
   const hubSeq = Number(hub);
   if (!Number.isSafeInteger(hubSeq)) return undefined;
   if (epoch === undefined) return { hubSeq, agent: null };
+  const agent = parseAgentCursor(sequence, offset, epoch);
+  return agent === undefined ? undefined : { hubSeq, agent };
+}
+
+function parseAgentCursor(sequence: string | undefined, offset: string | undefined, epoch: string) {
   const seq = Number(sequence);
   if (!Number.isSafeInteger(seq)) return undefined;
   const chunkOffset = offset === undefined ? undefined : Number(offset);
@@ -103,7 +111,7 @@ export function parseSessionCursor(
     (!Number.isSafeInteger(chunkOffset) || chunkOffset < 1 || chunkOffset > 65536)
   )
     return undefined;
-  return { hubSeq, agent: { seq, epoch, ...(chunkOffset === undefined ? {} : { chunkOffset }) } };
+  return { seq, epoch, ...(chunkOffset === undefined ? {} : { chunkOffset }) };
 }
 
 const deliveryStatus: Record<CommandStatus, DeliveryStatus> = {
@@ -149,6 +157,15 @@ export function transcriptItems(
     }
     previous = row;
   }
+  appendMessages(displayed, messages, anchors);
+  return displayed;
+}
+
+function appendMessages(
+  displayed: DisplayItem[],
+  messages: readonly SessionMessage[],
+  anchors: Map<string, number>,
+): void {
   for (const message of messages.toSorted((left, right) => left.ordinal - right.ordinal)) {
     displayed.push({
       id: message.commandId,
@@ -160,7 +177,6 @@ export function transcriptItems(
       retryable: message.retryable && !message.expired,
     });
   }
-  return displayed;
 }
 
 function sameAssistantTurn(

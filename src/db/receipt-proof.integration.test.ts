@@ -90,26 +90,24 @@ async function verifyMatrix(database: Database, runtime?: QueryHandle, sweep = f
     after = page.nextCursor;
   } while (after !== null);
   assert.equal(candidates.length, cases.length);
-  if (sweep) {
-    assert.ok(runtime);
-    const count = await drainReceiptSweep(database, NOW, "count");
-    assert.deepEqual(await hashTables(runtime), before);
-    for (const disposition of new Set(cases.map((fixture) => fixture.disposition))) {
-      assert.equal(
-        count.receiptCounts.receipts[disposition]?.count,
-        cases.filter((fixture) => fixture.disposition === disposition).length,
-        disposition,
-      );
-    }
-    assert.deepEqual(count.receiptApply.receipt, { applied: 0, locked: 0, changedOrMissing: 0 });
-    const applied = await drainReceiptSweep(database, NOW);
-    assert.deepEqual(applied.receiptCounts, count.receiptCounts);
-    assert.equal(
-      applied.receiptApply.receipt.applied,
-      count.receiptCounts.receipts.eligible?.count,
-    );
-  }
+  if (sweep) await verifyMatrixSweep(database, runtime, cases, before);
   if (!sweep && runtime !== undefined) assert.deepEqual(await hashTables(runtime), before);
+  await verifyMatrixCases(database, { cases, candidates, sweep });
+  return cases;
+}
+
+async function verifyMatrixCases(
+  database: Database,
+  {
+    cases,
+    candidates,
+    sweep,
+  }: {
+    cases: Awaited<ReturnType<typeof seedProofMatrix>>;
+    candidates: Awaited<ReturnType<Database["scanReceiptPayloads"]>>["candidates"];
+    sweep: boolean;
+  },
+) {
   for (const fixture of cases) {
     assert.equal(
       candidates.find(({ id }) => id === fixture.id)?.disposition,
@@ -123,7 +121,28 @@ async function verifyMatrix(database: Database, runtime?: QueryHandle, sweep = f
     candidates: [],
     nextCursor: null,
   });
-  return cases;
+}
+
+async function verifyMatrixSweep(
+  database: Database,
+  runtime: QueryHandle | undefined,
+  cases: Awaited<ReturnType<typeof seedProofMatrix>>,
+  before: string[] | undefined,
+) {
+  assert.ok(runtime);
+  const count = await drainReceiptSweep(database, NOW, "count");
+  assert.deepEqual(await hashTables(runtime), before);
+  for (const disposition of new Set(cases.map((fixture) => fixture.disposition))) {
+    assert.equal(
+      count.receiptCounts.receipts[disposition]?.count,
+      cases.filter((fixture) => fixture.disposition === disposition).length,
+      disposition,
+    );
+  }
+  assert.deepEqual(count.receiptApply.receipt, { applied: 0, locked: 0, changedOrMissing: 0 });
+  const applied = await drainReceiptSweep(database, NOW);
+  assert.deepEqual(applied.receiptCounts, count.receiptCounts);
+  assert.equal(applied.receiptApply.receipt.applied, count.receiptCounts.receipts.eligible?.count);
 }
 
 async function verifyApplied(
@@ -158,19 +177,24 @@ async function verifyRetainedIdentity(
     assert.equal(byId?.payload, null);
     assert.equal(byId.acceptedRoutes, null);
     assert.equal(byId.preRoutingDrop, null);
-    if (fixture.key === "signed") {
-      assert.equal(byId.manualReplayBinding?.triggerName, "target");
-      assert.equal(
-        byId.manualReplayBinding?.configurationRevisionId,
-        fixture.route.configurationRevisionId,
-      );
-      assert.ok(byId.manualReplayBinding?.triggerId);
-    }
+    if (fixture.key === "signed") verifySignedBinding(byId, fixture);
   } else {
     assert.match(JSON.stringify(byId?.payload), new RegExp(fixture.marker, "u"));
   }
   const runs = await database.findTriggerRunsByProviderEventReceiptId(fixture.id);
   assert.deepEqual(runs.map(({ id }) => id).sort(), fixture.runs.sort());
+}
+
+function verifySignedBinding(
+  byId: NonNullable<Awaited<ReturnType<Database["findProviderEventReceiptById"]>>>,
+  fixture: Awaited<ReturnType<typeof seedProofMatrix>>[number],
+) {
+  assert.equal(byId.manualReplayBinding?.triggerName, "target");
+  assert.equal(
+    byId.manualReplayBinding?.configurationRevisionId,
+    fixture.route.configurationRevisionId,
+  );
+  assert.ok(byId.manualReplayBinding?.triggerId);
 }
 
 async function readDumpMarkers(postgres: StartedPostgreSqlContainer, url: URL, markers: string[]) {

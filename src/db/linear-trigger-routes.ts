@@ -13,16 +13,7 @@ export function linearRoutesForConnection(
 ): LinearTriggerRoute[] {
   return configuration.triggers.flatMap(({ on, name, filters }) => {
     if (!on.startsWith("linear.")) return [];
-    // A resolved route carries the exact connection chosen at save time.
-    if (filters?.connectionId !== undefined) {
-      if (filters.connectionId !== connectionId) return [];
-    } else if (
-      filters?.connection !== undefined ||
-      filters?.project !== undefined ||
-      filters?.resourceId !== undefined
-    ) {
-      return [];
-    }
+    if (!matchesConnection(filters, connectionId)) return [];
     return [
       {
         provider: "linear",
@@ -33,6 +24,19 @@ export function linearRoutesForConnection(
       },
     ];
   });
+}
+
+function matchesConnection(
+  filters: CompiledHubConfig["triggers"][number]["filters"],
+  connectionId: string,
+): boolean {
+  // A resolved route carries the exact connection chosen at save time.
+  if (filters?.connectionId !== undefined) return filters.connectionId === connectionId;
+  return (
+    filters?.connection === undefined &&
+    filters?.project === undefined &&
+    filters?.resourceId === undefined
+  );
 }
 
 export function organizationTriggerRoutesForSave(

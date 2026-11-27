@@ -5,8 +5,8 @@ import { describe, it } from "vitest";
 const SPECS = ["e2e/apps.spec.ts", "e2e/apps-mobile.spec.ts"];
 const INTERACTION = /\.(?:collapse|expand|fill|save|click)\(/u;
 
-async function specSources(): Promise<readonly string[]> {
-  return await Promise.all(SPECS.map((path) => readFile(path, "utf8")));
+function specSources(): Promise<readonly string[]> {
+  return Promise.all(SPECS.map((path) => readFile(path, "utf8")));
 }
 
 /** Everything between one `test(` and the next, which is close enough to a test body to reason about. */

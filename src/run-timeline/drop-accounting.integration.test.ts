@@ -597,6 +597,7 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
       "serializes independent drop writers at the state read (same batch: %s)",
       async (sameBatch) => {
         assert.ok(harness.pooled);
+        const pooled = harness.pooled;
         const run = await harness.createRun();
         await database.appendRunTimelineEvent(event(run.id));
         const before = await database.readRunTimelineState(ORGANIZATION, run.id);
@@ -606,6 +607,44 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
         const releaseSecond = Promise.withResolvers<void>();
         let secondRead = false;
         const pending: Promise<unknown>[] = [];
+        function assertSerializedState(
+          state: Awaited<ReturnType<Database["readRunTimelineState"]>>,
+        ): void {
+          assert.equal(state?.droppedCount, sameBatch ? 3 : 8);
+          assert.equal(state?.eventCount, 2);
+          assert.equal(state?.byteCount, before?.byteCount);
+          assert.equal(state?.stepEndBytes, before?.stepEndBytes);
+        }
+
+        async function assertSerializedWrites(
+          firstResult: Awaited<ReturnType<Database["recordRunTimelineDrops"]>>,
+          secondResult: Awaited<ReturnType<Database["recordRunTimelineDrops"]>>,
+          observed: string,
+        ): Promise<void> {
+          const state = await database.readRunTimelineState(ORGANIZATION, run.id);
+          const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE);
+          assertSerializedState(state);
+          assert.deepEqual(firstResult, { seq: 2, inserted: true });
+          assert.deepEqual(secondResult, {
+            seq: 2,
+            inserted: false,
+            ...(sameBatch ? { noticeSeq: rows.find((row) => row.kind === "truncated")!.seq } : {}),
+          });
+          assert.deepEqual(
+            rows.map((row) => [row.seq, row.kind]),
+            [
+              [1, "turn_started"],
+              [2, "truncated"],
+            ],
+          );
+          const bytes = await pooled.runtime.query<{ bytes: number }>(
+            "select coalesce(sum(octet_length(data::text)), 0)::integer as bytes from run_timeline_events where trigger_run_id = $1 and kind = 'turn_started'",
+            [run.id],
+          );
+          assert.equal(state?.byteCount, bytes.rows[0]?.bytes);
+          assert.equal(observed, "blocked");
+        }
+
         try {
           const first = await connect({
             afterQuery: async (sql) => {
@@ -646,31 +685,7 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
           const firstResult = await a;
           releaseSecond.resolve();
           const secondResult = await b;
-          const state = await database.readRunTimelineState(ORGANIZATION, run.id);
-          const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE);
-          assert.equal(state?.droppedCount, sameBatch ? 3 : 8);
-          assert.equal(state?.eventCount, 2);
-          assert.equal(state?.byteCount, before?.byteCount);
-          assert.equal(state?.stepEndBytes, before?.stepEndBytes);
-          assert.deepEqual(firstResult, { seq: 2, inserted: true });
-          assert.deepEqual(secondResult, {
-            seq: 2,
-            inserted: false,
-            ...(sameBatch ? { noticeSeq: rows.find((row) => row.kind === "truncated")!.seq } : {}),
-          });
-          assert.deepEqual(
-            rows.map((row) => [row.seq, row.kind]),
-            [
-              [1, "turn_started"],
-              [2, "truncated"],
-            ],
-          );
-          const bytes = await harness.pooled.runtime.query<{ bytes: number }>(
-            "select coalesce(sum(octet_length(data::text)), 0)::integer as bytes from run_timeline_events where trigger_run_id = $1 and kind = 'turn_started'",
-            [run.id],
-          );
-          assert.equal(state?.byteCount, bytes.rows[0]?.bytes);
-          assert.equal(observed, "blocked");
+          await assertSerializedWrites(firstResult, secondResult, observed);
         } finally {
           releaseFirst.resolve();
           releaseSecond.resolve();

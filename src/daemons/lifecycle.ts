@@ -1639,8 +1639,7 @@ export class DaemonDispatchLifecycle {
       this.options.database,
       this.options.completionTokenSecret,
       this.options.publicBaseUrl,
-      this.executionCapabilities,
-      () => this.now(),
+      { outputs: this.executionCapabilities, now: () => this.now() },
     );
   }
 

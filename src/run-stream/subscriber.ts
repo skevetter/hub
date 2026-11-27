@@ -41,6 +41,8 @@ export class RunStreamSubscriber {
   private ping = false;
   private page: RunTimelineEvent[] = [];
   private index = 0;
+  private cursor: number;
+  private initialPage: Promise<RunTimelineEvent[]> | undefined;
   private eventsSent = 0;
   private readonly onAbort = () => this.finish("abort");
 
@@ -59,111 +61,41 @@ export class RunStreamSubscriber {
       release(reason: StreamCloseReason, durationMs: number, eventsSent: number): void;
     },
   ) {
-    let cursor = options.after;
+    this.cursor = options.after;
     // Prefetch a page without queuing event frames ahead of the next consumer read.
-    let initialPage = options.firstSeq === null ? undefined : options.notifier.page(cursor);
-    void initialPage?.catch(() => undefined);
+    this.initialPage = options.firstSeq === null ? undefined : options.notifier.page(this.cursor);
+    void this.initialPage?.catch(() => undefined);
     this.body = new ReadableStream<Uint8Array>(
       {
         start: (controller) => {
           this.controller = controller;
-          const { run, state } = options.context;
-          this.enqueue(
-            `retry: 5000\n\n: stream open\n\n${controlEvent("status", {
-              runId: run.id,
-              status: run.status,
-              firstSeq: options.firstSeq,
-              lastSeq: state?.eventCount ?? 0,
-              sealedSeq: state?.sealedSeq ?? null,
-              stepRowsOmitted: state?.stepRowsOmitted ?? 0,
-              origin: state?.origin ?? null,
-            })}`,
-          );
+          this.openingFrame();
         },
-        pull: async () => {
-          const produce = async () => {
-            while (!this.closed) {
-              if (this.index < this.page.length) {
-                const { run } = options.context;
-                const current = await options.store.findTriggerRunForOrganization(
-                  run.organizationId,
-                  run.id,
-                );
-                if (this.closed) return;
-                if (current?.outcome !== "accepted") {
-                  this.finish("error", controlEvent("error", { code: "run_not_found" }));
-                  return;
-                }
-                if (current.payloadExpiredAt != null) {
-                  this.finish("error", controlEvent("error", { code: "timeline_expired" }));
-                  return;
-                }
-                const row = this.page[this.index++]!;
-                if (
-                  this.enqueue(
-                    `id: ${row.seq}\nevent: ${row.kind}\ndata: ${JSON.stringify({
-                      seq: row.seq,
-                      kind: row.kind,
-                      at: row.at,
-                      stepId: row.stepId,
-                      data: row.data,
-                    })}\n\n`,
-                  )
-                ) {
-                  cursor = row.seq;
-                  this.eventsSent += 1;
-                }
-                return;
-              }
-              this.page = [];
-              this.index = 0;
-              if (this.ping) {
-                this.ping = false;
-                this.enqueue(": ping\n\n");
-                return;
-              }
-              const version = options.notifier.version;
-              const context = await this.readContext();
-              if (this.closed || context === undefined) return;
-              const page = await (initialPage ?? options.notifier.page(cursor));
-              initialPage = undefined;
-              if (this.closed) return;
-              if (page.length > 0) {
-                this.page = page;
-                continue;
-              }
-              const { run, state } = context;
-              if (
-                run.status !== "running" &&
-                state?.sealedSeq != null &&
-                cursor >= state.sealedSeq
-              ) {
-                this.finish(
-                  "end",
-                  controlEvent("end", {
-                    status: run.status,
-                    lastSeq: state.eventCount,
-                    sealedSeq: state.sealedSeq,
-                    stepRowsOmitted: state.stepRowsOmitted,
-                  }),
-                );
-                return;
-              }
-              await options.notifier.wait(version, this.abort.signal);
-            }
-          };
-          await Promise.race([
-            produce().catch((error: unknown) => {
-              options.reportFailure(error);
-              this.finish("error", controlEvent("error", { code: "infrastructure_unavailable" }));
-            }),
-            this.done.promise,
-          ]);
-        },
+        pull: () => this.pull(),
         cancel: () => this.finish("abort"),
       },
       { highWaterMark: 0 },
     );
+    this.attach();
+  }
+
+  private openingFrame(): void {
+    const { run, state } = this.options.context;
+    this.enqueue(
+      `retry: 5000\n\n: stream open\n\n${controlEvent("status", {
+        runId: run.id,
+        status: run.status,
+        firstSeq: this.options.firstSeq,
+        lastSeq: state?.eventCount ?? 0,
+        sealedSeq: state?.sealedSeq ?? null,
+        stepRowsOmitted: state?.stepRowsOmitted ?? 0,
+        origin: state?.origin ?? null,
+      })}`,
+    );
+  }
+
+  private attach(): void {
+    const options = this.options;
     options.request.signal.addEventListener("abort", this.onAbort, { once: true });
     if (options.request.signal.aborted) {
       queueMicrotask(this.onAbort);
@@ -180,23 +112,118 @@ export class RunStreamSubscriber {
         this.finish("max_age", controlEvent("reconnect", { reconnectMs: 5000 }));
       }, options.settings.streamMaxSeconds * 1000),
     );
-    const reauthorize = async () => {
-      try {
-        if (!(await options.reauthorize())) {
-          this.finish("reauth", controlEvent("error", { code: "unauthorized" }));
-        }
-      } catch {
+    this.scheduleReauthorization();
+    for (const timer of this.timers) timer.unref();
+  }
+
+  private scheduleReauthorization(): void {
+    this.reauthorizationTimer = setTimeout(() => {
+      void this.reauthorize();
+    }, 60_000).unref();
+  }
+
+  private async reauthorize(): Promise<void> {
+    try {
+      if (!(await this.options.reauthorize())) {
         this.finish("reauth", controlEvent("error", { code: "unauthorized" }));
       }
-      if (!this.closed)
-        this.reauthorizationTimer = setTimeout(() => {
-          void reauthorize();
-        }, 60_000).unref();
-    };
-    this.reauthorizationTimer = setTimeout(() => {
-      void reauthorize();
-    }, 60_000).unref();
-    for (const timer of this.timers) timer.unref();
+    } catch {
+      this.finish("reauth", controlEvent("error", { code: "unauthorized" }));
+    }
+    if (!this.closed) this.scheduleReauthorization();
+  }
+
+  private async pull(): Promise<void> {
+    await Promise.race([
+      this.produce().catch((error: unknown) => {
+        this.options.reportFailure(error);
+        this.finish("error", controlEvent("error", { code: "infrastructure_unavailable" }));
+      }),
+      this.done.promise,
+    ]);
+  }
+
+  private async produce(): Promise<void> {
+    const options = this.options;
+    while (!this.closed) {
+      if (this.index < this.page.length) {
+        const { run } = options.context;
+        const current = await options.store.findTriggerRunForOrganization(
+          run.organizationId,
+          run.id,
+        );
+        this.sendCurrentRow(current);
+        return;
+      }
+      if (this.resetPageAndPing()) return;
+      const version = options.notifier.version;
+      const context = await this.readContext();
+      if (this.closed || context === undefined) return;
+      const page = await (this.initialPage ?? options.notifier.page(this.cursor));
+      this.initialPage = undefined;
+      if (this.closed) return;
+      if (page.length > 0) {
+        this.page = page;
+        continue;
+      }
+      if (this.finishIfSealed(context)) return;
+      await options.notifier.wait(version, this.abort.signal);
+    }
+  }
+
+  private resetPageAndPing(): boolean {
+    this.page = [];
+    this.index = 0;
+    if (!this.ping) return false;
+    this.ping = false;
+    this.enqueue(": ping\n\n");
+    return true;
+  }
+
+  private sendCurrentRow(
+    current: Awaited<ReturnType<RunTimelineStore["findTriggerRunForOrganization"]>>,
+  ): void {
+    if (this.closed) return;
+    if (current?.outcome !== "accepted") {
+      this.finish("error", controlEvent("error", { code: "run_not_found" }));
+      return;
+    }
+    if (current.payloadExpiredAt != null) {
+      this.finish("error", controlEvent("error", { code: "timeline_expired" }));
+      return;
+    }
+    const row = this.page[this.index++];
+    if (row === undefined)
+      throw new TypeError("Cannot read properties of undefined (reading 'seq')");
+    if (
+      this.enqueue(
+        `id: ${row.seq}\nevent: ${row.kind}\ndata: ${JSON.stringify({
+          seq: row.seq,
+          kind: row.kind,
+          at: row.at,
+          stepId: row.stepId,
+          data: row.data,
+        })}\n\n`,
+      )
+    ) {
+      this.cursor = row.seq;
+      this.eventsSent += 1;
+    }
+  }
+
+  private finishIfSealed({ run, state }: StreamContext): boolean {
+    if (run.status === "running" || state?.sealedSeq == null || !(this.cursor >= state.sealedSeq))
+      return false;
+    this.finish(
+      "end",
+      controlEvent("end", {
+        status: run.status,
+        lastSeq: state.eventCount,
+        sealedSeq: state.sealedSeq,
+        stepRowsOmitted: state.stepRowsOmitted,
+      }),
+    );
+    return true;
   }
 
   finish(reason: StreamCloseReason, frame?: string): void {
@@ -241,16 +268,7 @@ export class RunStreamSubscriber {
       this.finish("error", controlEvent("error", { code: "run_not_found" }));
       return undefined;
     }
-    if (
-      isRunTimelineExpired(
-        {
-          completedAt: run.completedAt,
-          expiredAt: state?.expiredAt ?? null,
-          payloadExpiredAt: run.payloadExpiredAt,
-        },
-        retentionCutoff(new Date(), settings.retentionDays),
-      )
-    ) {
+    if (timelineExpired(run, state, settings)) {
       this.finish("error", controlEvent("error", { code: "timeline_expired" }));
       return undefined;
     }
@@ -261,4 +279,19 @@ export class RunStreamSubscriber {
     }
     return { run, state };
   }
+}
+
+function timelineExpired(
+  run: AcceptedTriggerRunRecord,
+  state: RunTimelineState | undefined,
+  settings: RunProgressSettings,
+): boolean {
+  return isRunTimelineExpired(
+    {
+      completedAt: run.completedAt,
+      expiredAt: state?.expiredAt ?? null,
+      payloadExpiredAt: run.payloadExpiredAt,
+    },
+    retentionCutoff(new Date(), settings.retentionDays),
+  );
 }

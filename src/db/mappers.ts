@@ -226,24 +226,54 @@ function toOutputDeliveryAttempts(
   if (!isRecord(value)) return {};
   const attempts: Record<string, AgentExecutionOutputAttempt> = {};
   for (const [id, raw] of Object.entries(value)) {
-    if (!isRecord(raw)) continue;
-    const outputType = raw["outputType"];
-    const status = raw["status"];
-    const startedAt = toDate(raw["startedAt"]);
-    const leaseExpiresAt = toDate(raw["leaseExpiresAt"]);
-    const completedAt = raw["completedAt"] === null ? null : toDate(raw["completedAt"]);
-    if (
-      typeof outputType !== "string" ||
-      (status !== "pending" && status !== "succeeded" && status !== "failed") ||
-      startedAt === undefined ||
-      leaseExpiresAt === undefined ||
-      (raw["completedAt"] !== null && completedAt === undefined)
-    ) {
-      continue;
-    }
-    attempts[id] = { id, outputType, status, startedAt, leaseExpiresAt, completedAt: completedAt! };
+    const attempt = toOutputDeliveryAttempt(id, raw);
+    if (attempt !== undefined) attempts[id] = attempt;
   }
   return attempts;
+}
+
+function isOutputAttemptStatus(value: unknown): value is AgentExecutionOutputAttempt["status"] {
+  return value === "pending" || value === "succeeded" || value === "failed";
+}
+
+function toOutputDeliveryAttempt(
+  id: string,
+  raw: unknown,
+): AgentExecutionOutputAttempt | undefined {
+  if (!isRecord(raw)) return undefined;
+  const outputType = raw["outputType"];
+  const status = raw["status"];
+  const startedAt = toDate(raw["startedAt"]);
+  const leaseExpiresAt = toDate(raw["leaseExpiresAt"]);
+  const completedAt = raw["completedAt"] === null ? null : toDate(raw["completedAt"]);
+  if (
+    typeof outputType !== "string" ||
+    !isOutputAttemptStatus(status) ||
+    startedAt === undefined ||
+    leaseExpiresAt === undefined ||
+    (raw["completedAt"] !== null && completedAt === undefined)
+  ) {
+    return undefined;
+  }
+  const attempt = {
+    id,
+    outputType,
+    status,
+    startedAt,
+    leaseExpiresAt,
+    completedAt: completedAt ?? null,
+  };
+  preserveObservedCompletion(attempt, completedAt);
+  return attempt;
+}
+
+function preserveObservedCompletion(
+  attempt: AgentExecutionOutputAttempt,
+  completedAt: Date | null | undefined,
+) {
+  // A getter can return null only on the later validation read.
+  if (completedAt === undefined)
+    Object.defineProperty(attempt, "completedAt", { value: undefined });
 }
 
 function toDate(value: unknown): Date | undefined {
@@ -257,23 +287,7 @@ function toAgentExecutionHubAcknowledgements(value: unknown): AgentExecutionHubA
   if (!isRecord(value)) return emptyAgentExecutionHubAcknowledgements();
   const terminalAt = toDateOrNull(value["terminal_at"]);
   const idleAt = toDateOrNull(value["idle_at"]);
-  const rawFinishExecutionCall = value["finish_execution_call"];
-  let finishExecutionCall: AgentExecutionHubAcknowledgements["finishExecutionCall"] = null;
-  if (isRecord(rawFinishExecutionCall)) {
-    const callId = rawFinishExecutionCall["call_id"];
-    const status = rawFinishExecutionCall["status"];
-    const observedAt = toDateOrNull(rawFinishExecutionCall["observed_at"]);
-    if (
-      (typeof callId === "string" || callId === null || callId === undefined) &&
-      (status === "running" ||
-        status === "completed" ||
-        status === "failed" ||
-        status === "canceled") &&
-      observedAt !== null
-    ) {
-      finishExecutionCall = { callId: callId ?? null, status, observedAt };
-    }
-  }
+  const finishExecutionCall = readFinishExecutionCall(value["finish_execution_call"]);
   const stopInterruptGeneration = value["stop_interrupt_generation"];
   return {
     terminalAt,
@@ -281,6 +295,26 @@ function toAgentExecutionHubAcknowledgements(value: unknown): AgentExecutionHubA
     finishExecutionCall,
     ...(typeof stopInterruptGeneration === "string" ? { stopInterruptGeneration } : {}),
   };
+}
+
+function readFinishExecutionCall(
+  raw: unknown,
+): AgentExecutionHubAcknowledgements["finishExecutionCall"] {
+  if (!isRecord(raw)) return null;
+  const callId = raw["call_id"];
+  const status = raw["status"];
+  const observedAt = toDateOrNull(raw["observed_at"]);
+  if (
+    (typeof callId === "string" || callId == null) &&
+    (status === "running" ||
+      status === "completed" ||
+      status === "failed" ||
+      status === "canceled") &&
+    observedAt !== null
+  ) {
+    return { callId: callId ?? null, status, observedAt };
+  }
+  return null;
 }
 
 function emptyAgentExecutionHubAcknowledgements(): AgentExecutionHubAcknowledgements {

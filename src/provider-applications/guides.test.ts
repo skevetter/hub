@@ -364,15 +364,19 @@ test("no guide leaks Paseo's internal vocabulary into operator-facing copy", () 
       guide.httpsRequirement(LOCAL),
     );
     for (const origin of [ORIGIN, LOCAL]) {
-      for (const group of guideGroups(guide, origin)) {
-        phrases.push(group.title ?? "", group.description ?? "", group.unavailable ?? "");
-        for (const step of group.steps) phrases.push(stepText(step));
-        for (const field of group.fields) {
-          phrases.push(field.label, field.description ?? "", field.required);
-        }
-      }
+      for (const group of guideGroups(guide, origin)) collectGroupPhrases(group, phrases);
     }
   }
   const copy = phrases.join(" ").toLowerCase();
   for (const term of forbidden) assert.ok(!copy.includes(term), `copy mentions "${term}"`);
 });
+function collectGroupPhrases(
+  group: ReturnType<typeof guideGroups>[number],
+  phrases: string[],
+): void {
+  phrases.push(group.title ?? "", group.description ?? "", group.unavailable ?? "");
+  for (const step of group.steps) phrases.push(stepText(step));
+  for (const field of group.fields) {
+    phrases.push(field.label, field.description ?? "", field.required);
+  }
+}

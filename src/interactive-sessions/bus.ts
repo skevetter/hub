@@ -64,13 +64,17 @@ export class SessionEventBus {
     if (!listeners) return;
     for (const listener of Array.from(listeners)) {
       if (!listeners.has(listener)) continue;
+      this.notify(listener, notification);
+    }
+  }
+
+  private notify(listener: Listener, notification: SessionNotification): void {
+    try {
+      listener(notification);
+    } catch (error) {
       try {
-        listener(notification);
-      } catch (error) {
-        try {
-          this.reportFailure?.(error);
-        } catch {}
-      }
+        this.reportFailure?.(error);
+      } catch {}
     }
   }
 
@@ -107,10 +111,7 @@ export class SessionEventBus {
         epoch,
         items: [],
         bytes: 0,
-        evictedThrough:
-          item.kind === "assistant" && item.chunkStart !== undefined
-            ? { seq: item.seq, chunkOffset: item.chunkStart }
-            : { seq: item.seq - 1 },
+        evictedThrough: positionBefore(item),
         eviction: buffer?.eviction,
       };
       this.agentBuffers.set(sessionId, buffer);
@@ -120,14 +121,26 @@ export class SessionEventBus {
     const bytes = Buffer.byteLength(JSON.stringify(item));
     buffer.items.push({ item: structuredClone(item), bytes });
     buffer.bytes += bytes;
-    while (buffer.items.length > MAX_AGENT_ITEMS || buffer.bytes > MAX_AGENT_BYTES) {
-      const removed = buffer.items.shift()!;
-      buffer.bytes -= removed.bytes;
-      const offset = removed.item.kind === "assistant" ? removed.item.chunkOffset : undefined;
-      buffer.evictedThrough = {
-        seq: removed.item.seq,
-        ...(offset === undefined ? {} : { chunkOffset: offset }),
-      };
-    }
+    trimAgentBuffer(buffer);
+  }
+}
+
+function positionBefore(item: TranscriptItem): AgentPosition {
+  return item.kind === "assistant" && item.chunkStart !== undefined
+    ? { seq: item.seq, chunkOffset: item.chunkStart }
+    : { seq: item.seq - 1 };
+}
+
+function trimAgentBuffer(buffer: AgentBuffer): void {
+  while (buffer.items.length > MAX_AGENT_ITEMS || buffer.bytes > MAX_AGENT_BYTES) {
+    const removed = buffer.items.shift();
+    if (removed === undefined)
+      throw new TypeError("Cannot read properties of undefined (reading 'bytes')");
+    buffer.bytes -= removed.bytes;
+    const offset = removed.item.kind === "assistant" ? removed.item.chunkOffset : undefined;
+    buffer.evictedThrough = {
+      seq: removed.item.seq,
+      ...(offset === undefined ? {} : { chunkOffset: offset }),
+    };
   }
 }

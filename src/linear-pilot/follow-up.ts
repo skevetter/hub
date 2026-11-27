@@ -341,10 +341,16 @@ async function startFreshFollowUp(
   if (proofIsStop && !(await options.confirmStop(scope, prior.stop)))
     return followUpResult("ignored", "stop_unverified");
   const page = await options.readHistory(scope, verified, PILOT_HISTORY_PAGE_SIZE);
-  const prompt = composePilotPrompt(scope, message, verified, page, {
-    ...(proofIsStop ? { confirmedStopId: prior.stop } : { confirmedResponseId: prior.response }),
-    secrets: await options.secrets(scope),
-    idsFor: (id) => options.activityIds(scope.nativeSessionId, id),
+  const prompt = composePilotPrompt({
+    scope,
+    message,
+    current: verified,
+    page,
+    context: {
+      ...(proofIsStop ? { confirmedStopId: prior.stop } : { confirmedResponseId: prior.response }),
+      secrets: await options.secrets(scope),
+      idsFor: (id) => options.activityIds(scope.nativeSessionId, id),
+    },
   });
   if (prompt === undefined) return followUpResult("ignored", "history_unusable");
   return dispatchFresh(options, admission, prompt);
