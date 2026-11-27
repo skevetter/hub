@@ -1,6 +1,6 @@
 /* oxlint-disable eslint-plugin-react-perf/jsx-no-new-function-as-prop, eslint-plugin-react-perf/jsx-no-new-object-as-prop, eslint-plugin-react-perf/jsx-no-new-array-as-prop, eslint-plugin-react-perf/jsx-no-jsx-as-prop -- the controls bind one trigger form */
 import { Plus } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { Card } from "../components/app/card.js";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
@@ -27,6 +27,7 @@ import {
   StepLimitFields,
   StepScriptFields,
   agentStepDescription,
+  useFlaggedOpen,
   type StepAgentProps,
 } from "./step-fields.js";
 import {
@@ -34,17 +35,25 @@ import {
   outputReferences,
   patchStepAt,
   reorderRowKeys,
+  reservedStepIdError,
   staleRunIfError,
   stepAt,
   stepFieldId,
   stepFieldKey,
+  stepNeedsAttention,
+  stepSummary,
   type TriggerFieldProps,
 } from "./step-form-model.js";
+import { selectedProviderModel } from "./provider-catalog.js";
 
 export interface StepRows {
   keys: readonly string[];
   error: string | undefined;
   status: string;
+  /** The row being edited. Every other row is a one-line summary unless something needs attention. */
+  active: string;
+  activate: (key: string) => void;
+  open: (index: number) => void;
   add: () => void;
   move: (from: number, to: number) => void;
   remove: (index: number) => void;
@@ -84,6 +93,15 @@ function useStepFocus() {
   return setFocus;
 }
 
+function activeAfter(change: StepListChange, keys: readonly string[], next: readonly string[]) {
+  if (change.kind === "move") return keys[change.from];
+  return next[Math.min(change.index, next.length - 1)];
+}
+
+function menuAfter(change: StepListChange, count: number): number {
+  return change.kind === "remove" ? Math.min(change.index, count - 1) : change.to;
+}
+
 function editStatus(change: StepListChange, count: number): string {
   return change.kind === "remove"
     ? `Step removed. ${stepCount(count - 1)}.`
@@ -104,6 +122,7 @@ export function useStepRows({
   const [stored, setStored] = useState(() =>
     form.steps.map((_, position) => `row-${String(position)}`),
   );
+  const [active, setActive] = useState(() => stored[0] ?? "");
   const [refusal, setRefusal] = useState<Refusal>();
   const [status, setStatus] = useState("");
   const setFocus = useStepFocus();
@@ -112,6 +131,7 @@ export function useStepRows({
     const message = stepListEditError(form, change);
     if (message !== undefined) {
       setRefusal({ message, form });
+      setActive(keys[change.kind === "move" ? change.from : change.index] ?? active);
       return;
     }
     const next =
@@ -119,18 +139,19 @@ export function useStepRows({
         ? removeStep(form, change.index)
         : moveStep(form, change.from, change.to);
     if (next === form) return;
-    setStored(reorderRowKeys(keys, change));
+    const nextKeys = reorderRowKeys(keys, change);
+    setStored(nextKeys);
+    setActive(activeAfter(change, keys, nextKeys) ?? active);
     onChange(next);
     setStatus(editStatus(change, form.steps.length));
-    const index =
-      change.kind === "remove" ? Math.min(change.index, next.steps.length - 1) : change.to;
-    setFocus({ target: "menu", index });
+    setFocus({ target: "menu", index: menuAfter(change, next.steps.length) });
   };
   const add = () => {
     const next = addStep(form);
     if (next === form) return;
     counter.current += 1;
     setStored([...keys, `row-${String(counter.current)}`]);
+    setActive(`row-${String(counter.current)}`);
     onChange(next);
     onAdd();
     setStatus(`Step added. ${stepCount(next.steps.length)}.`);
@@ -140,6 +161,12 @@ export function useStepRows({
     keys,
     error: refusal?.form === form ? refusal.message : undefined,
     status,
+    active: keys.includes(active) ? active : (keys[0] ?? ""),
+    activate: setActive,
+    open: (index) => {
+      setActive(keys[index] ?? active);
+      setFocus({ target: "id", index });
+    },
     add,
     move: (from, to) => edit({ kind: "move", from, to }),
     remove: (index) => edit({ kind: "remove", index }),
@@ -160,16 +187,29 @@ export function StepBody(props: StepAgentProps & { hasDaemon: boolean }) {
 }
 
 export function StepCard(props: StepAgentProps & { hasDaemon: boolean; rows: StepRows }) {
-  const { rows, ...body } = props;
-  const { form, index, hasDaemon } = body;
+  const { rows, ...fields } = props;
+  const { form, errors, index, hasDaemon } = fields;
   const step = stepAt(form, index);
+  const key = rows.keys[index] ?? "";
   const name = step.id.trim() === "" ? "Unnamed step" : step.id;
+  const menu = <StepMenu index={index} count={form.steps.length} name={name} rows={rows} />;
+  const label = `Step ${String(index + 1)}: ${name}`;
+  if (key !== rows.active && !stepNeedsAttention(form, errors, index)) {
+    return <CollapsedStep {...fields} rows={rows} label={label} name={name} menu={menu} />;
+  }
+  const body = {
+    ...fields,
+    onChange: (next: TriggerFormValue) => {
+      rows.activate(key);
+      fields.onChange(next);
+    },
+  };
   const description = agentStepDescription(step.action === "script", hasDaemon);
   return (
     <Card
-      label={`Step ${String(index + 1)}: ${name}`}
+      label={label}
       title={name}
-      action={<StepMenu index={index} count={form.steps.length} name={name} rows={rows} />}
+      action={menu}
       {...(description === undefined ? {} : { description })}
     >
       <StepIdField {...body} />
@@ -182,9 +222,43 @@ export function StepCard(props: StepAgentProps & { hasDaemon: boolean; rows: Ste
   );
 }
 
+/** What a step that is not being edited shows, on one row: what it runs, and a way back in. */
+function CollapsedStep(
+  props: StepAgentProps & { rows: StepRows; label: string; name: string; menu: ReactNode },
+) {
+  const { rows, label, name, menu, ...fields } = props;
+  const { form, index, providerCatalog } = fields;
+  const step = stepAt(form, index);
+  const model = selectedProviderModel(providerCatalog.entries, step.agent).model?.label;
+  const summary = stepSummary(step, model);
+  return (
+    <section
+      aria-label={label}
+      className="flex min-w-0 items-center gap-3 rounded-sm border bg-card px-6 py-3"
+    >
+      <h2 className="max-w-[40%] shrink-0 truncate text-sm text-foreground">{name}</h2>
+      <p className="min-w-0 flex-1 truncate font-mono text-sm text-muted-foreground">{summary}</p>
+      {step.runIf === "" ? null : (
+        <span className="shrink-0 text-xs text-muted-foreground">Condition</span>
+      )}
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        aria-label={`Edit step ${String(index + 1)}`}
+        onClick={() => rows.open(index)}
+      >
+        Edit
+      </Button>
+      {menu}
+    </section>
+  );
+}
+
 function StepIdField(props: TriggerFieldProps & { index: number }) {
   const { form, errors, onChange, index } = props;
   const key = stepFieldKey(index, "id");
+  const error = errors[key] ?? reservedStepIdError(stepAt(form, index).id);
   return (
     <FormField
       id={stepFieldId("trigger-step-id", index)}
@@ -196,7 +270,7 @@ function StepIdField(props: TriggerFieldProps & { index: number }) {
       onChange={(id) => onChange(patchStepAt(form, index, { id }))}
       required
       {...sharedYamlField(form, key)}
-      {...fieldError(errors, key)}
+      {...(error === undefined ? {} : { error })}
     />
   );
 }
@@ -254,10 +328,7 @@ function StepConditionFields(props: StepAgentProps) {
   const ifError = errors[ifKey] ?? stale;
   const schemaError = errors[schemaKey];
   const flagged = ifError !== undefined || schemaError !== undefined;
-  const [open, setOpen] = useState(step.runIf !== "" || step.outputSchema !== "");
-  useEffect(() => {
-    if (flagged) setOpen(true);
-  }, [flagged]);
+  const [open, setOpen] = useFlaggedOpen(flagged, step.runIf !== "" || step.outputSchema !== "");
   const agent = step.action === "prompt";
   return (
     <Disclosure

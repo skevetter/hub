@@ -1,6 +1,13 @@
 /* oxlint-disable eslint-plugin-react-perf/jsx-no-new-function-as-prop, eslint-plugin-react-perf/jsx-no-new-object-as-prop, eslint-plugin-react-perf/jsx-no-new-array-as-prop -- the controls bind one trigger form */
 import { MessageSquareText, SquareTerminal } from "lucide-react";
-import { useLayoutEffect, useRef, useState, type ComponentProps, type ReactElement } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ComponentProps,
+  type ReactElement,
+} from "react";
 
 import { CheckboxField } from "../components/app/checkbox-field.js";
 import { Combobox, type ComboboxOption } from "../components/app/combobox.js";
@@ -45,6 +52,23 @@ function stepUpdate({ form, onChange, index }: StepFieldProps): StepFieldUpdate 
 }
 
 /** The field's own error slot and its YAML-sharing state, both keyed by this step. */
+/** Whether any of these fields of the step carries an error the reader has to see. */
+function stepHasError(props: StepFieldProps, fields: readonly TriggerStepField[]): boolean {
+  return fields.some((field) => props.errors[stepFieldKey(props.index, field)] !== undefined);
+}
+
+/**
+ * A section that holds a flagged field is open, including when the step it belongs to is drawn
+ * again after being a one-line summary.
+ */
+export function useFlaggedOpen(flagged: boolean, initial: boolean) {
+  const [open, setOpen] = useState(initial || flagged);
+  useEffect(() => {
+    if (flagged) setOpen(true);
+  }, [flagged]);
+  return [open, setOpen] as const;
+}
+
 function stepFieldState(props: StepFieldProps, field: TriggerStepField) {
   const key = stepFieldKey(props.index, field);
   return { ...sharedYamlField(props.form, key), ...fieldError(props.errors, key) };
@@ -363,7 +387,10 @@ function StepPromptFields(props: StepFieldProps) {
   const { form, index } = props;
   const step = stepAt(form, index);
   const update = stepUpdate(props);
-  const [optionsExpanded, setOptionsExpanded] = useState(false);
+  const [optionsExpanded, setOptionsExpanded] = useFlaggedOpen(
+    stepHasError(props, ["providerOptions"]),
+    false,
+  );
   return (
     <>
       <PromptEditor
@@ -492,10 +519,20 @@ function PromptMergeTags({
   );
 }
 
+const GITHUB_FIELDS = [
+  "githubConnection",
+  "githubRepositories",
+  "githubPermissions",
+  "githubDuration",
+] as const;
+
 function StepGitHubFields(props: StepFieldProps & { connections: TriggerSnapshot["connections"] }) {
   const { form, index, connections } = props;
   const step = stepAt(form, index);
-  const [expanded, setExpanded] = useState(step.githubConnection !== "");
+  const [expanded, setExpanded] = useFlaggedOpen(
+    stepHasError(props, GITHUB_FIELDS),
+    step.githubConnection !== "",
+  );
   const update = stepUpdate(props);
   const options = [
     { value: "", label: "Do not inject a GitHub token" },
