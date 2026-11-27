@@ -1,6 +1,8 @@
 def filtered($pattern):
   if type == "string" and test("\\A(?:" + $pattern + ")\\z") then . else null end;
-def version: filtered("^[0-9]+\\.[0-9]+\\.[0-9]+(-notifications\\.[0-9]+)?$");
+def version:
+  "(0|[1-9][0-9]*)" as $part |
+  filtered([$part, $part, $part] | join("\\.") + "|0\\.11\\.0-notifications\\." + $part);
 def number: if type == "number" then . else null end;
 def boolean: if type == "boolean" then . else null end;
 def reason: filtered("refused|paused|not-newer|no-space|install-running|no-previous|no-tarball");

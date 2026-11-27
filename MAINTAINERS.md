@@ -60,21 +60,28 @@ Automatic deploys take a backup, install, and check the service. A failed smoke 
 and pauses deployment. Mark incompatible migrations and persisted data changes `rollback-unsafe`
 on the PR. The pipeline publishes held releases as prereleases. It keeps the hold on subsequent
 releases until a successful manual deploy promotes a prerelease. A held prerelease never rolls
-back automatically. A manual dispatch of a stable release can roll back. Only the repository owner
-can unpause. See the `cd-alert` issues for failed or held
-releases.
+back automatically. A manual dispatch of a stable release can roll back automatically. Only the
+repository owner can run `cd-control rollback` or `unpause`. See the `cd-alert` issues for failed
+or held releases.
 
 ### Deployment runbook
 
 1. The first release after the legacy baseline is held without scanning historical migrations or
    PR labels. Run `cd-control status` and `selftest`, then `unpause`. Dispatch
    [Main](.github/workflows/main.yml) from `main` with the held release's exact SHA.
-2. After an automatic rollback and pause, run `cd-control unpause`, then use **Re-run failed jobs**
-   on the run that holds the fix. Dispatching the SHA already recorded as running only runs smoke.
-3. The workflow refuses older releases. Roll forward with a revert, or have an administrator
-   run `rollback` through `sudo` on the host. A main push waits for the running main deploy,
-   whose job can take up to 55 minutes.
-4. With squash merges, put `!` in the Conventional Commit title for a major bump. The squash
+2. If the first deploy or a later held release fails before it is recorded, dispatch `rollback`
+   in [CD control](.github/workflows/cd-control.yml) from `main`. The job waits for recovery and
+   runs host smoke on the restored version, which can be the bootstrap build. Check the step
+   summary. Deploys stay paused even if rollback fails.
+3. If the workflow is unavailable, an administrator can run
+   `sudo /usr/local/sbin/hub-deploy-root rollback` on the host. Run
+   `sudo /usr/local/sbin/hub-deploy-root wait 60` until it reports `done`; stop on `failed`.
+   Then run `sudo /usr/local/sbin/hub-deploy-root smoke <previous>` with the rollback reply's
+   `to` version. Leave deploys paused while investigating.
+4. Once the fix or revert is ready, run `cd-control unpause`, then use **Re-run failed jobs**
+   on the run that holds the fix. The workflow refuses older releases. Dispatching the SHA
+   already recorded as running only runs smoke.
+5. With squash merges, put `!` in the Conventional Commit title for a major bump. The squash
    commit has no breaking-change footer.
 
 ### Accepted limits

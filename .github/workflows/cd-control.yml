@@ -7,7 +7,7 @@ on:
         description: Production control command
         type: choice
         required: true
-        options: [status, pause, unpause, selftest]
+        options: [status, pause, unpause, rollback, selftest]
 
 permissions: {}
 
@@ -16,11 +16,14 @@ jobs:
     name: control
     if: >-
       github.ref == 'refs/heads/main' && github.repository == 'skevetter/hub' &&
-      (inputs.action != 'unpause' ||
+      ((inputs.action != 'unpause' && inputs.action != 'rollback') ||
       (github.actor == github.repository_owner && github.triggering_actor == github.repository_owner))
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: ${{ inputs.action == 'rollback' && 35 || 5 }}
     environment: production
+    concurrency:
+      group: ${{ (inputs.action == 'rollback' || inputs.action == 'unpause') && 'deploy-production' || format('cd-control-{0}', github.run_id) }}
+      cancel-in-progress: false
     permissions:
       contents: read
     steps:
@@ -31,7 +34,7 @@ jobs:
         run: |
           [[ "$GITHUB_REPOSITORY" == skevetter/hub && "$GITHUB_REF" == refs/heads/main ]]
           [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
-          if [[ "$CONTROL_ACTION" == unpause ]]; then
+          if [[ "$CONTROL_ACTION" == unpause || "$CONTROL_ACTION" == rollback ]]; then
             [[ "$GITHUB_ACTOR" == "$GITHUB_REPOSITORY_OWNER" && "$TRIGGERING_ACTOR" == "$GITHUB_REPOSITORY_OWNER" ]]
           fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -56,7 +59,7 @@ jobs:
           VPS2_SSH_PORT: ${{ secrets.VPS2_SSH_PORT }}
         run: |
           case "$CONTROL_ACTION" in
-            status|pause|unpause|selftest) bash scripts/cd/deploy.sh "$CONTROL_ACTION" ;;
+            status|pause|unpause|rollback|selftest) bash scripts/cd/deploy.sh "$CONTROL_ACTION" ;;
             *) exit 2 ;;
           esac
       - name: Remove SSH credentials

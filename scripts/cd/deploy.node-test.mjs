@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,7 +18,14 @@ if [[ "$command" == "$SLOW_CALL" ]]; then
   printf '%s\\n' slow-reply >> "$RUNNER_TEMP/calls"
 fi
 case "$command" in
-  status) echo "{\\"ok\\":true,\\"commit\\":$RUNNING,\\"private\\":\\"$VPS2_SSH_HOST\\",\\"version\\":\\"1.0.0\\\\n$VPS2_SSH_HOST\\"}" ;;
+  status)
+    if grep -qx rollback "$RUNNER_TEMP/calls"; then
+      jq -cn --arg version "\${STATUS_VERSION:-\${ROLLBACK_TO:-1.0.0}}" \\
+        --argjson paused "$(test -f "$RUNNER_TEMP/paused" && echo true || echo false)" \\
+        '{ok:true, commit:null, version:$version, previous_version:null, paused:$paused}'
+    else
+      echo "{\\"ok\\":true,\\"commit\\":$RUNNING,\\"private\\":\\"$VPS2_SSH_HOST\\",\\"version\\":\\"1.0.0\\\\n$VPS2_SSH_HOST\\"}"
+    fi ;;
   backup*) echo '{"ok":true,"entries":5,"bytes":99,"file":"/private/database.dump"}' ;;
   install*)
     if [[ "$REFUSE_INSTALL" == yes ]]; then echo '{"ok":false,"reason":"refused"}'; exit 2; fi
@@ -36,25 +43,33 @@ case "$command" in
     if ! grep -qx rollback "$RUNNER_TEMP/calls"; then
       case "$WAIT" in
         running) echo '{"ok":false,"state":"running"}'; exit 5 ;;
-        failed) echo '{"ok":false,"state":"failed","code":"interrupted"}'; exit 3 ;;
+        failed) echo cd-failed > "$RUNNER_TEMP/paused"
+          echo '{"ok":false,"state":"failed","code":"interrupted"}'; exit 3 ;;
+        pre-swap) echo '{"ok":false,"state":"failed","code":"download"}'; exit 3 ;;
         invalid) echo '{"ok":false,"state":"failed","code":"ok"}'; exit 3 ;;
       esac
     fi
-    echo '{"ok":true,"state":"done"}' ;;
+    if grep -qx rollback "$RUNNER_TEMP/calls"; then echo cd-failed > "$RUNNER_TEMP/paused"; fi
+    echo '{"ok":true,"state":"done","operation":"rollback"}' ;;
   wait*) echo '{"ok":true,"state":"done"}' ;;
   record*) if [[ "$RECORD_FAIL" == yes ]]; then echo '{"ok":false}'; exit 4; fi
     echo '{"ok":true}' ;;
   pause*)
     [[ " $* " == *" ConnectTimeout=5 "* ]] || exit 4
     node -p 'Date.now()' > "$RUNNER_TEMP/pause-time"
+    printf '%s\\n' "\${command#pause }" > "$RUNNER_TEMP/paused"
     echo '{"ok":true}' ;;
   smoke\\ 1.1.0)
     if [[ "$SMOKE_FAIL" == yes ]]; then echo '{"ok":false,"checks":{"local_health":false}}'; exit 3; fi
     echo '{"ok":true,"checks":{"local_health":true}}' ;;
-  rollback) echo '{"ok":true,"to":"1.0.0"}' ;;
-  smoke\\ 1.0.0)
+  rollback)
+    if [[ "$REFUSE_ROLLBACK" == yes ]]; then echo '{"ok":false,"reason":"no-previous"}'; exit 2; fi
+    jq -cn --arg to "\${ROLLBACK_TO:-1.0.0}" --argjson started "\${ROLLBACK_STARTED:-true}" \\
+      '{ok:true, started:$started, to:$to}' ;;
+  "smoke \${ROLLBACK_TO:-1.0.0}")
     if [[ "$ROLLBACK_SMOKE_FAIL" == yes ]]; then echo '{"ok":false}'; exit 3; fi
     echo '{"ok":true}' ;;
+  smoke*) echo '{"ok":false,"reason":"refused"}'; exit 2 ;;
   unknown|precheck\\ 0.0.1*|000*)
     if [[ "$ACCEPT" != yes ]]; then
       printf '{"ok":false,"reason":"%s"}\\n' "\${REFUSAL:-refused}"
@@ -90,7 +105,10 @@ function execute(action, options = {}) {
         ? ["-c", 'export DEPLOY_PID=$$; exec bash "$@"', "test", source, action]
         : action;
     const outputPath = join(temp, "output");
+    const summaryPath = join(temp, "summary");
+    const pausePath = join(temp, "paused");
     writeFileSync(outputPath, "");
+    writeFileSync(summaryPath, "");
     const result = spawnSync("bash", args, {
       encoding: "utf8",
       timeout: 10_000,
@@ -99,6 +117,7 @@ function execute(action, options = {}) {
         PATH: `${temp}:${process.env.PATH}`,
         RUNNER_TEMP: temp,
         GITHUB_OUTPUT: outputPath,
+        GITHUB_STEP_SUMMARY: summaryPath,
         RUNNING: "null",
         CD_DIR: fileURLToPath(new URL(".", import.meta.url)),
         ANCESTRY: "0",
@@ -122,7 +141,14 @@ function execute(action, options = {}) {
         ? Number(readFileSync(join(temp, "pause-time"), "utf8")) -
           Number(readFileSync(join(temp, "signal-time"), "utf8"))
         : undefined;
-    return { ...result, calls, pauseDelay, output: readFileSync(outputPath, "utf8") };
+    return {
+      ...result,
+      calls,
+      pauseDelay,
+      output: readFileSync(outputPath, "utf8"),
+      summary: readFileSync(summaryPath, "utf8"),
+      pauseReason: existsSync(pausePath) ? readFileSync(pausePath, "utf8").trim() : null,
+    };
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
@@ -218,6 +244,50 @@ test("rolls back, waits, smokes and pauses after a failed smoke", () => {
   assert.match(failed.output, /outcome=rollback-failed\n/u);
 });
 
+const bootstrap = "0.11.0-notifications.38";
+
+test("smokes the bootstrap after a rollback and repeats the host pause safely", () => {
+  const result = execute("deploy", { WAIT: "failed", ROLLBACK_TO: bootstrap });
+  assert.equal(result.status, 1);
+  assert.deepEqual(result.calls.slice(-4), ["rollback", "wait", "smoke", "pause"]);
+  assert.match(result.output, /outcome=rolled-back\n/u);
+  assert.equal(result.pauseReason, "cd-failed");
+});
+
+test("waits and smokes even when the host reports a no-op rollback", () => {
+  const result = execute("deploy", {
+    WAIT: "pre-swap",
+    ROLLBACK_TO: bootstrap,
+    ROLLBACK_STARTED: "false",
+  });
+  assert.equal(result.status, 1);
+  assert.deepEqual(result.calls.slice(-4), ["rollback", "wait", "smoke", "pause"]);
+  assert.match(result.summary, /"started":false/u);
+  assert.match(result.output, /outcome=rolled-back\n/u);
+  assert.equal(result.pauseReason, "cd-failed");
+});
+
+for (const [label, options, expectedCalls] of [
+  ["success", {}, ["pause", "rollback", "wait", "status", "smoke"]],
+  [
+    "smoke failure",
+    { ROLLBACK_SMOKE_FAIL: "yes" },
+    ["pause", "rollback", "wait", "status", "smoke"],
+  ],
+  ["refusal", { REFUSE_ROLLBACK: "yes" }, ["pause", "rollback"]],
+  ["wrong running version", { STATUS_VERSION: "1.1.0" }, ["pause", "rollback", "wait", "status"]],
+]) {
+  test(`manual rollback leaves deploys paused on ${label}`, () => {
+    const result = execute("rollback", { ROLLBACK_TO: bootstrap, ...options });
+    const success = label === "success";
+    assert.equal(result.status, success ? 0 : 1, result.stderr);
+    assert.deepEqual(result.calls, expectedCalls);
+    assert.equal(result.pauseReason, "cd-failed");
+    assert.ok(result.summary.includes(success ? "Rollback completed." : "Rollback failed."));
+    if (label === "refusal") assert.match(result.summary, /"reason":"no-previous"/u);
+  });
+}
+
 test("rolls back a dispatched stable release but never a held prerelease", () => {
   for (const PRERELEASE of ["false", "true"]) {
     const result = execute("deploy", { SMOKE_FAIL: "yes", MANUAL_DEPLOY: "true", PRERELEASE });
@@ -276,6 +346,37 @@ test("recovers from a terminal install failure and pauses on ambiguous failures"
 function call(...args) {
   return execute(["-c", 'source "$CD_DIR/ssh.sh"; cd_call "$@"', "test", ...args]);
 }
+
+test("accepts bootstrap versions only for smoke, not release-changing requests", () => {
+  for (const args of [
+    ["install", bootstrap, "a".repeat(64)],
+    ["backup", bootstrap],
+    ["precheck", bootstrap, "a".repeat(40)],
+    ["record", bootstrap, "a".repeat(40)],
+  ]) {
+    const result = call(...args);
+    assert.equal(result.status, 2);
+    assert.deepEqual(result.calls, []);
+  }
+});
+
+test("rejects malformed installed versions in smoke arguments and rollback replies", () => {
+  for (const version of [
+    "0.11.0-notifications.038",
+    "0.11.0-notifications.",
+    "0.11.0-notifications.38-extra",
+    `${bootstrap}\n`,
+    "1.0.0-notifications.38",
+  ]) {
+    const result = call("smoke", version);
+    assert.equal(result.status, 2, JSON.stringify(version));
+    assert.deepEqual(result.calls, []);
+    const rollback = execute("rollback", { ROLLBACK_TO: version });
+    assert.equal(rollback.status, 1);
+    assert.deepEqual(rollback.calls, ["pause", "rollback", "wait"]);
+    assert.match(rollback.summary, /"to":null/u);
+  }
+});
 
 test("validates wait bounds and rejects malformed arguments locally", () => {
   for (const value of ["0", "121", "060", "900", "60 60"]) {

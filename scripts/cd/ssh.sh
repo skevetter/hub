@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 cd_version='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+cd_installed_version="$cd_version"'|0\.11\.0-notifications\.(0|[1-9][0-9]*)'
 
 cd_ssh() {
   local seconds=120 connect_seconds=20 timeout_option=--kill-after=1
@@ -28,7 +29,8 @@ cd_valid() {
   [[ $# -gt 0 && ${#command} -le 256 ]] || return 1
   case "$1" in
     status|rollback|unpause) [[ $# == 1 ]] ;;
-    backup|smoke) [[ $# == 2 && "$2" =~ ^$cd_version$ ]] ;;
+    backup) [[ $# == 2 && "$2" =~ ^$cd_version$ ]] ;;
+    smoke) [[ $# == 2 && "$2" =~ ^($cd_installed_version)$ ]] ;;
     precheck|record) [[ $# == 3 && "$2" =~ ^$cd_version$ && "$3" =~ ^[0-9a-f]{40}$ ]] ;;
     install) [[ $# == 3 && "$2" =~ ^$cd_version$ && "$3" =~ ^[0-9a-f]{64}$ ]] ;;
     quiet|wait) [[ $# == 2 ]] && cd_seconds "$1" "$2" ;;

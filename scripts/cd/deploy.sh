@@ -56,7 +56,7 @@ rollback_release() {
     echo "Rollback did not complete" >&2
     return 1
   fi
-  smoke "$to" || { echo "Rollback smoke failed" >&2; return 1; }
+  "$1" "$to" || { echo "Rollback verification failed" >&2; return 1; }
 }
 
 pause_failed() {
@@ -66,7 +66,7 @@ pause_failed() {
 fail_deploy() {
   local outcome="${2:-}"
   if [[ "$1" == rollback && "${PRERELEASE:-false}" != true ]]; then
-    if rollback_release; then outcome=rolled-back; else outcome=rollback-failed; fi
+    if rollback_release smoke; then outcome=rolled-back; else outcome=rollback-failed; fi
   fi
   if [[ -n "$outcome" ]]; then mark_output outcome "$outcome" || :; fi
   pause_failed || echo "Unable to pause deployment" >&2
@@ -75,6 +75,26 @@ fail_deploy() {
 
 smoke() {
   wait_bg logged smoke "$1" >/dev/null && wait_bg external_smoke
+}
+
+verify_rollback() {
+  local status version
+  status=$(logged status) || return 1
+  version=$(jq -er --arg to "$1" 'select(.paused and .version == $to) | .version' <<< "$status") ||
+    { echo "Rollback target is not running or deploys are not paused" >&2; return 1; }
+  wait_bg logged smoke "$version" >/dev/null
+}
+
+manual_rollback() {
+  local result=completed code=0
+  if ! { pause_failed && rollback_release verify_rollback; }; then
+    result=failed
+    code=1
+  fi
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    printf '\nRollback %s.\n' "$result" >> "$GITHUB_STEP_SUMMARY" || :
+  fi
+  return "$code"
 }
 
 mark_output() {
@@ -199,6 +219,7 @@ case "${1:-deploy}" in
   status|unpause) logged "$1" >/dev/null ;;
   pause) logged pause manual-pause >/dev/null ;;
   pause-failed) pause_failed ;;
+  rollback) manual_rollback ;;
   selftest) selftest ;;
   *) exit 2 ;;
 esac
