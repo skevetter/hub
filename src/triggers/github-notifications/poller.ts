@@ -129,21 +129,7 @@ export function createGitHubNotificationPoller(options: {
         }
         const threads = oldestFirst(result.notifications);
         const outcome = await store.deliver(
-          {
-            threads,
-            limit,
-            cursor: {
-              lastModified: result.lastModified ?? cursor.lastModified,
-              since: nextSince(cursor.since, threads),
-              nextPollAt,
-            },
-            // No Last-Modified: the next poll must not answer 304 and skip the threads left over.
-            stoppedCursor: (lastDelivered) => ({
-              lastModified: null,
-              since: catchUpSince(cursor.since, lastDelivered),
-              nextPollAt,
-            }),
-          },
+          deliveryBatch(threads, cursor, nextPollAt, { lastModified: result.lastModified, limit }),
           now,
           options.onProgressRequested,
         );
@@ -153,6 +139,29 @@ export function createGitHubNotificationPoller(options: {
           ...(outcome.deferred ? { deferred: true as const } : {}),
         };
       }),
+  };
+}
+
+function deliveryBatch(
+  threads: readonly GitHubNotificationThread[],
+  cursor: NotificationCursor,
+  nextPollAt: Date,
+  { lastModified, limit }: { lastModified: string | null; limit: number },
+): DeliveryBatch {
+  return {
+    threads,
+    limit,
+    cursor: {
+      lastModified: lastModified ?? cursor.lastModified,
+      since: nextSince(cursor.since, threads),
+      nextPollAt,
+    },
+    // No Last-Modified: the next poll must not answer 304 and skip the threads left over.
+    stoppedCursor: (lastDelivered) => ({
+      lastModified: null,
+      since: catchUpSince(cursor.since, lastDelivered),
+      nextPollAt,
+    }),
   };
 }
 

@@ -61,20 +61,18 @@ export function createGitHubNotificationsClient(
       let pollIntervalSeconds: number | undefined;
       let url: string | undefined = firstPage(root, since);
       for (let page = 0; url !== undefined; page++) {
-        signal?.throwIfAborted();
-        if (page >= MAX_PAGES) {
-          throw new GitHubNotificationsError("GitHub notifications exceeded the page limit.");
-        }
-        const response = await send(
-          request,
-          url,
-          options.token,
-          page === 0 ? lastModified : null,
+        checkPageAvailable(page, signal);
+        const response = await send({
+          fetcher: request,
+          target: url,
+          token: options.token,
+          ifModifiedSince: page === 0 ? lastModified : null,
           signal,
-        );
+          scrub,
+        });
         signal?.throwIfAborted();
         pollIntervalSeconds ??= readPollInterval(response);
-        if (response.status === 304 && page === 0) {
+        if (isFirstPageNotModified(response, page)) {
           return { status: "not_modified", pollIntervalSeconds };
         }
         if (!response.ok) {
@@ -96,32 +94,53 @@ export function createGitHubNotificationsClient(
       };
     },
   };
+}
 
-  async function send(
-    fetcher: NotificationFetch,
-    target: string,
-    token: string,
-    ifModifiedSince: string | null,
-    signal: AbortSignal | undefined,
-  ): Promise<Response> {
-    const headers: Record<string, string> = {
-      accept: "application/vnd.github+json",
-      authorization: `Bearer ${token}`,
-      "x-github-api-version": API_VERSION,
-      "user-agent": "paseo-hub-github-notifications",
-    };
-    if (ifModifiedSince !== null) headers["if-modified-since"] = ifModifiedSince;
-    try {
-      return await fetcher(target, {
-        method: "GET",
-        headers,
-        ...(signal === undefined ? {} : { signal }),
-      });
-    } catch (error) {
-      signal?.throwIfAborted();
-      const reason = error instanceof Error ? error.message : "request failed";
-      throw new GitHubNotificationsError(scrub(`GitHub notifications request failed: ${reason}`));
-    }
+function checkPageAvailable(page: number, signal: AbortSignal | undefined): void {
+  signal?.throwIfAborted();
+  if (page >= MAX_PAGES) {
+    throw new GitHubNotificationsError("GitHub notifications exceeded the page limit.");
+  }
+}
+
+function isFirstPageNotModified(response: Response, page: number): boolean {
+  return response.status === 304 && page === 0;
+}
+
+interface SendOptions {
+  fetcher: NotificationFetch;
+  target: string;
+  token: string;
+  ifModifiedSince: string | null;
+  signal: AbortSignal | undefined;
+  scrub: (text: string) => string;
+}
+
+async function send({
+  fetcher,
+  target,
+  token,
+  ifModifiedSince,
+  signal,
+  scrub,
+}: SendOptions): Promise<Response> {
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    authorization: `Bearer ${token}`,
+    "x-github-api-version": API_VERSION,
+    "user-agent": "paseo-hub-github-notifications",
+  };
+  if (ifModifiedSince !== null) headers["if-modified-since"] = ifModifiedSince;
+  try {
+    return await fetcher(target, {
+      method: "GET",
+      headers,
+      ...(signal === undefined ? {} : { signal }),
+    });
+  } catch (error) {
+    signal?.throwIfAborted();
+    const reason = error instanceof Error ? error.message : "request failed";
+    throw new GitHubNotificationsError(scrub(`GitHub notifications request failed: ${reason}`));
   }
 }
 

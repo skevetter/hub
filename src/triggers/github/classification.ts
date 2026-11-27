@@ -78,19 +78,20 @@ function classifyPullRequest(event: NormalizedGitHubEvent): GitHubClassifiedEven
     payload.pull_request === undefined ? null : itemFor("pull_request", payload.pull_request);
   return {
     semanticEvent: pullRequestSemanticEvent(payload.action),
-    pullRequest:
-      payload.pull_request === undefined
-        ? null
-        : {
-            draft: payload.pull_request.draft ?? null,
-            headSha: payload.pull_request.head?.sha ?? null,
-          },
+    pullRequest: pullRequestStatus(payload.pull_request),
     actor: payload.sender?.login ?? "",
     text: textFor(item),
     labels: labelsFor(payload.pull_request?.labels),
     changedLabel: payload.action === "labeled" ? payload.label?.name : undefined,
     item,
   };
+}
+
+function pullRequestStatus(
+  pullRequest: ReturnType<typeof PullRequestPayloadSchema.parse>["pull_request"],
+): GitHubClassifiedEvent["pullRequest"] {
+  if (pullRequest === undefined) return null;
+  return { draft: pullRequest.draft ?? null, headSha: pullRequest.head?.sha ?? null };
 }
 
 function classifyIssueComment(event: NormalizedGitHubEvent): GitHubClassifiedEvent {
@@ -103,11 +104,15 @@ function classifyIssueComment(event: NormalizedGitHubEvent): GitHubClassifiedEve
     text: payload.comment?.body ?? "",
     labels: labelsFor(payload.issue?.labels),
     changedLabel: undefined,
-    item:
-      payload.issue === undefined
-        ? null
-        : itemFor(isPullRequest ? "pull_request" : "issue", payload.issue),
+    item: issueCommentItem(payload.issue, isPullRequest),
   };
+}
+
+function issueCommentItem(
+  issue: ReturnType<typeof IssueCommentPayloadSchema.parse>["issue"],
+  isPullRequest: boolean,
+): GitHubClassifiedItem | null {
+  return issue === undefined ? null : itemFor(isPullRequest ? "pull_request" : "issue", issue);
 }
 
 function classifyReview(event: NormalizedGitHubEvent): GitHubClassifiedEvent {
