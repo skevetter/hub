@@ -6,6 +6,8 @@ import { FAILED_RUN_FILTER } from "../triggers/run-status.js";
 import type { HomeSnapshot } from "./dashboard.js";
 import { needsYou, type NeedsYou } from "./needs-you.js";
 
+const FAILED_RUNS_SEARCH = { status: FAILED_RUN_FILTER };
+
 const LINK =
   "text-link underline underline-offset-4 max-md:inline-flex max-md:min-h-11 max-md:items-center";
 
@@ -40,7 +42,11 @@ function FailingFigure({ found: { failing }, base }: FigureProps) {
       {failing === 0 ? (
         "Last runs all finished."
       ) : (
-        <Link to={`${base}/activity?status=${FAILED_RUN_FILTER}` as never} className={LINK}>
+        <Link
+          to={`${base}/activity` as never}
+          search={FAILED_RUNS_SEARCH as never}
+          className={LINK}
+        >
           Review runs
         </Link>
       )}

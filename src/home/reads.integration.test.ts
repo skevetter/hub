@@ -9,7 +9,7 @@ import {
 import type { Database, DurableProviderEvent, OrganizationTriggerRoute } from "../db/types.js";
 import type { ProviderEventDropReasonCode } from "../triggers/drop-reason.js";
 import { compileTriggerDocument } from "../triggers/configuration/index.js";
-import { RUNS_PER_DAY_SQL } from "./runs-per-day.js";
+import { fillRunDays, listRunsPerDay, RUNS_PER_DAY_SQL } from "./runs-per-day.js";
 import { PROVIDERS, stoppedTriggers, TRIGGER_MATCHES_SQL } from "./trigger-matches.js";
 
 let pg: TimelinePostgresHarness;
@@ -377,6 +377,22 @@ describe.each(["postgres", "memory"] as const)("runs per day on %s", (engine) =>
       { day: "2026-02-02", total: 1, failed: 1 },
     ]);
     expect(await world.database.listRunsPerDay("absent", since, until)).toEqual([]);
+  });
+});
+
+describe("runs per day under a non-ISO DateStyle", () => {
+  it("keeps ISO day keys so the chart still finds its days", async () => {
+    const world = await createWorld("postgres");
+    await seedRunDays(world);
+    const { runtime } = await pg.connect({}, 1);
+    await runtime.query("set DateStyle = 'SQL, DMY'");
+    const { rows } = await runtime.query<{ shown: string }>("select current_date::text as shown");
+    expect(rows[0]?.shown).toMatch(/^\d{2}\/\d{2}\/\d{4}$/u);
+    const since = new Date("2026-02-02T00:00:00Z");
+    const until = new Date("2026-02-05T00:00:00Z");
+    const days = await listRunsPerDay(runtime, world.org, since, until);
+    expect(days.map(({ day }) => day)).toEqual(["2026-02-02", "2026-02-03", "2026-02-04"]);
+    expect(fillRunDays(days, since).slice(0, 3)).toEqual(days);
   });
 });
 

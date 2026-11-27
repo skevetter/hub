@@ -165,6 +165,9 @@ test("Home counts each thing that needs a person and links to it", async ({ hub,
     for (const [unit, name, url] of links) {
       await home.followNeedsYouLink(unit, name);
       await expect(page).toHaveURL(url);
+      if (unit === "failing") {
+        await expect(page.getByRole("combobox", { name: "Status" })).toHaveValue("unsuccessful");
+      }
       await page.goBack();
       await home.expectOpen();
     }
