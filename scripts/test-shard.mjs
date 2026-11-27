@@ -24,11 +24,14 @@ const PUBLIC_NAMES = new Set(["GITHUB_SERVER_URL", "GITHUB_API_URL", "GITHUB_GRA
 const HOST_NAMES = ["HOSTNAME", "RUNNER_NAME", "COMPUTERNAME"];
 // Vitest's JSON report keeps only error.message for a suite that fails to start, so the log's
 // typed header has to corroborate these bare messages.
-const BARE_START_TIMEOUTS = new Set([
-  "database query timed out",
-  "Connection terminated due to connection timeout",
-  "timeout exceeded when trying to connect",
-  "the database system is starting up",
+const BARE_START_TIMEOUTS = new Map([
+  ["database query timed out", /^DatabaseUnavailableError: database query timed out$/u],
+  [
+    "Connection terminated due to connection timeout",
+    /^Error: Connection terminated due to connection timeout$/u,
+  ],
+  ["timeout exceeded when trying to connect", /^Error: timeout exceeded when trying to connect$/u],
+  ["the database system is starting up", /^\w*[Ee]rror: the database system is starting up$/u],
 ]);
 const CONNECTION_TIMEOUT = /^Error: Connection terminated due to connection timeout$/u;
 // pg-pool attaches the error that ended the client as the cause of a connection timeout.
@@ -221,7 +224,8 @@ function withoutExpectedCauses(headers) {
 
 function fileMessageHeaders(fileMessage, logHeaders) {
   if (fileMessage.trim() === "") return [];
-  const corroborated = logHeaders.length > 0 && BARE_START_TIMEOUTS.has(firstLine(fileMessage));
+  const typed = BARE_START_TIMEOUTS.get(fileMessage.trim());
+  const corroborated = typed !== undefined && logHeaders.some((header) => typed.test(header));
   return corroborated ? [] : [fileMessage];
 }
 

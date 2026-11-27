@@ -331,6 +331,22 @@ test("a bare JSON message needs a matching log header", () => {
   assert.deepEqual(retryableFiles(typed, ["a.test.ts"], { root }), ["a.test.ts"]);
 });
 
+test("the log must name the same timeout and the whole message must be that timeout", () => {
+  const log = (header) => logFailureHeaders(failureLog("a.test.ts", header));
+  const retryable = (message, headers) =>
+    retryableFiles(reportOf(suiteFailure("a.test.ts", message, [])), ["a.test.ts"], {
+      root,
+      headers,
+    });
+  const query = "database query timed out";
+  assert.deepEqual(retryable(query, log("Error: timeout exceeded when trying to connect")), []);
+  assert.deepEqual(retryable(query, log("DatabaseUnavailableError: database query timed out")), [
+    "a.test.ts",
+  ]);
+  const extra = "timeout exceeded when trying to connect\n  Configuration error: wrong endpoint";
+  assert.deepEqual(retryable(extra, log("Error: timeout exceeded when trying to connect")), []);
+});
+
 test("the cause pg-pool attaches to a connection timeout is part of that failure", () => {
   const timeout = "Error: Connection terminated due to connection timeout";
   const log = (cause) =>
