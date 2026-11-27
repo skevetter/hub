@@ -73,6 +73,7 @@ import {
 import { StepLimitFields, agentStepDescription, type StepAgentProps } from "./step-fields.js";
 import {
   fieldError,
+  reservedStepIdErrors,
   saveFieldErrors,
   startsAsList,
   yamlListsSteps,
@@ -935,11 +936,15 @@ function useTriggerEditorState({
   // new trigger is not a page of errors, it is a page nobody has filled in. Once they have asked,
   // the marks stay and follow what they type.
   const [refused, setRefused] = useState(false);
-  const errors = useMemo(() => triggerFormErrors(form), [form]);
+  const errors = useMemo(
+    () => ({ ...triggerFormErrors(form), ...reservedStepIdErrors(form.steps) }),
+    [form],
+  );
   const refuse = () => setRefused(true);
   const switchMode = (next: EditorMode) =>
     switchEditorMode(next, { mode, other, setForm, setYaml, setMode, refuse });
-  const submit = editorSubmit({ mode, other, yaml, onSave: save, refuse });
+  const reservedId = Object.keys(reservedStepIdErrors(form.steps)).length > 0;
+  const submit = editorSubmit({ mode, other, yaml, onSave: save, refuse, reservedId });
   return {
     mode,
     yaml,
@@ -1020,17 +1025,19 @@ function editorSubmit({
   yaml,
   onSave,
   refuse,
+  reservedId,
 }: {
   mode: EditorMode;
   other: EditorProjection;
   yaml: string;
   onSave: (yaml: string) => void;
   refuse: () => void;
+  reservedId: boolean;
 }) {
   return (event: ChangeEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (mode === "yaml") onSave(yaml);
-    else if (other.status === "ok") onSave(other.yaml);
+    else if (!reservedId && other.status === "ok") onSave(other.yaml);
     else refuse();
   };
 }

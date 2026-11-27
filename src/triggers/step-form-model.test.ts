@@ -4,12 +4,16 @@ import {
   outputReferences,
   patchStepAt,
   reorderRowKeys,
+  reservedStepIdError,
+  reservedStepIdErrors,
   saveFieldErrors,
   staleRunIfError,
   startsAsList,
   stepAt,
   stepFieldId,
   stepFieldKey,
+  stepNeedsAttention,
+  stepSummary,
   yamlListsSteps,
 } from "./step-form-model.js";
 
@@ -103,6 +107,44 @@ describe("step form model", () => {
   it("does not flag a half-typed condition", () => {
     const typing = patchStepAt(form("a", "b"), 1, { runIf: "${{ steps." });
     expect(staleRunIfError(typing, 1)).toBeUndefined();
+  });
+
+  it("summarises a step in one line", () => {
+    const [agent] = form("a").steps;
+    const [script] = form("b").steps;
+    if (agent === undefined || script === undefined) throw new Error("no steps");
+    expect(stepSummary({ ...agent, agent: "opencode/m" }, "Model One")).toBe("Agent: Model One");
+    expect(stepSummary({ ...agent, agent: "opencode/m" }, undefined)).toBe("Agent: opencode/m");
+    expect(stepSummary(agent, undefined)).toBe("Agent: not chosen");
+    expect(
+      stepSummary(
+        { ...script, action: "script", script: "\n  npm test \nnpm run lint" },
+        undefined,
+      ),
+    ).toBe("Script: npm test");
+    expect(stepSummary({ ...script, action: "script", script: "  " }, undefined)).toBe(
+      "Script: empty",
+    );
+  });
+
+  it("keeps a step open for a flagged field, a stale condition or a reserved ID", () => {
+    const value = form("review", "fix");
+    expect(stepNeedsAttention(value, {}, 1)).toBe(false);
+    expect(stepNeedsAttention(value, { "steps.1.prompt": "Required." }, 1)).toBe(true);
+    expect(stepNeedsAttention(value, { "steps.1.continuationMode": "No." }, 0)).toBe(false);
+    const guarded = patchStepAt(value, 1, {
+      runIf: "${{ steps.review.outputs.verdict == 'fix' }}",
+    });
+    expect(stepNeedsAttention(moveStep(guarded, 1, 0), {}, 0)).toBe(true);
+    expect(stepNeedsAttention(form("constructor"), {}, 0)).toBe(true);
+  });
+
+  it("refuses only the IDs that name built-in properties", () => {
+    expect(reservedStepIdError("prototype")).toBe('"prototype" is reserved. Choose another ID.');
+    expect(reservedStepIdError("review")).toBeUndefined();
+    expect(reservedStepIdErrors(form("a", "constructor").steps)).toEqual({
+      "steps.1.id": '"constructor" is reserved. Choose another ID.',
+    });
   });
 
   it("spells earlier outputs the way a condition reads them", () => {
