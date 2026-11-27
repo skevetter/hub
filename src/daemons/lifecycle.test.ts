@@ -560,6 +560,47 @@ describe("durable Hub action acknowledgement state", () => {
     },
   );
 
+  it("stops observing once recovery archives an execution whose acknowledgements are all durable", async () => {
+    const fixture = await acknowledgementFixture();
+    await recordDurableArchiveAcknowledgements(fixture.database);
+
+    await fixture.lifecycle.recoverPendingHubActions(DAEMON_ID);
+
+    const execution = await fixture.database.findAgentExecutionById(EXECUTION_ID);
+    assert.deepEqual(fixture.connection.actions, ["archive"]);
+    assert.notEqual(execution?.hubActionCompletedAt, null);
+    assert.equal(fixture.lifecycle.activeExecutionObservationCount(), 0);
+    await fixture.lifecycle.stop();
+  });
+
+  it("stops observing when a slower recovery finishes watching after the archive completed", async () => {
+    const fixture = await acknowledgementFixture();
+    await recordDurableArchiveAcknowledgements(fixture.database);
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    let watches = 0;
+    const watch = fixture.connection.agents.watch.bind(fixture.connection.agents);
+    fixture.connection.agents.watch = async (agentId, listener, authorize) => {
+      watches += 1;
+      if (watches === 1) await gate;
+      return watch(agentId, listener, authorize);
+    };
+
+    const slow = fixture.lifecycle.recoverPendingHubActions(DAEMON_ID);
+    await vi.waitFor(() => assert.equal(watches, 1));
+    await fixture.lifecycle.recoverPendingHubActions(DAEMON_ID);
+    assert.deepEqual(fixture.connection.actions, ["archive"]);
+    assert.equal(fixture.lifecycle.activeExecutionObservationCount(), 0);
+
+    openGate();
+    await slow;
+    assert.equal(fixture.lifecycle.activeExecutionObservationCount(), 0);
+    assert.equal(fixture.connection.observerCount(), 0);
+    await fixture.lifecycle.stop();
+  });
+
   it("resumes durable partial signals across restart and archives exactly once", async () => {
     const fixture = await acknowledgementFixture();
     await fixture.lifecycle.recoverPendingHubActions(DAEMON_ID);
@@ -593,6 +634,23 @@ describe("durable Hub action acknowledgement state", () => {
     await fixture.lifecycle.stop();
   });
 });
+
+async function recordDurableArchiveAcknowledgements(
+  database: Awaited<ReturnType<typeof createMemoryDatabase>>,
+): Promise<void> {
+  const observedAt = ACKNOWLEDGED_AT;
+  await database.recordAgentExecutionHubAcknowledgement(EXECUTION_ID, {
+    kind: "finish_execution",
+    callId: "finish-call",
+    status: "completed",
+    observedAt,
+  });
+  await database.recordAgentExecutionHubAcknowledgement(EXECUTION_ID, {
+    kind: "terminal",
+    observedAt,
+  });
+  await database.recordAgentExecutionHubAcknowledgement(EXECUTION_ID, { kind: "idle", observedAt });
+}
 
 async function acknowledgementFixture() {
   const database = createMemoryDatabase({ now: () => new Date("2026-01-01T00:00:00.000Z") });
@@ -680,6 +738,10 @@ class AcknowledgementConnection implements DaemonConnection {
   };
   readonly actions: Array<"interrupt" | "archive"> = [];
   private readonly handlers = new Set<(event: DaemonEvent) => void | Promise<void>>();
+
+  observerCount(): number {
+    return this.handlers.size;
+  }
 
   on(handler: (event: DaemonEvent) => void | Promise<void>): () => void {
     this.handlers.add(handler);

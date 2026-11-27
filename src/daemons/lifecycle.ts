@@ -1157,6 +1157,19 @@ export class DaemonDispatchLifecycle {
     );
     this.executionSubscriptions.get(executionId)?.();
     this.executionSubscriptions.set(executionId, unsubscribe);
+    await this.releaseIfArchiveFinished(executionId, unsubscribe);
+  }
+
+  // The archive can finish while watch() is still pending, so there was nothing to release then.
+  private async releaseIfArchiveFinished(
+    executionId: string,
+    unsubscribe: () => void,
+  ): Promise<void> {
+    const current = await this.options.database.findAgentExecutionById(executionId);
+    if (current === undefined || current.hubActionCompletedAt === null) return;
+    if (this.executionSubscriptions.get(executionId) === unsubscribe) {
+      this.releaseExecutionResources(executionId);
+    }
   }
 
   async failPendingExecutionsForDisconnectedMachine(
@@ -1394,9 +1407,17 @@ export class DaemonDispatchLifecycle {
         this.dispatchTimeoutMs,
         (callback, delayMs) => this.scheduleDeadline(async () => callback(), delayMs),
       );
-      if (settled !== undefined)
-        await this.options.database.completeHubAction(execution.id, action);
+      if (settled !== undefined) await this.completeHubAction(execution.id, action);
     }
+  }
+
+  private async completeHubAction(
+    executionId: string,
+    action: NonNullable<AgentExecutionRecord["hubAction"]>,
+  ): Promise<void> {
+    await this.options.database.completeHubAction(executionId, action);
+    // Either the idle event or recovery can mark the archive ready, and only the first released.
+    if (action === "archive") this.releaseExecutionResources(executionId);
   }
 
   private async sendStopInterrupt(
