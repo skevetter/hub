@@ -173,6 +173,24 @@ export class TriggerSteps {
     );
   }
 
+  /** A collapsed row keeps its Edit and menu buttons inside the card; the page may be checked for sideways scroll too. */
+  async expectRowControlsFit(position: number, pageFits = true) {
+    const number = String(position);
+    const row = await this.step(position).boundingBox();
+    expect(row).not.toBeNull();
+    for (const name of [`Edit step ${number}`, `Actions for step ${number}`]) {
+      const button = await this.step(position)
+        .getByRole("button", { name, exact: true })
+        .boundingBox();
+      expect(button, name).not.toBeNull();
+      expect(button?.x, name).toBeGreaterThanOrEqual(row?.x ?? 0);
+      expect((button?.x ?? 0) + (button?.width ?? 0), name).toBeLessThanOrEqual(
+        (row?.x ?? 0) + (row?.width ?? 0),
+      );
+    }
+    if (pageFits) await this.expectNoHorizontalScroll();
+  }
+
   /** A viewport tall enough to hold the list, so fixed bars are drawn once instead of per slice. */
   private async shoot(directory: string, name: string, viewport: { width: number }) {
     await this.page.setViewportSize({ width: viewport.width, height: 6000 });
