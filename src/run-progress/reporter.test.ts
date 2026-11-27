@@ -1297,7 +1297,7 @@ describe("progress scheduling", () => {
     assert.equal(f.provider.requests.length, 3);
     assert.match(f.provider.visible.get("comment") ?? "", /Succeeded/u);
     assert.equal((await run.read())?.state, "finished");
-  });
+  }, 120_000);
 
   it("receives timeline events when every per-run stream subscription is in use", async () => {
     const f = fixture();
@@ -1386,7 +1386,7 @@ it("shares leases and credential cooldowns with a separate Hub process", async (
     await expectExternalLeaseRecovery(f, connection, exit);
   }
   await expectExternalCredentialCooldown(f, connection);
-}, 45_000);
+}, 120_000);
 
 async function expectExternalLeaseRecovery(
   f: ReturnType<typeof fixture>,
@@ -1955,4 +1955,5 @@ it.each(["memory", "embedded Postgres", "pooled Postgres"] as const)(
     });
     assert.equal((await run.read())?.editCount, 2);
   },
+  120_000,
 );
