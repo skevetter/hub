@@ -202,6 +202,33 @@ test("log blocks give each failing file its first error line", () => {
   assert.deepEqual(headers.get("b.test.ts"), [portTimeout]);
 });
 
+test("the default reporter's real hook failure output is understood", () => {
+  const rule = "\u23AF".repeat(6);
+  const log = [
+    " RUN  v3.2.4 /repo",
+    " \u276F src/x.test.ts (2 tests | 2 skipped) 105ms",
+    "   \u2193 slow hook > never runs",
+    "",
+    `${rule} Failed Suites 2 ${rule}`,
+    "",
+    " FAIL  src/x.test.ts > slow hook",
+    "Error: Hook timed out in 100ms.",
+    "If this is a long-running hook, pass a timeout value as the last argument.",
+    " \u276F src/x.test.ts:3:3",
+    "",
+    `${rule}[1/2]${"\u23AF"}`,
+    "",
+    " FAIL  src/x.test.ts > port",
+    "Error: Port 5432/tcp not bound after 20000ms",
+    " \u276F src/x.test.ts:7:33",
+    "",
+  ].join("\n");
+  assert.deepEqual(logFailureHeaders(log).get("src/x.test.ts"), [
+    "Error: Hook timed out in 100ms.",
+    "Error: Port 5432/tcp not bound after 20000ms",
+  ]);
+});
+
 test("only a container-start header makes a file retryable", () => {
   const hookFailure = {
     name: `${root}/e.test.ts`,
