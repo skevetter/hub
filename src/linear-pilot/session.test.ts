@@ -239,6 +239,31 @@ test("Stop compares signed request time with the daemon wire turn start", async 
   }
 });
 
+function acceptMismatch(
+  turn: ReturnType<typeof ownedTurn>,
+  assistant: ReturnType<typeof row>,
+  caseId: number,
+  mismatch: number,
+) {
+  if (mismatch === 0) turn.accept({ ...assistant, epoch: `other-${caseId}` });
+  if (mismatch === 1) turn.accept({ ...assistant, seq: 3 + caseId });
+  if (mismatch === 2) turn.accept({ ...assistant, seq: 1 });
+  if (mismatch === 3)
+    turn.accept({ ...assistant, event: { ...assistant.event, turnId: `other-${caseId}` } });
+  if (mismatch === 4)
+    turn.accept(row({ type: "user_message", clientMessageId: `other-${caseId}` }, 2));
+  if (mismatch === 5) turn.accept({ ...assistant, agentId: `other-${caseId}` });
+  if (mismatch === 6) turn.accept(assistant);
+  if (mismatch === 7) {
+    turn.accept({ ...completion, event: { type: "turn_started", provider: "codex" } });
+  }
+  if (mismatch === 8) {
+    turn.accept(assistant);
+    turn.accept(row({ type: "assistant_message", text: "Second", messageId: "second" }, 3));
+    turn.accept({ ...assistant, seq: 4 });
+  }
+}
+
 test("2,048 deterministic mismatches never yield an answer or a confirmed exact end", () => {
   const assistant = row(
     { type: "assistant_message", text: "Do not publish", messageId: "final" },
@@ -247,23 +272,7 @@ test("2,048 deterministic mismatches never yield an answer or a confirmed exact 
   for (let caseId = 0; caseId < 2_048; caseId++) {
     const turn = ownedTurn();
     const mismatch = caseId % 9;
-    if (mismatch === 0) turn.accept({ ...assistant, epoch: `other-${caseId}` });
-    if (mismatch === 1) turn.accept({ ...assistant, seq: 3 + caseId });
-    if (mismatch === 2) turn.accept({ ...assistant, seq: 1 });
-    if (mismatch === 3)
-      turn.accept({ ...assistant, event: { ...assistant.event, turnId: `other-${caseId}` } });
-    if (mismatch === 4)
-      turn.accept(row({ type: "user_message", clientMessageId: `other-${caseId}` }, 2));
-    if (mismatch === 5) turn.accept({ ...assistant, agentId: `other-${caseId}` });
-    if (mismatch === 6) turn.accept(assistant);
-    if (mismatch === 7) {
-      turn.accept({ ...completion, event: { type: "turn_started", provider: "codex" } });
-    }
-    if (mismatch === 8) {
-      turn.accept(assistant);
-      turn.accept(row({ type: "assistant_message", text: "Second", messageId: "second" }, 3));
-      turn.accept({ ...assistant, seq: 4 });
-    }
+    acceptMismatch(turn, assistant, caseId, mismatch);
     const item = turn.accept(
       mismatch === 6
         ? { ...completion, event: { ...completion.event, turnId: `other-${caseId}` } }
