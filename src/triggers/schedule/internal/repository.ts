@@ -122,21 +122,7 @@ async function enqueueOccurrence(
     (id, organization_id, provider, delivery_id, source, payload, received_at, accepted_routes)
     values ($1, $2, 'schedule', $3, 'schedule.tick', $4, $5, $6)
     on conflict (organization_id, delivery_id) do nothing`,
-    [
-      receiptId,
-      schedule.organization_id,
-      deliveryId,
-      event,
-      now,
-      JSON.stringify([
-        {
-          projectId: schedule.runtime_project_id,
-          configurationRevisionId: schedule.configuration_revision_id,
-          connectionId: null,
-          resourceId: null,
-        },
-      ]),
-    ],
+    [receiptId, schedule.organization_id, deliveryId, event, now, serializeAcceptedRoute(schedule)],
   );
   if (inserted.rowCount === 0) {
     const duplicate = await existingOccurrence(transaction, schedule, deliveryId);
@@ -160,6 +146,17 @@ async function enqueueOccurrence(
   });
   if ("receiptReplay" in accepted) throw new ScheduleOccurrenceConflict();
   return accepted;
+}
+
+function serializeAcceptedRoute(schedule: DueSchedule): string {
+  return JSON.stringify([
+    {
+      projectId: schedule.runtime_project_id,
+      configurationRevisionId: schedule.configuration_revision_id,
+      connectionId: null,
+      resourceId: null,
+    },
+  ]);
 }
 
 async function existingOccurrence(
