@@ -426,6 +426,10 @@ function operatorPrecedence(operator: BinaryOperator): number {
 
 const FORBIDDEN_CONTEXT_KEYS = new Set(["constructor", "prototype", "__proto__"]);
 
+export function isReservedContextKey(key: string): boolean {
+  return FORBIDDEN_CONTEXT_KEYS.has(key);
+}
+
 function readOwnContextKey<T>(record: Readonly<Record<string, T>>, key: string): T | undefined {
   if (FORBIDDEN_CONTEXT_KEYS.has(key) || !Object.hasOwn(record, key)) return undefined;
   return record[key];
