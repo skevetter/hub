@@ -2,9 +2,31 @@ import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { compileHubConfig } from "../../config/index.js";
 import type { NormalizedSlackMentionEvent } from "./events.js";
-import { matchSlackTriggers, readSlackPromptBody } from "./match.js";
+import {
+  matchSlackTriggers,
+  readSlackInvocationParserMessage,
+  readSlackPromptBody,
+} from "./match.js";
 
 describe("Slack trigger matching", () => {
+  it("requires exact mention and command boundaries with large Unicode content", () => {
+    const config = {
+      triggers: [
+        { name: "run", on: "slack.mention", filters: { pattern: "run", from_users: ["*"] } },
+      ],
+    };
+    const suffix = "\u2603".repeat(100_000);
+    const event = { ...mention(), threadTs: null, content: `<@UBOT> run\u00a0${suffix}` };
+    assert.equal(matchSlackTriggers(config, event, "UBOT").length, 1);
+    assert.equal(readSlackInvocationParserMessage(event, "UBOT", { pattern: "run" }), suffix);
+    assert.deepEqual(matchSlackTriggers(config, { ...event, content: "" }, "UBOT"), []);
+    assert.deepEqual(
+      matchSlackTriggers(config, { ...event, content: `<@UBOT> run${suffix}` }, "UBOT"),
+      [],
+    );
+    assert.deepEqual(matchSlackTriggers(config, { ...event, author: { id: "UBOT" } }, "UBOT"), []);
+  });
+
   it("allows exact, case-sensitive Slack usernames as well as user IDs", () => {
     const config = configForUsers(["operator", "U2"]);
 

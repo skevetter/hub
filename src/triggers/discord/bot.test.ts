@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { DiscordAPIError, RESTJSONErrorCodes, type Client } from "discord.js";
+import { DiscordAPIError, RESTJSONErrorCodes, Client } from "discord.js";
 import { describe, it } from "vitest";
 import { createDiscordBotClient } from "./bot.js";
 
@@ -57,6 +57,30 @@ describe("Discord bot client", () => {
 
     // Discord.js reconnects or resumes these; presenting them as a durable setup fault would lie.
     await assert.rejects(bot.start(), (error: unknown) => error === original);
+  });
+
+  it("registers its gateway handlers immediately and cleans up the login observer", async () => {
+    const client = new Client({ intents: [] });
+    const originalDisconnectListeners = client.listenerCount("shardDisconnect");
+    client.login = () => Promise.reject(new Error("recoverable close"));
+    const bot = createDiscordBotClient({ token: "token", client });
+    assert.equal(client.listenerCount("messageCreate"), 1);
+    assert.equal(client.listenerCount("guildDelete"), 1);
+    assert.throws(() => bot.getSelfUserId(), {
+      message: "discord bot client has not received a self user yet",
+    });
+
+    const guilds: unknown[] = [];
+    const unsubscribe = bot.onGuildDelete(async (guild) => {
+      guilds.push(guild);
+    });
+    const emit = client.emit.bind(client);
+    Reflect.apply(emit, undefined, ["guildDelete", { id: "100", available: false }]);
+    unsubscribe();
+    Reflect.apply(emit, undefined, ["guildDelete", { id: "101", available: true }]);
+    assert.deepEqual(guilds, [{ id: "100", unavailable: true }]);
+    await assert.rejects(bot.start(), { message: "recoverable close" });
+    assert.equal(client.listenerCount("shardDisconnect"), originalDisconnectListeners);
   });
 
   it("disables all mention parsing when sending channel messages", async () => {
