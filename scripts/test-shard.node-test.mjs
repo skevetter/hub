@@ -529,6 +529,10 @@ test("only Vitest's own frame and excerpt formats are skipped", () => {
   assert.deepEqual(headersOf(frame, "    100| it(1)", "    1200| it(2)"), [`Error: ${message}`]);
   const wrongHost = headersOf(" \u276F config/startup.yaml:12:7", "  12| endpoint: wrong-host");
   assert.deepEqual(wrongHost, [`Error: ${message}\n  12| endpoint: wrong-host`]);
+  for (const line of ["    1  | endpoint: wrong-host", "       | endpoint: wrong-host"]) {
+    const found = headersOf(" \u276F config/startup.yaml:12:7", line);
+    assert.deepEqual(found, [`Error: ${message}\n${line}`]);
+  }
   const noLocation = headersOf(" \u276F Configuration error: wrong endpoint", frame);
   assert.deepEqual(noLocation, [`Error: ${message}\n \u276F Configuration error: wrong endpoint`]);
 });
