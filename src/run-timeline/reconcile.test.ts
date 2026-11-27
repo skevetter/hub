@@ -146,8 +146,7 @@ async function finishScript(
   database: Database,
   step: WorkflowStepRunRecord,
   status: "succeeded" | "failed" | "timed_out",
-  exitCode: number | null = 0,
-  failureReason?: string,
+  { exitCode = 0, failureReason }: { exitCode?: number | null; failureReason?: string } = {},
 ) {
   const startedAt = new Date(Date.now() - 2_000);
   await database.startWorkflowScriptStep({
@@ -282,7 +281,7 @@ describe.each(backends)("timeline reconciliation (%s)", (_name, open) => {
       let status: "succeeded" | "timed_out" | "failed" = "failed";
       if (exitCode === 0) status = "succeeded";
       else if (exitCode === null) status = "timed_out";
-      await finishScript(database, step, status, exitCode, "script failure");
+      await finishScript(database, step, status, { exitCode, failureReason: "script failure" });
       const before = await database.listWorkflowStepRunsForTriggerRun(run.id);
       const { reconciler } = components(database);
       await reconciler.reconcile(ORGANIZATION, run.id);
@@ -490,8 +489,8 @@ describe.each(backends)("timeline reconciliation (%s)", (_name, open) => {
     const run = await acceptedRun(harness, ["ok", "bad", "timeout", "skip", "pending"]);
     const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
     await finishScript(database, steps[0]!, "succeeded");
-    await finishScript(database, steps[1]!, "failed", 7);
-    await finishScript(database, steps[2]!, "timed_out", null);
+    await finishScript(database, steps[1]!, "failed", { exitCode: 7 });
+    await finishScript(database, steps[2]!, "timed_out", { exitCode: null });
     await database.markWorkflowStepSkipped(run.id, "skip", "condition false");
     await database.failWorkflowRun(run.id, "failed", "script exited 7", "bad");
     const before = await database.listWorkflowStepRunsForTriggerRun(run.id);
@@ -602,7 +601,8 @@ describe.each(backends)("timeline reconciliation (%s)", (_name, open) => {
     }
     const failure = '\u{1f600}"'.repeat(120);
     const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
-    for (const step of steps) await finishScript(database, step, "failed", 1, failure);
+    for (const step of steps)
+      await finishScript(database, step, "failed", { exitCode: 1, failureReason: failure });
     await database.failWorkflowRun(run.id, "failed", failure);
     const before = await database.listWorkflowStepRunsForTriggerRun(run.id);
     await components(database, new Date(Date.now() + 60_000), 30, 5000).reconciler.reconcile(

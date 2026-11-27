@@ -62,6 +62,13 @@ const VARIANTS: {
   },
 ];
 
+function maskSeparators(separatorLength: number, mask: number): string {
+  let separators = "";
+  for (let index = 0; index < separatorLength; index++)
+    separators += mask & (1 << index) ? "\\" : "/";
+  return separators;
+}
+
 function userinfoCandidates() {
   const prefixes: {
     scheme: (typeof URL_USERINFO_SCHEMES)[number];
@@ -72,9 +79,7 @@ function userinfoCandidates() {
   for (const scheme of URL_USERINFO_SCHEMES) {
     for (let separatorLength = 0; separatorLength <= 4; separatorLength++) {
       for (let mask = 0; mask < 2 ** separatorLength; mask++) {
-        let separators = "";
-        for (let index = 0; index < separatorLength; index++)
-          separators += mask & (1 << index) ? "\\" : "/";
+        const separators = maskSeparators(separatorLength, mask);
         prefixes.push({ scheme, separatorLength, mask, separators });
       }
     }
