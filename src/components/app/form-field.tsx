@@ -116,28 +116,21 @@ const INPUT_TYPES: Record<Exclude<FormFieldKind, "multiline">, string> = {
   number: "number",
 };
 
-function TypedInput({
-  kind,
-  name,
-  defaultValue,
-  value,
-  readOnly,
-  autoComplete,
-  placeholder,
-  minLength,
-  maxLength,
-  pattern,
-  min,
-  step,
-  inputMode,
-  onChange,
-  control,
-}: TypedControl & { control: FieldControl }) {
-  const emit = useCallback(
-    (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => onChange?.(event.target.value),
-    [onChange],
-  );
-  const shared = {
+function sharedInputProps(
+  {
+    name,
+    defaultValue,
+    value,
+    readOnly,
+    placeholder,
+    minLength,
+    maxLength,
+    onChange,
+    control,
+  }: TypedControl & { control: FieldControl },
+  emit: (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => void,
+) {
+  return {
     ...control,
     name,
     ...(defaultValue === undefined ? {} : { defaultValue }),
@@ -148,6 +141,15 @@ function TypedInput({
     ...(maxLength === undefined ? {} : { maxLength }),
     ...(onChange === undefined ? {} : { onChange: emit }),
   };
+}
+
+function TypedInput(props: TypedControl & { control: FieldControl }) {
+  const { kind, autoComplete, pattern, min, step, inputMode, onChange } = props;
+  const emit = useCallback(
+    (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => onChange?.(event.target.value),
+    [onChange],
+  );
+  const shared = sharedInputProps(props, emit);
   if (kind === "multiline") return <Textarea rows={4} spellCheck={false} {...shared} />;
   // Nothing typed into these fields is prose. An identifier, a key, or a workspace name is not
   // a word the browser should learn, offer back, or underline in red. Sign-in fields are the

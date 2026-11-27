@@ -34,9 +34,7 @@ export function ScriptStepOutput({
   const truncated = result.truncated || outputTail.length < result.output_tail.length;
   return (
     <div className="grid gap-2">
-      <span>
-        {result.exit_code === null ? "No exit code" : `Exit code ${String(result.exit_code)}`}
-      </span>
+      <span>{exitCodeLabel(result.exit_code)}</span>
       <Disclosure
         id={`script-output-${stepId}`}
         open={open}
@@ -55,6 +53,10 @@ export function ScriptStepOutput({
       </Disclosure>
     </div>
   );
+}
+
+function exitCodeLabel(exitCode: number | null): string {
+  return exitCode === null ? "No exit code" : `Exit code ${String(exitCode)}`;
 }
 
 /** Whether the value is something this step kind shows, so the table can pick a view. */
