@@ -30,50 +30,21 @@ uses Oxfmt, not Prettier.
 
 ## Publish a release
 
-A Hub release is three artifacts: the `@getpaseo/hub` npm package, a multi-architecture
-container image, and a GitHub Release. npm is published locally; the tag publishes the other two.
-A release is not done until all three are out.
+[Main](.github/workflows/main.yml) checks the pushed commit and packs that exact commit in a
+scratch checkout. The version comes from Conventional Commits. The checkout's version stays
+unchanged. The tarball includes a shrinkwrap and the package job checks the installed tree before
+it can be published. The build branch produces a workflow artifact. Only `main` creates a tag and
+GitHub Release with the tarball and its checksum.
 
-1. Update the version in `package.json` and `package-lock.json`.
-2. Add a matching `## <version> - YYYY-MM-DD` section to `CHANGELOG.md`. The changelog describes
-   the self-hosted release, so leave out changes that only affect the hosted service: plans,
-   pricing, trials, billing, and hosted usage limits.
-3. Run the release checks. `release:check` verifies release metadata, types, lint, formatting, the
-   production build, and the npm package contents.
+The release check compares the tested commit to the latest reachable `v*` tag. Changes limited
+to the [no-ship paths](scripts/cd/ship-paths.mjs) skip the tag and deploy. If the last release was
+paused or failed after tagging, a no-ship push does not retry it. Start the published release
+manually from `main` with its exact SHA.
 
-   ```sh
-   npm run release:check
-   ```
-
-4. Commit the release preparation to `main` and push it.
-5. Publish npm from that clean `main` checkout, then verify the public package from a directory
-   outside the repository. Open the URL Hub prints, and stop it with Ctrl+C once the first-run
-   page loads.
-
-   ```sh
-   npm whoami
-   npm publish --access public
-   npm view @getpaseo/hub version
-   cd "$(mktemp -d)" && npx @getpaseo/hub@<version>
-   ```
-
-6. Create an annotated tag on the release commit and push it:
-
-   ```sh
-   git tag -a v<version> <commit> -m "Paseo Hub v<version>"
-   git push origin v<version>
-   ```
-
-The tag must match both `package.json` and the changelog section. A tag push runs only the
-[Release](.github/workflows/release.yml) workflow; it does not rerun the main CI suite. The
-workflow publishes `ghcr.io/getpaseo/hub:<version>`, updates `latest` for stable releases, and
-creates or updates the GitHub Release from the matching changelog section. Prereleases do not
-move `latest`.
-
-Before announcing the release, verify the GitHub Release, anonymous access to both image tags, and
-that `npm view @getpaseo/hub dist-tags` shows the new version as `latest`. Later changes to the
-current changelog section update the existing release notes through
-[Release Notes Sync](.github/workflows/release-notes-sync.yml).
+Automatic deploys take a backup, install, and check the service. A failed smoke check rolls back
+and pauses deployment. Mark incompatible migrations and persisted data changes `rollback-unsafe`
+on the PR. The pipeline publishes those releases and waits for a manual start. Manual deployments
+do not roll back automatically. See the `cd-alert` issues for failed or held releases.
 
 ## Update public documentation
 
