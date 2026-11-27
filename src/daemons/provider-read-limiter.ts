@@ -44,7 +44,27 @@ export function createProviderReadLimiter() {
     }
   }
 
-  function schedule<T>(
+  const schedule = createSchedule({
+    queue,
+    isKnown: (daemonId) => order.has(daemonId),
+    dispatch,
+    release: () => {
+      running--;
+      dispatch();
+    },
+  });
+  return { schedule, reconcile };
+}
+
+interface ScheduleQueue {
+  queue: Set<QueuedRead>;
+  isKnown: (daemonId: string) => boolean;
+  dispatch: () => void;
+  release: () => void;
+}
+
+function createSchedule({ queue, isKnown, dispatch, release }: ScheduleQueue) {
+  return function schedule<T>(
     daemonId: string,
     signal: AbortSignal,
     read: (signal: AbortSignal) => Promise<T>,
@@ -93,12 +113,11 @@ export function createProviderReadLimiter() {
           .then(resolve, reject)
           .finally(() => {
             clearTimeout(timer);
-            running--;
-            dispatch();
+            release();
           });
       }
 
-      if (!order.has(daemonId)) {
+      if (!isKnown(daemonId)) {
         drop();
         return;
       }
@@ -106,7 +125,5 @@ export function createProviderReadLimiter() {
       signal.addEventListener("abort", cancel, { once: true });
       dispatch();
     });
-  }
-
-  return { schedule, reconcile };
+  };
 }

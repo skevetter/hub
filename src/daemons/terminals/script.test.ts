@@ -510,13 +510,13 @@ test("sweeping stops leftover script terminals that nothing claims", async () =>
   await make("hub-script-live");
   await make("hub-script-leftover");
   await make("somebody-elses");
-  const result = await sweepScriptTerminals(
-    daemon.client,
-    { cwd: "/work/webapp" },
-    (name) => name === "hub-script-live",
-    new FakeClock(),
-    NO_WAIT,
-  );
+  const result = await sweepScriptTerminals({
+    terminals: daemon.client,
+    scope: { cwd: "/work/webapp" },
+    keep: (name) => name === "hub-script-live",
+    clock: new FakeClock(),
+    retry: NO_WAIT,
+  });
   expect(result).toEqual({ stopped: 1, unconfirmed: 0 });
   expect(daemon.killed).toEqual(["terminal-2"]);
 });

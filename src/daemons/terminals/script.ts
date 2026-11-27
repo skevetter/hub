@@ -129,11 +129,21 @@ export async function runScript(
   const deadlineAt = clock.now() + input.timeoutMs;
   const markerId = clock.random();
   const { command, args } = scriptTerminalCommand(markerId, input.script, input.eventJson);
-  const created: { id?: string; workspaceId?: string; lostCreate?: boolean } = {};
+  const created: CreatedTerminal = {};
   let outcome: ScriptRunResult | undefined;
   let thrown: unknown;
   try {
-    outcome = await execute();
+    outcome = await createAndPoll({
+      terminals,
+      input,
+      clock,
+      deadlineAt,
+      markerId,
+      command,
+      args,
+      created,
+      scopeOf,
+    });
   } catch (error) {
     thrown = error;
   }
@@ -147,36 +157,98 @@ export async function runScript(
   const attempts = isAborted(input.signal) ? 1 : undefined;
   const stopped =
     created.id !== undefined
-      ? await stopTerminal(terminals, created.id, scopeOf(), clock, retry, attempts)
+      ? await stopTerminal({
+          terminals,
+          terminalId: created.id,
+          scope: scopeOf(),
+          clock,
+          retry,
+          attempts,
+        })
       : created.lostCreate !== true ||
-        (await stopByName(terminals, target, clock, retry, attempts));
-  if (thrown instanceof ScriptRunAborted) throw new ScriptRunAborted(stopped ? null : target);
-  if (thrown !== undefined) throw thrown;
-  const result = outcome ?? refused(new Error("script run ended without an outcome"), input.cwd);
-  return stopped ? result : { ...result, cleanup: target };
+        (await stopByName({ terminals, target, clock, retry, attempts }));
+  return finishRun({ stopped, target, thrown, outcome }, input);
 
   function scopeOf() {
     return { cwd: input.cwd, workspaceId: created.workspaceId };
   }
+}
 
-  async function execute(): Promise<ScriptRunResult> {
-    try {
-      const terminal = await terminals.create({
-        cwd: input.cwd,
-        name: input.name,
-        command,
-        args,
-        size: TERMINAL_SIZE,
-      });
-      created.id = terminal.id;
-      if (terminal.workspaceId !== undefined) created.workspaceId = terminal.workspaceId;
-      await input.onTerminal?.({ id: terminal.id, workspaceId: terminal.workspaceId });
-    } catch (error) {
-      if (error instanceof DaemonResponseLostError) created.lostCreate = true;
-      return refused(error, input.cwd);
-    }
-    return poll(terminals, created.id, markerId, deadlineAt, scopeOf(), input, clock);
+interface CreatedTerminal {
+  id?: string;
+  workspaceId?: string;
+  lostCreate?: boolean;
+}
+
+interface CreateAndPollOptions {
+  terminals: TerminalConnection;
+  input: ScriptRunInput;
+  clock: ScriptRunnerClock;
+  deadlineAt: number;
+  markerId: string;
+  command: string;
+  args: string[];
+  created: CreatedTerminal;
+  scopeOf: () => { cwd: string; workspaceId: string | undefined };
+}
+
+async function createAndPoll({
+  terminals,
+  input,
+  clock,
+  deadlineAt,
+  markerId,
+  command,
+  args,
+  created,
+  scopeOf,
+}: CreateAndPollOptions): Promise<ScriptRunResult> {
+  try {
+    const terminal = await terminals.create({
+      cwd: input.cwd,
+      name: input.name,
+      command,
+      args,
+      size: TERMINAL_SIZE,
+    });
+    created.id = terminal.id;
+    if (terminal.workspaceId !== undefined) created.workspaceId = terminal.workspaceId;
+    await input.onTerminal?.({ id: terminal.id, workspaceId: terminal.workspaceId });
+  } catch (error) {
+    if (error instanceof DaemonResponseLostError) created.lostCreate = true;
+    return refused(error, input.cwd);
   }
+  return poll({
+    terminals,
+    terminalId: created.id,
+    markerId,
+    deadlineAt,
+    scope: scopeOf(),
+    input,
+    clock,
+  });
+}
+
+interface RunOutcome {
+  stopped: boolean;
+  target: ScriptCleanupTarget;
+  thrown: unknown;
+  outcome: ScriptRunResult | undefined;
+}
+
+function finishRun(
+  { stopped, target, thrown, outcome }: RunOutcome,
+  input: ScriptRunInput,
+): ScriptRunResult {
+  if (thrown instanceof ScriptRunAborted) throw new ScriptRunAborted(stopped ? null : target);
+  if (thrown instanceof Error) throw thrown;
+  if (thrown !== undefined) {
+    const message =
+      typeof thrown === "string" ? thrown : "Script run failed with a non-Error value";
+    throw new Error(message, { cause: thrown });
+  }
+  const result = outcome ?? refused(new Error("script run ended without an outcome"), input.cwd);
+  return stopped ? result : { ...result, cleanup: target };
 }
 
 /** Stops what a previous run left on the host, found by the id when known and else by name. */
@@ -188,34 +260,43 @@ export async function killScriptTerminal(
 ): Promise<void> {
   const stopped =
     target.terminalId !== undefined
-      ? await stopTerminal(
+      ? await stopTerminal({
           terminals,
-          target.terminalId,
-          { cwd: target.cwd, workspaceId: target.workspaceId },
+          terminalId: target.terminalId,
+          scope: { cwd: target.cwd, workspaceId: target.workspaceId },
           clock,
           retry,
-        )
-      : await stopByName(terminals, target, clock, retry);
+        })
+      : await stopByName({ terminals, target, clock, retry });
   if (!stopped) throw new Error("the daemon did not confirm the terminal stopped");
+}
+
+interface SweepScriptTerminalsOptions {
+  terminals: TerminalConnection;
+  scope: TerminalScope;
+  keep: (name: string) => boolean | Promise<boolean>;
+  clock?: ScriptRunnerClock;
+  retry?: RetryRuntime;
 }
 
 /**
  * Stops every terminal in a directory whose name carries the script prefix and that `keep` does
  * not claim, for the sweep that follows a reconnect or a restart.
  */
-export async function sweepScriptTerminals(
-  terminals: TerminalConnection,
-  scope: { cwd: string; workspaceId?: string | undefined },
-  keep: (name: string) => boolean | Promise<boolean>,
-  clock: ScriptRunnerClock = systemScriptRunnerClock,
-  retry: RetryRuntime = {},
-): Promise<{ stopped: number; unconfirmed: number }> {
+export async function sweepScriptTerminals({
+  terminals,
+  scope,
+  keep,
+  clock = systemScriptRunnerClock,
+  retry = {},
+}: SweepScriptTerminalsOptions): Promise<{ stopped: number; unconfirmed: number }> {
   const found = await terminals.list(scope);
   let stopped = 0;
   let unconfirmed = 0;
   for (const terminal of found) {
     if (!terminal.name.startsWith(SCRIPT_TERMINAL_PREFIX) || (await keep(terminal.name))) continue;
-    if (await stopTerminal(terminals, terminal.id, scope, clock, retry)) stopped += 1;
+    if (await stopTerminal({ terminals, terminalId: terminal.id, scope, clock, retry }))
+      stopped += 1;
     else unconfirmed += 1;
   }
   return { stopped, unconfirmed };
@@ -240,15 +321,32 @@ class TerminalNotStopped extends Error {
   }
 }
 
+interface TerminalScope {
+  cwd: string;
+  workspaceId?: string | undefined;
+}
+
+interface StopOptions {
+  terminals: TerminalConnection;
+  clock: ScriptRunnerClock;
+  retry: RetryRuntime;
+  attempts?: number | undefined;
+}
+
+interface StopTerminalOptions extends StopOptions {
+  terminalId: string;
+  scope: TerminalScope;
+}
+
 /** True once the daemon confirmed the terminal is stopped, or no longer has it. */
-async function stopTerminal(
-  terminals: TerminalConnection,
-  terminalId: string,
-  scope: { cwd: string; workspaceId?: string | undefined },
-  clock: ScriptRunnerClock,
-  retry: RetryRuntime,
-  attempts?: number,
-): Promise<boolean> {
+async function stopTerminal({
+  terminals,
+  terminalId,
+  scope,
+  clock,
+  retry,
+  attempts,
+}: StopTerminalOptions): Promise<boolean> {
   try {
     await retryWithBackoff(
       async () => {
@@ -265,13 +363,17 @@ async function stopTerminal(
   }
 }
 
-async function stopByName(
-  terminals: TerminalConnection,
-  target: { cwd: string; name: string; workspaceId?: string | undefined },
-  clock: ScriptRunnerClock,
-  retry: RetryRuntime,
-  attempts?: number,
-): Promise<boolean> {
+interface StopByNameOptions extends StopOptions {
+  target: TerminalScope & { name: string };
+}
+
+async function stopByName({
+  terminals,
+  target,
+  clock,
+  retry,
+  attempts,
+}: StopByNameOptions): Promise<boolean> {
   const scope = { cwd: target.cwd, workspaceId: target.workspaceId };
   try {
     await retryWithBackoff(
@@ -279,7 +381,7 @@ async function stopByName(
         const found = await terminals.list(scope);
         const named = found.filter(({ name }) => name === target.name);
         for (const { id } of named) {
-          if (!(await stopTerminal(terminals, id, scope, clock, retry, attempts))) {
+          if (!(await stopTerminal({ terminals, terminalId: id, scope, clock, retry, attempts }))) {
             throw new TerminalNotStopped();
           }
         }
@@ -292,19 +394,28 @@ async function stopByName(
   }
 }
 
-async function poll(
-  terminals: TerminalConnection,
-  terminalId: string,
-  markerId: string,
-  deadlineAt: number,
-  scope: { cwd: string; workspaceId: string | undefined },
-  input: ScriptRunInput,
-  clock: ScriptRunnerClock,
-): Promise<ScriptRunResult> {
+interface PollOptions {
+  terminals: TerminalConnection;
+  terminalId: string;
+  markerId: string;
+  deadlineAt: number;
+  scope: { cwd: string; workspaceId: string | undefined };
+  input: ScriptRunInput;
+  clock: ScriptRunnerClock;
+}
+
+async function poll({
+  terminals,
+  terminalId,
+  markerId,
+  deadlineAt,
+  scope,
+  input,
+  clock,
+}: PollOptions): Promise<ScriptRunResult> {
   const startedAt = clock.now();
   const exit = new RegExp(`^${marker(markerId)}(\\d{1,3}):$`, "u");
-  let lastLines: readonly string[] = [];
-  let lastTotal = 0;
+  const last: PollTail = { lines: [], total: 0 };
   let lastLivenessCheck = Number.NEGATIVE_INFINITY;
   /** At most every few seconds, asks the daemon whether the terminal still exists. */
   const hasEnded = async (): Promise<boolean> => {
@@ -313,7 +424,7 @@ async function poll(
     return !(await stillListed(terminals, terminalId, scope));
   };
   const ended = (): ScriptRunResult => ({
-    ...tailOf(lastLines, lastTotal),
+    ...tailOf(last.lines, last.total),
     status: "failed",
     exitCode: null,
     failureReason: TERMINAL_ENDED_MESSAGE,
@@ -321,7 +432,7 @@ async function poll(
   for (;;) {
     if (isAborted(input.signal)) throw new ScriptRunAborted();
     if (clock.now() >= deadlineAt) {
-      const tail = await captureQuietly(terminals, terminalId, lastLines, lastTotal);
+      const tail = await captureQuietly(terminals, terminalId, last.lines, last.total);
       return {
         ...tailOf(tail.lines, tail.total),
         status: "timed_out",
@@ -335,37 +446,58 @@ async function poll(
     const capture = await terminals
       .capture(terminalId, -CAPTURE_LINES)
       .catch((error: unknown) => error);
-    if (!isCapture(capture)) {
-      if (capture instanceof DaemonTerminalError && capture.code === "permission_denied") {
-        return { ...tailOf(lastLines, lastTotal), ...refusedFields(capture, input.cwd) };
-      }
-      // A lost capture says nothing about the script, so ask again until the deadline. But a
-      // terminal the daemon no longer lists will never answer, and holds a slot for nothing.
-      if (await hasEnded()) return ended();
-      continue;
-    }
-    const lines = capture.lines.map(cleanLine);
-    for (let index = lines.length - 1; index >= 0; index -= 1) {
-      const match = exit.exec(lines[index]!.trimEnd());
-      if (match === null) continue;
-      const exitCode = Number(match[1]);
-      const tail = tailOf(lines.slice(0, index), capture.totalLines - (lines.length - index));
-      return exitCode === 0
-        ? { ...tail, status: "succeeded", exitCode }
-        : {
-            ...tail,
-            status: "failed",
-            exitCode,
-            failureReason: `script exited ${String(exitCode)}`,
-          };
-    }
-    if (lines.length > 0) {
-      lastLines = lines;
-      lastTotal = capture.totalLines;
-      continue;
-    }
+    const decision = inspectCapture(capture, exit, last, input);
+    if (decision === "has-output") continue;
+    if (decision !== undefined) return decision;
+    // Empty or lost captures do not say whether the terminal still exists.
     if (await hasEnded()) return ended();
   }
+}
+
+interface PollTail {
+  lines: readonly string[];
+  total: number;
+}
+
+function inspectCapture(
+  capture: unknown,
+  exit: RegExp,
+  last: PollTail,
+  input: ScriptRunInput,
+): ScriptRunResult | "has-output" | undefined {
+  if (!isCapture(capture)) {
+    if (capture instanceof DaemonTerminalError && capture.code === "permission_denied") {
+      return { ...tailOf(last.lines, last.total), ...refusedFields(capture, input.cwd) };
+    }
+    return undefined;
+  }
+  const lines = capture.lines.map(cleanLine);
+  const result = exitResult(lines, capture, exit);
+  if (result !== undefined) return result;
+  if (lines.length === 0) return undefined;
+  last.lines = lines;
+  last.total = capture.totalLines;
+  return "has-output";
+}
+
+function exitResult(
+  lines: readonly string[],
+  capture: TerminalCapture,
+  exit: RegExp,
+): ScriptRunResult | undefined {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (line === undefined)
+      throw new TypeError("Cannot read properties of undefined (reading 'trimEnd')");
+    const match = exit.exec(line.trimEnd());
+    if (match === null) continue;
+    const exitCode = Number(match[1]);
+    const tail = tailOf(lines.slice(0, index), capture.totalLines - (lines.length - index));
+    return exitCode === 0
+      ? { ...tail, status: "succeeded", exitCode }
+      : { ...tail, status: "failed", exitCode, failureReason: `script exited ${String(exitCode)}` };
+  }
+  return undefined;
 }
 
 function isAborted(signal: AbortSignal | undefined): boolean {
@@ -448,17 +580,27 @@ function tailOf(
   totalLines: number,
 ): Pick<ScriptRunResult, "outputTail" | "truncated"> {
   const trimmed = lines.map(cleanLine);
-  while (trimmed.length > 0 && trimmed[trimmed.length - 1]!.trim() === "") trimmed.pop();
+  trimBlankTail(trimmed);
   let text = trimmed.join("\n");
   let truncated = totalLines > lines.length;
   if (Buffer.byteLength(text) > MAX_OUTPUT_TAIL_BYTES) {
     let bytes = Buffer.from(text).subarray(-MAX_OUTPUT_TAIL_BYTES);
     // Drop a partial multi-byte character at the cut.
-    while (bytes.length > 0 && (bytes[0]! & 0xc0) === 0x80) bytes = bytes.subarray(1);
+    while (bytes.length > 0 && ((bytes[0] ?? 0) & 0xc0) === 0x80) bytes = bytes.subarray(1);
     text = bytes.toString();
     truncated = true;
   }
   return { outputTail: text, truncated };
+}
+
+function trimBlankTail(lines: string[]): void {
+  while (lines.length > 0) {
+    const line = lines[lines.length - 1];
+    if (line === undefined)
+      throw new TypeError("Cannot read properties of undefined (reading 'trim')");
+    if (line.trim() !== "") return;
+    lines.pop();
+  }
 }
 
 /** What the workflow engine needs to run a script step and to clean up after one that was lost. */
@@ -526,7 +668,7 @@ export function createScriptStepRunner(
       if (connectionForDaemon(daemonId)?.terminals === undefined) {
         throw new Error("daemon_not_connected");
       }
-      return sweepScriptTerminals(terminalsFor(daemonId), scope, keep, clock, retry);
+      return sweepScriptTerminals({ terminals: terminalsFor(daemonId), scope, keep, clock, retry });
     },
   };
 }
