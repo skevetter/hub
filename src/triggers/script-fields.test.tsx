@@ -3,7 +3,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, it } from "vitest";
 import { newStepFormValue, type TriggerFormValue } from "./configuration/editor.js";
 import { ProgressMessageField } from "./panel.js";
-import { ActionField, ScriptFields, triggerSecondaryLine } from "./script-fields.js";
+import { StepActionField, StepScriptFields } from "./step-fields.js";
+import { triggerSecondaryLine } from "./script-fields.js";
 
 const form: TriggerFormValue = {
   name: "deploy",
@@ -22,6 +23,7 @@ const form: TriggerFormValue = {
 
 const promptForm: TriggerFormValue = { ...form, steps: [newStepFormValue()] };
 const noop = () => undefined;
+const place = { errors: {}, onChange: noop, index: 0 };
 
 describe("trigger progress message field", () => {
   it.each(["github.push", "manual.run", "schedule.tick", "discord.mention"] as const)(
@@ -68,7 +70,7 @@ describe("trigger progress message field", () => {
 
 describe("trigger action choice", () => {
   it("offers Prompt and Script, with Script chosen for a script trigger", () => {
-    const markup = renderToStaticMarkup(<ActionField value={form} onChange={noop} />);
+    const markup = renderToStaticMarkup(<StepActionField form={form} {...place} />);
     assert.match(markup, /Action/u);
     assert.match(markup, /Prompt/u);
     assert.match(markup, /Script/u);
@@ -80,25 +82,34 @@ describe("trigger action choice", () => {
   });
 
   it("chooses Prompt for a prompt trigger", () => {
-    const markup = renderToStaticMarkup(<ActionField value={promptForm} onChange={noop} />);
+    const markup = renderToStaticMarkup(<StepActionField form={promptForm} {...place} />);
     assert.match(markup, /role="radio"[^>]*aria-checked="true"[^>]*>(?:(?!<\/button>).)*Prompt/su);
   });
 
-  it("changes only the first action and preserves later steps", () => {
+  it("changes only the chosen step and preserves the others", () => {
     const second = newStepFormValue({ id: "later", prompt: "Keep this" });
     const original = { ...promptForm, steps: [...promptForm.steps, second] };
     let updated: TriggerFormValue | undefined;
-    const control = ActionField({ value: original, onChange: (value) => (updated = value) });
+    const control = StepActionField({
+      form: original,
+      errors: {},
+      index: 1,
+      onChange: (value) => (updated = value),
+    });
     control.props.onChange("script");
-    assert.equal(updated?.steps[0]?.action, "script");
-    assert.equal(updated?.steps[1], second);
-    assert.equal(original.steps[0]?.action, "prompt");
+    assert.equal(updated?.steps[1]?.action, "script");
+    assert.equal(updated?.steps[1]?.id, "later");
+    assert.equal(updated?.steps[1]?.prompt, "Keep this");
+    assert.equal(updated?.steps[0], original.steps[0]);
+    assert.equal(original.steps[1]?.action, "prompt");
   });
 });
 
 describe("script fields", () => {
   const render = (errors = {}) =>
-    renderToStaticMarkup(<ScriptFields value={form} errors={errors} onChange={noop} />);
+    renderToStaticMarkup(
+      <StepScriptFields form={form} errors={errors} onChange={noop} index={0} />,
+    );
 
   it("shows the script in a monospace textarea", () => {
     const markup = render();
@@ -123,7 +134,7 @@ describe("script fields", () => {
   });
 
   it("uses no weight, uppercase, or tracking utilities", () => {
-    const markup = render() + renderToStaticMarkup(<ActionField value={form} onChange={noop} />);
+    const markup = render() + renderToStaticMarkup(<StepActionField form={form} {...place} />);
     assert.doesNotMatch(markup, /font-(medium|semibold|bold)|uppercase|tracking-/u);
   });
 });

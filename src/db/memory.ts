@@ -2355,7 +2355,7 @@ class MemoryDatabase implements Database {
     const notice = this.hasTimelineTruncationNotice(state.triggerRunId);
     const data = this.prepareTimelineAppendData(state, input);
     const bytes = jsonbBytes(data);
-    if (timelineBudgetExceeded(state, input.kind, bytes, maxEvents, notice)) {
+    if (timelineBudgetExceeded({ state, kind: input.kind, bytes, maxEvents, notice })) {
       this.dropTimelineEvent(state, input, notice);
       return { reason: "cap" };
     }

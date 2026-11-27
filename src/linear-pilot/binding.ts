@@ -248,6 +248,14 @@ interface VerifiedOwner {
 
 type Owner = VerifiedOwner | Refused;
 
+function mappedIdentity(
+  identity: SurfaceIdentity,
+  ownerUserId: string,
+  status: "mapped" | "existing",
+): PilotIdentityResult {
+  return identity.userId === ownerUserId ? { status, identity } : refuse("identity_conflict");
+}
+
 export class PilotBindings implements PilotBindingStore {
   constructor(
     private readonly runtime: DatabaseRuntime,
@@ -289,14 +297,12 @@ export class PilotBindings implements PilotBindingStore {
     if (owner.status === "refused") return owner;
     const settle = (identity: SurfaceIdentity | undefined, status: "mapped" | "existing") => {
       if (identity === undefined) return undefined;
-      return identity.userId === authority.ownerUserId
-        ? ({ status, identity } as const)
-        : refuse("identity_conflict");
+      return mappedIdentity(identity, authority.ownerUserId, status);
     };
     const existing = settle(await this.identities.findSurfaceIdentity(identityKey), "existing");
     if (existing) return existing;
     const created = await this.identities.createSurfaceIdentity(input);
-    if (created) return settle(created, "mapped")!;
+    if (created) return mappedIdentity(created, authority.ownerUserId, "mapped");
     // Lost a create race or the identity predates a connection change: re-read, never overwrite.
     return (
       settle(await this.identities.findSurfaceIdentity(identityKey), "existing") ??
@@ -317,7 +323,13 @@ export class PilotBindings implements PilotBindingStore {
       if (rows.length === 0) return { status: "none" };
       const row = currentPilotRow(rows, authority, origin);
       if ("status" in row) return row;
-      const session = await authorizeSession(tx, authority, owner, row.sessionId, false);
+      const session = await authorizeSession({
+        tx,
+        a: authority,
+        owner,
+        sessionId: row.sessionId,
+        lock: false,
+      });
       if ("status" in session) return session;
       return { status: "bound", binding: row };
     };
@@ -341,13 +353,20 @@ export class PilotBindings implements PilotBindingStore {
       await this.lockMutation(tx, authority, input);
       const owner = await authorizeOwner(tx, authority, true);
       if (owner.status === "refused") return owner;
-      const session = await authorizeSession(tx, authority, owner, sessionId, true);
+      const session = await authorizeSession({ tx, a: authority, owner, sessionId, lock: true });
       if ("status" in session) return session;
       const rows = await nativeRows(tx, authority, input, true);
       if (rows.length === 0) {
         if (await sessionHasBinding(tx, authority.organizationId, sessionId))
           return refuse("session_already_bound");
-        const binding = await insertPilotBinding(tx, authority, input, sessionId, 1, input.now);
+        const binding = await insertPilotBinding({
+          tx,
+          authority,
+          origin: input,
+          sessionId,
+          generation: 1,
+          now: input.now,
+        });
         return binding ? ({ status: "created", binding } as const) : refuse("history_mismatch");
       }
       const row = currentPilotRow(rows, authority, input);
@@ -375,26 +394,25 @@ export class PilotBindings implements PilotBindingStore {
       const current = currentPilotRow(rows, authority, input);
       if ("status" in current) return current;
 
-      const predecessor = rows[expected.generation - 1];
-      if (
-        predecessor?.id !== expected.bindingId.toLowerCase() ||
-        predecessor.sessionId !== expected.sessionId.toLowerCase()
-      ) {
-        return refuse("history_mismatch");
-      }
-      const nextGeneration = expected.generation + 1;
-      const replay = current.generation === nextGeneration && current.sessionId === nextSessionId;
-      if (current.id !== predecessor.id && !replay) return refuse("history_mismatch");
-      const retired = await authorizeRetirement(
+      const predecessor = advancePredecessor({ rows, expected, current, nextSessionId });
+      if (predecessor === undefined) return refuse("history_mismatch");
+      const { nextGeneration, replay } = predecessor;
+      const retired = await authorizeRetirement({
         tx,
         authority,
         owner,
-        predecessor.sessionId,
+        sessionId: predecessor.sessionId,
         expected,
-      );
+      });
       if (retired) return retired;
 
-      const next = await authorizeSession(tx, authority, owner, nextSessionId, true);
+      const next = await authorizeSession({
+        tx,
+        a: authority,
+        owner,
+        sessionId: nextSessionId,
+        lock: true,
+      });
       if ("status" in next) return next;
       if (replay) return { status: "replayed", binding: current };
       if (!isFreshSession(next)) return refuse("session_unavailable");
@@ -402,22 +420,7 @@ export class PilotBindings implements PilotBindingStore {
         return refuse("session_already_bound");
       if (!surfaceRevision(nextGeneration)) return refuse("history_mismatch");
 
-      const updated = await tx.query(
-        `update surface_bindings set superseded_at = $1
-         where organization_id = $2 and id = $3 and superseded_at is null`,
-        [input.now, authority.organizationId, current.id],
-      );
-      if (updated.rowCount !== 1) return refuse("history_mismatch");
-      const binding = await insertPilotBinding(
-        tx,
-        authority,
-        input,
-        nextSessionId,
-        nextGeneration,
-        input.now,
-      );
-      if (binding === undefined) return tx.rollback(refuse("history_mismatch"));
-      return { status: "advanced", binding };
+      return advanceBinding({ tx, authority, input, nextSessionId, nextGeneration, current });
     });
   };
 
@@ -436,6 +439,75 @@ export class PilotBindings implements PilotBindingStore {
     );
     await this.locks.withTxLock(tx, "surface-policy:" + authority.connectionId.toLowerCase());
   }
+}
+
+interface AdvanceHistory {
+  rows: BindingRow[];
+  expected: PilotAdvanceExpected;
+  current: BindingRow;
+  nextSessionId: string;
+}
+
+function advancePredecessor({ rows, expected, current, nextSessionId }: AdvanceHistory) {
+  const predecessor = rows[expected.generation - 1];
+  if (
+    predecessor?.id !== expected.bindingId.toLowerCase() ||
+    predecessor.sessionId !== expected.sessionId.toLowerCase()
+  )
+    return undefined;
+
+  const nextGeneration = expected.generation + 1;
+  const replay = current.generation === nextGeneration && current.sessionId === nextSessionId;
+  if (current.id !== predecessor.id && !replay) return undefined;
+  return { sessionId: predecessor.sessionId, nextGeneration, replay };
+}
+
+interface AdvanceBindingOptions {
+  tx: TransactionHandle;
+  authority: PilotAuthority;
+  input: PilotAdvanceInput;
+  nextSessionId: string;
+  nextGeneration: number;
+  current: BindingRow;
+}
+
+async function advanceBinding({
+  tx,
+  authority,
+  input,
+  nextSessionId,
+  nextGeneration,
+  current,
+}: AdvanceBindingOptions): Promise<PilotAdvanceResult> {
+  const updated = await tx.query(
+    `update surface_bindings set superseded_at = $1
+         where organization_id = $2 and id = $3 and superseded_at is null`,
+    [input.now, authority.organizationId, current.id],
+  );
+  if (updated.rowCount !== 1) return refuse("history_mismatch");
+  const binding = await insertPilotBinding({
+    tx,
+    authority,
+    origin: input,
+    sessionId: nextSessionId,
+    generation: nextGeneration,
+    now: input.now,
+  });
+  if (binding === undefined) return tx.rollback(refuse("history_mismatch"));
+  return { status: "advanced", binding };
+}
+
+function activePrivateProfile(profile: ProfileRow | undefined): profile is ProfileRow {
+  return !!profile && profile.status === "active" && profile.access === "private";
+}
+
+function verifiedOwner(
+  a: PilotAuthority,
+  profile: ProfileRow,
+  identity: { id: string; userId: string } | undefined,
+): Owner {
+  if (identity && identity.userId !== a.ownerUserId) return refuse("identity_conflict");
+  return { status: "verified", profile, identityId: identity?.id ?? null };
 }
 
 /** Checks everything about the owner chain that does not depend on a session. */
@@ -464,8 +536,7 @@ async function authorizeOwner(tx: QueryHandle, a: PilotAuthority, lock: boolean)
      from interactive_session_profiles where id = $1 and organization_id = $2${share}`,
     [a.profileId, a.organizationId],
   );
-  if (!profile || profile.status !== "active" || profile.access !== "private")
-    return refuse("profile_unavailable");
+  if (!activePrivateProfile(profile)) return refuse("profile_unavailable");
   if (profile.createdByUserId !== a.ownerUserId) return refuse("owner_mismatch");
   const {
     rows: [member],
@@ -481,18 +552,40 @@ async function authorizeOwner(tx: QueryHandle, a: PilotAuthority, lock: boolean)
      where organization_id = $1 and workspace_id = $2 and provider_user_id = $3${share}`,
     [a.organizationId, a.workspaceId, a.humanProviderUserId],
   );
-  if (identity && identity.userId !== a.ownerUserId) return refuse("identity_conflict");
-  return { status: "verified", profile, identityId: identity?.id ?? null };
+  return verifiedOwner(a, profile, identity);
 }
 
-async function authorizeSession(
-  tx: QueryHandle,
+function usableSession(
+  session: SessionRow | undefined,
   a: PilotAuthority,
-  owner: VerifiedOwner,
-  sessionId: string,
-  lock: boolean,
+  allowClosed: boolean,
+): session is SessionRow {
+  return (
+    !!session &&
+    session.origin === "linear" &&
+    (allowClosed || session.state !== "closed") &&
+    session.profileId === a.profileId &&
+    session.startedByUserId === a.ownerUserId
+  );
+}
+
+interface AuthorizeSessionOptions {
+  tx: QueryHandle;
+  a: PilotAuthority;
+  owner: VerifiedOwner;
+  sessionId: string;
+  lock: boolean;
+  allowClosed?: boolean;
+}
+
+async function authorizeSession({
+  tx,
+  a,
+  owner,
+  sessionId,
+  lock,
   allowClosed = false,
-): Promise<SessionRow | Refused> {
+}: AuthorizeSessionOptions): Promise<SessionRow | Refused> {
   const {
     rows: [session],
   } = await tx.query<SessionRow>(
@@ -504,28 +597,36 @@ async function authorizeSession(
      from interactive_sessions where id = $1 and organization_id = $2${lock ? " for share" : ""}`,
     [sessionId, a.organizationId],
   );
-  if (
-    !session ||
-    session.origin !== "linear" ||
-    (!allowClosed && session.state === "closed") ||
-    session.profileId !== a.profileId ||
-    session.startedByUserId !== a.ownerUserId
-  )
-    return refuse("session_unavailable");
+  if (!usableSession(session, a, allowClosed)) return refuse("session_unavailable");
   if (session.profileVersion !== owner.profile.version) return refuse("profile_changed");
   if (owner.identityId === null) return refuse("identity_unmapped");
   if (session.requesterIdentityId !== owner.identityId) return refuse("actor_mismatch");
   return session;
 }
 
-async function authorizeRetirement(
-  tx: QueryHandle,
-  authority: PilotAuthority,
-  owner: VerifiedOwner,
-  sessionId: string,
-  expected: PilotAdvanceExpected,
-): Promise<Refused | undefined> {
-  const old = await authorizeSession(tx, authority, owner, sessionId, true, true);
+interface AuthorizeRetirementOptions {
+  tx: QueryHandle;
+  authority: PilotAuthority;
+  owner: VerifiedOwner;
+  sessionId: string;
+  expected: PilotAdvanceExpected;
+}
+
+async function authorizeRetirement({
+  tx,
+  authority,
+  owner,
+  sessionId,
+  expected,
+}: AuthorizeRetirementOptions): Promise<Refused | undefined> {
+  const old = await authorizeSession({
+    tx,
+    a: authority,
+    owner,
+    sessionId,
+    lock: true,
+    allowClosed: true,
+  });
   if ("status" in old) return old;
   if (
     old.state !== "closed" ||
@@ -580,14 +681,23 @@ async function sessionHasBinding(tx: QueryHandle, organizationId: string, sessio
   return binding !== undefined;
 }
 
-async function insertPilotBinding(
-  tx: QueryHandle,
-  authority: PilotAuthority,
-  origin: PilotNativeOrigin,
-  sessionId: string,
-  generation: number,
-  now: Date,
-) {
+interface InsertPilotBindingOptions {
+  tx: QueryHandle;
+  authority: PilotAuthority;
+  origin: PilotNativeOrigin;
+  sessionId: string;
+  generation: number;
+  now: Date;
+}
+
+async function insertPilotBinding({
+  tx,
+  authority,
+  origin,
+  sessionId,
+  generation,
+  now,
+}: InsertPilotBindingOptions) {
   const {
     rows: [binding],
   } = await tx.query<BindingRow>(
@@ -637,10 +747,7 @@ function currentPilotRow(
     if (
       row.generation !== index + 1 ||
       (row !== current && row.supersededAt === null) ||
-      row.organizationId !== authority.organizationId ||
-      row.connectionId !== connectionId ||
-      row.issueId !== origin.issueId ||
-      row.teamId !== origin.teamId ||
+      !matchesBindingChain(row, authority, origin, connectionId) ||
       sessions.has(row.sessionId)
     ) {
       return refuse("history_mismatch");
@@ -648,4 +755,18 @@ function currentPilotRow(
     sessions.add(row.sessionId);
   }
   return current;
+}
+
+function matchesBindingChain(
+  row: BindingRow,
+  authority: PilotAuthority,
+  origin: PilotNativeOrigin,
+  connectionId: string,
+) {
+  return (
+    row.organizationId === authority.organizationId &&
+    row.connectionId === connectionId &&
+    row.issueId === origin.issueId &&
+    row.teamId === origin.teamId
+  );
 }

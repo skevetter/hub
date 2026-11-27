@@ -16,6 +16,19 @@ import {
   URL_USERINFO_SECRET,
 } from "./test-utils/url-userinfo-fixtures.js";
 
+function assertFieldByteBounds(row: ReturnType<typeof projectTimelineEvent>): void {
+  for (const [field, bound] of [
+    ["error", 240],
+    ["reason", 120],
+    ["failure", 120],
+    ["trigger", 120],
+  ] as const) {
+    const text = row?.data[field];
+    if (typeof text === "string")
+      expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(bound);
+  }
+}
+
 const scrub = createTimelineScrubber();
 const STEPS = { succeeded: 1, failed: 1, timed_out: 1, skipped: 1, not_run: 1, total: 5 };
 const STEP_END: Extract<TimelineProjectionInput, { kind: "step_finished" }> = {
@@ -705,16 +718,7 @@ describe("closed stored-event projection", () => {
       ];
       for (const row of rows) {
         expect(Buffer.byteLength(JSON.stringify(row?.data), "utf8")).toBeLessThanOrEqual(1024);
-        for (const [field, bound] of [
-          ["error", 240],
-          ["reason", 120],
-          ["failure", 120],
-          ["trigger", 120],
-        ] as const) {
-          const text = row?.data[field];
-          if (typeof text === "string")
-            expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(bound);
-        }
+        assertFieldByteBounds(row);
       }
     }
     const long = "a".repeat(100);
