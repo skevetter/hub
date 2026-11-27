@@ -316,7 +316,7 @@ function firstSpan(text, needles, hits) {
 /**
  * Replaces env values with [redacted] and repository root paths with a dot. Overlapping
  * matches merge into one span, and a span that touches an env value is always redacted.
- * It keeps one pending hit per needle, so memory stays flat on huge logs.
+ * It keeps one pending hit per needle instead of collecting every match first.
  */
 export function redactText(text, { values, roots = [] }) {
   const needles = [
