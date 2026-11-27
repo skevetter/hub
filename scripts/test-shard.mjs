@@ -158,9 +158,10 @@ const ANSI_PATTERN = /\u001B\[[0-9;]*m/gu;
 const FAIL_LINE =
   /^\s*FAIL\s+(?:(?:\[[^\]]*\]|\|[^|]*\|)\s*)?(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+(?:>|\[).*)?\s*$/u;
 const SEPARATOR_LINE = /^\s*\u23AF{3,}/u;
-const HINT_LINE = /^If this is a long-running (?:test|hook)/u;
+const HINT_LINE =
+  /^If this is a long-running (?:test|hook), pass a timeout value as the last argument or configure it globally with "(?:testTimeout|hookTimeout)"\.$/u;
 const FRAME_LINE = /^\s+at\s.+(?::\d+:\d+|\(<anonymous>\))\)?\s*$/u;
-const REPORTER_FRAME = /^\s*\u276F/u;
+const REPORTER_FRAME = /^ \u276F /u;
 
 /** A JSON failure message cut at its first V8 stack frame. Reporter text never goes through this. */
 function withoutStack(text) {
@@ -240,11 +241,13 @@ export function logFailureHeaders(logText) {
 function reportedFailures(file) {
   const assertions = file.assertionResults ?? [];
   const failed = assertions.filter(({ status }) => status === "failed");
-  const texts = failed.map(({ failureMessages }) =>
-    (failureMessages ?? []).map(withoutStack).join("\n"),
-  );
+  const texts = failed.flatMap(({ failureMessages }) => {
+    const entries =
+      Array.isArray(failureMessages) && failureMessages.length > 0 ? failureMessages : [""];
+    return entries.map((entry) => withoutStack(entry ?? ""));
+  });
   const unexplained = texts.some((text) => text.trim() === "");
-  const fileMessage = typeof file.message === "string" ? withoutStack(file.message) : "";
+  const fileMessage = typeof file.message === "string" ? file.message : "";
   return { texts, fileMessage, unexplained };
 }
 
