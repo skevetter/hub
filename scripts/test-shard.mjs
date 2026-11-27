@@ -1,4 +1,5 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join, relative } from "node:path";
 
@@ -6,14 +7,17 @@ export const BUILT_SERVER_KEY = ".output/server/";
 export const RETRY_CAP = 5;
 export const DEFAULT_SHARD_TOTAL = 6;
 const MAX_SHARD_TOTAL = 100;
-const MIN_REDACTED_LENGTH = 6;
+const MIN_REDACTED_LENGTH = 3;
+const TRIVIAL_VALUE = /^(?:\d+|true|false|yes|no|on|off|null|undefined)$/iu;
 const SHARD_PATTERN = /^([1-9]\d*)\/([1-9]\d*)$/u;
 const COUNT_PATTERN = /^[1-9]\d*$/u;
-const SENSITIVE_NAME = /TOKEN|SECRET|KEY|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|AUTH|COOKIE|SESSION/iu;
+const SENSITIVE_NAME =
+  /TOKEN|SECRET|KEY|PASS|CREDENTIAL|PRIVATE|AUTH|COOKIE|SESSION|URL|URI|DSN|JWT|BEARER|SALT|SIG|CONN|WEBHOOK|CERT|SEED/iu;
+const PUBLIC_NAMES = new Set(["GITHUB_SERVER_URL", "GITHUB_API_URL", "GITHUB_GRAPHQL_URL"]);
 const HOST_NAMES = ["HOSTNAME", "RUNNER_NAME", "COMPUTERNAME"];
 const CONTAINER_START_PATTERNS = [
-  /Port \d+\/tcp not bound after \d+ ?ms/u,
-  /Hook timed out in \d+ ?ms/u,
+  /^(?:\w*Error: )?Port \d+\/tcp not bound after \d+ ?ms\b/u,
+  /^(?:\w*Error: )?Hook timed out in \d+ ?ms\b/u,
 ];
 
 /** A bad command line or environment: the process exits 2 instead of 1. */
@@ -125,31 +129,72 @@ export function coverageProblems(files, { groups, builtOnly, total }) {
   return problems;
 }
 
-function failureTexts(file) {
-  const failed = (file.assertionResults ?? []).filter(({ status }) => status === "failed");
-  return [file.message, ...failed.flatMap(({ failureMessages }) => failureMessages ?? [])].filter(
-    (text) => typeof text === "string" && text.trim() !== "",
-  );
-}
+const ANSI_PATTERN = /\u001B\[[0-9;]*m/gu;
+const FAIL_LINE =
+  /^\s*FAIL\s+(?:\[[^\]]*\]\s+)?(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+>.*)?\s*$/u;
+const SEPARATOR_LINE = /^\s*\u23AF{3,}/u;
 
-/** True when every failure in the file is a container-start timeout. Nothing else is retried. */
-export function containerStartFailure(file) {
-  const texts = failureTexts(file);
+function firstLine(text) {
   return (
-    texts.length > 0 &&
-    texts.every((text) => CONTAINER_START_PATTERNS.some((pattern) => pattern.test(text)))
+    String(text)
+      .split("\n")
+      .find((line) => line.trim() !== "")
+      ?.trim() ?? ""
   );
 }
 
-/** The failed files, when all of them failed only on a container start. Otherwise empty. */
-export function retryableFiles(report, failedFiles, root) {
+function isContainerStartHeader(text) {
+  const header = firstLine(text);
+  return CONTAINER_START_PATTERNS.some((pattern) => pattern.test(header));
+}
+
+/** First error line of each failure block the default reporter printed, keyed by test file. */
+export function logFailureHeaders(logText) {
+  const headers = new Map();
+  let pending;
+  for (const line of logText.replace(ANSI_PATTERN, "").split("\n")) {
+    const failed = FAIL_LINE.exec(line);
+    if (failed) pending = failed[1];
+    else if (SEPARATOR_LINE.test(line)) pending = undefined;
+    else if (pending && line.trim() !== "") {
+      headers.set(pending, [...(headers.get(pending) ?? []), line.trim()]);
+      pending = undefined;
+    }
+  }
+  return headers;
+}
+
+function reportedFailures(file) {
+  const assertions = file.assertionResults ?? [];
+  const failed = assertions.filter(({ status }) => status === "failed");
+  const texts = failed.map(({ failureMessages }) => (failureMessages ?? []).join("\n"));
+  const fileMessage = typeof file.message === "string" ? file.message : "";
+  if (fileMessage.trim() !== "") texts.push(fileMessage);
+  return { texts, unexplained: failed.some((_, index) => texts[index].trim() === "") };
+}
+
+/**
+ * True when every failure of the file starts with a container-start timeout header.
+ * Vitest's JSON report omits hook failures, so the log blocks count as evidence too.
+ */
+export function containerStartFailure(file, logHeaders = []) {
+  const { texts, unexplained } = reportedFailures(file);
+  const pending = (file.assertionResults ?? []).some(({ status }) => status === "pending");
+  if (pending || unexplained) return false;
+  const headers = [...texts, ...logHeaders];
+  return headers.length > 0 && headers.every(isContainerStartHeader);
+}
+
+/** The failed files, when every one of them failed only on a container start. Otherwise empty. */
+export function retryableFiles(report, failedFiles, { root, headers = new Map() }) {
   if (failedFiles.length === 0) return [];
   const failed = new Set(failedFiles);
   const results = report.testResults.filter(({ name }) => failed.has(relative(root, name)));
-  const retryable = results.length === failed.size && results.every(containerStartFailure);
+  const retryable =
+    results.length === failed.size &&
+    results.every((file) => containerStartFailure(file, headers.get(relative(root, file.name))));
   return retryable ? failedFiles : [];
 }
-
 export function countAssertions(testResults) {
   const counts = { passed: 0, failed: 0, skipped: 0 };
   for (const { assertionResults } of testResults) {
@@ -178,28 +223,51 @@ export function mergeReports(reports, retryReport) {
   };
 }
 
+function isSensitiveName(name) {
+  if (PUBLIC_NAMES.has(name)) return false;
+  return SENSITIVE_NAME.test(name) || HOST_NAMES.includes(name);
+}
+
 export function sensitiveValues(env = process.env, host = hostname()) {
   const named = Object.entries(env)
-    .filter(([name]) => SENSITIVE_NAME.test(name) || HOST_NAMES.includes(name))
+    .filter(([name]) => isSensitiveName(name))
     .map(([, value]) => value);
   return [...new Set([...named, host])]
-    .filter((value) => typeof value === "string" && value.length >= MIN_REDACTED_LENGTH)
+    .filter(
+      (value) =>
+        typeof value === "string" &&
+        value.length >= MIN_REDACTED_LENGTH &&
+        !TRIVIAL_VALUE.test(value),
+    )
     .sort((a, b) => b.length - a.length);
 }
 
-export function redactText(text, values) {
-  return values.reduce((result, value) => result.split(value).join("[redacted]"), text);
+/** Replaces env values with [redacted] and the repository root with a dot. */
+export function redactText(text, { values, root }) {
+  const local = root ? text.split(root).join(".") : text;
+  return values.reduce((result, value) => result.split(value).join("[redacted]"), local);
 }
 
-export function redactDeep(value, values) {
-  if (typeof value === "string") return redactText(value, values);
-  if (Array.isArray(value)) return value.map((item) => redactDeep(item, values));
+export function redactDeep(value, scrubber) {
+  if (typeof value === "string") return redactText(value, scrubber);
+  if (Array.isArray(value)) return value.map((item) => redactDeep(item, scrubber));
   if (value && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, redactDeep(item, values)]),
+      Object.entries(value).map(([key, item]) => [
+        redactText(key, scrubber),
+        redactDeep(item, scrubber),
+      ]),
     );
   }
   return value;
+}
+
+function escapeData(text) {
+  return String(text).replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A");
+}
+
+function plainLine(text) {
+  return String(text).replace(/[\r\n]+/gu, " ");
 }
 
 export function outcomeLine({ title, passed, durationMs, counts, files, retried }) {
@@ -209,7 +277,7 @@ export function outcomeLine({ title, passed, durationMs, counts, files, retried 
 }
 
 function slowestFiles(report, root, limit) {
-  return report.testResults
+  return (report?.testResults ?? [])
     .map((entry) => ({
       file: entry.name.replace(`${root}/`, ""),
       ms: entry.endTime - entry.startTime,
@@ -251,15 +319,15 @@ export function relativizeReport(report, root) {
   return { ...report, testResults };
 }
 
-/** Writes the artifact files. Env values and the host name are removed from every file. */
-export function writeShardArtifacts(directory, label, { report, summary, logs }, values) {
+/** Writes the artifact files. Env values, the host name and the root path are removed. */
+export function writeShardArtifacts(directory, label, { report, summary, logs }, scrubber) {
   mkdirSync(directory, { recursive: true });
   const write = (name, data) =>
-    writeFileSync(join(directory, name), `${JSON.stringify(redactDeep(data, values))}\n`);
-  write(`${label}.json`, report);
+    writeFileSync(join(directory, name), `${JSON.stringify(redactDeep(data, scrubber))}\n`);
+  if (report) write(`${label}.json`, report);
   write(`${label}.summary.json`, summary);
-  for (const [name, path] of logs.filter(([, path]) => existsSync(path))) {
-    writeFileSync(join(directory, name), redactText(readFileSync(path, "utf8"), values));
+  for (const [name, path] of logs.filter(([, path]) => path && existsSync(path))) {
+    writeFileSync(join(directory, name), redactText(readFileSync(path, "utf8"), scrubber));
   }
 }
 
@@ -267,32 +335,46 @@ export function appendStepSummary(path, markdown) {
   if (path) appendFileSync(path, markdown);
 }
 
-function retryCandidates(first, root) {
+async function retryCandidates(first, root) {
   const unexplained =
-    first.incompleteFiles || first.processError || !first.cleanLog || !first.report;
+    first.runExit !== 1 ||
+    first.incompleteFiles ||
+    first.processError ||
+    !first.cleanLog ||
+    !first.report;
   if (unexplained) return [];
-  return retryableFiles(first.report, first.failedFiles, root);
+  const logText = await readFile(first.log, "utf8").catch(() => null);
+  if (logText === null) return [];
+  const headers = logFailureHeaders(logText);
+  return retryableFiles(first.report, first.failedFiles, { root, headers });
 }
 
-function sumCounts(first, retry) {
-  return countAssertions(mergeReports([first.report], retry.report).testResults);
+async function retryEachFile(candidates, { label, execute }) {
+  const outcomes = [];
+  for (const [index, file] of candidates.entries()) {
+    const run = await execute(`${label} retry ${index + 1}`, [file]);
+    outcomes.push({ file, run, passed: run.exitCode === 0 });
+  }
+  return outcomes;
 }
 
-async function retryOnce(first, { label, root, execute, candidates }) {
-  const retry = await execute(`${label} retry`, candidates);
-  const report = mergeReports([first.report], retry.report);
-  const failed = retry.exitCode !== 0;
+function afterRetries(first, outcomes) {
+  const merged = mergeReports([first.report], {
+    testResults: outcomes.flatMap(({ run }) => run.report?.testResults ?? []),
+  });
+  const failed = outcomes.filter(({ passed }) => !passed);
+  const exitCode = failed.length > 0 ? 1 : 0;
   return {
-    exitCode: failed ? 1 : 0,
-    durationMs: first.durationMs + retry.durationMs,
-    counts: sumCounts(first, retry),
-    report,
-    failedFiles: failed ? retry.failedFiles : [],
-    retried: candidates,
-    retryFailed: failed,
-    diagnostic: retry.diagnostic,
-    logs: [first.log, retry.log],
-    root,
+    exitCode,
+    durationMs: outcomes.reduce((sum, { run }) => sum + run.durationMs, first.durationMs),
+    counts: countAssertions(merged.testResults),
+    report: { ...merged, success: exitCode === 0 && merged.success },
+    failedFiles: failed.map(({ file }) => file),
+    retried: outcomes.map(({ file }) => file),
+    retryOutcomes: outcomes.map(({ file, passed }) => ({ file, passed })),
+    retryFailed: failed.length > 0,
+    diagnostic: failed[0]?.run.diagnostic,
+    logs: [first.log, ...outcomes.map(({ run }) => run.log)],
   };
 }
 
@@ -309,31 +391,30 @@ function singleRun(first, retried = []) {
   };
 }
 
-/** Runs the files once. Retries the failed ones once, serially, only after container-start timeouts. */
+/** Runs the files once. Retries the failed ones once each, serially, only after container-start timeouts. */
 export async function runWithRetry({ label, files, root, execute }) {
   const first = await execute(label, files);
   if (first.exitCode === 0) return singleRun(first);
-  const candidates = retryCandidates(first, root);
+  const candidates = await retryCandidates(first, root);
   if (candidates.length === 0) return singleRun(first);
   if (candidates.length > RETRY_CAP) {
     const diagnostic = `${candidates.length} files failed on container-start timeouts, more than ${RETRY_CAP}. Not retried.`;
     return { ...singleRun(first), tooManyRetries: candidates.length, diagnostic };
   }
-  return retryOnce(first, { label, root, execute, candidates });
+  return afterRetries(first, await retryEachFile(candidates, { label, execute }));
 }
 
 export function retryAnnotations(result) {
-  const lines = (result.retried ?? []).map((file) =>
-    result.retryFailed
-      ? `::error title=Failed again after a container-start retry::${file}`
-      : `::warning title=Retried after a container-start timeout::${file} passed on a serial retry`,
+  const lines = (result.retryOutcomes ?? []).map(({ file, passed }) =>
+    passed
+      ? `::warning title=Retried after a container-start timeout::${escapeData(file)} passed on a serial retry`
+      : `::error title=Failed again after a container-start retry::${escapeData(file)}`,
   );
   if (result.tooManyRetries) {
-    lines.push(`::error title=Too many container-start timeouts::${result.diagnostic}`);
+    lines.push(`::error title=Too many container-start timeouts::${escapeData(result.diagnostic)}`);
   }
   return lines;
 }
-
 function summaryRecord({ title, label, files, result, line }) {
   return {
     title,
@@ -372,21 +453,21 @@ export async function runShardJob(options) {
     retried: retried.length,
   });
   print(line);
-  if (result.diagnostic) print(`  ${title}: ${result.diagnostic}`);
-  for (const file of result.failedFiles) print(`  ${title}: ${file}`);
+  if (result.diagnostic) print(`  ${title}: ${plainLine(result.diagnostic)}`);
+  for (const file of result.failedFiles) print(`  ${title}: ${plainLine(file)}`);
   for (const annotation of retryAnnotations(result)) print(annotation);
   const exitCode = result.tooManyRetries ? 1 : result.exitCode;
-  const values = sensitiveValues(options.env, options.host);
+  const scrubber = { values: sensitiveValues(options.env, options.host), root };
   if (reportDir) {
     const summary = summaryRecord({ title, label, files: files.length, result, line });
-    const logs = [
-      ["vitest.log", result.logs[0]],
-      ["vitest.retry.log", result.logs[1] ?? ""],
-    ];
-    const report = relativizeReport(result.report, root);
-    writeShardArtifacts(reportDir, label, { report, summary, logs }, values);
+    const logs = result.logs.map((path, index) => [
+      index === 0 ? "vitest.log" : `vitest.retry-${index}.log`,
+      path,
+    ]);
+    const report = result.report && relativizeReport(result.report, root);
+    writeShardArtifacts(reportDir, label, { report, summary, logs }, scrubber);
   }
   const markdown = stepSummary({ title, line, report: result.report, root, retried });
-  appendStepSummary(summaryPath, redactText(markdown, values));
+  appendStepSummary(summaryPath, redactText(markdown, scrubber));
   return exitCode;
 }

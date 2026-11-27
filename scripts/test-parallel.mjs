@@ -26,10 +26,15 @@ import { runWorkerGroup, takeFullSuiteLock, watchTestSignals } from "./test-work
 
 const failedListVersion = 1;
 
+function comparePaths(a, b) {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}
+
 export function partitionFiles(files, count) {
   const shardCount = Math.min(count, files.length);
   const ideal = files.reduce((sum, file) => sum + file.weight, 0) / shardCount;
-  const sorted = [...files].sort((a, b) => b.weight - a.weight || a.path.localeCompare(b.path));
+  const sorted = [...files].sort((a, b) => b.weight - a.weight || comparePaths(a.path, b.path));
   const pinned = sorted.filter((file) => file.cached !== false && file.weight > ideal);
   const pinnedPaths = new Set(pinned.map((file) => file.path));
   const shards = Array.from({ length: shardCount - pinned.length }, () => ({
@@ -270,6 +275,7 @@ function unreportedRun({ run, files, durationMs, signal, log }) {
   return {
     exitCode: 1,
     durationMs,
+    log,
     failedFiles: files,
     incompleteFiles: files.length,
     interruptedFiles: signal.aborted ? files.length : 0,
@@ -308,7 +314,7 @@ export async function executeFiles({
   const report = await readVitestReport(reportPath);
   if (!report) return unreportedRun({ run, files, durationMs, signal, log });
   const result = summarizeReport(report, { root, files, run, durationMs, signal, log, reportPath });
-  Object.assign(result, { report, log, processError: run.processError });
+  Object.assign(result, { report, log, processError: run.processError, runExit: run.exitCode });
   if (result.exitCode) result.cleanLog = await logHasNoUnhandledErrors(log);
   if (collectTiming && !signal.aborted) {
     result.timings = await completedTimings(report, { root, files, run, log });
@@ -644,10 +650,7 @@ async function runMode(mode, context) {
     const failed = await readFailedFiles(failedFileList, files);
     return runSerialRetry(failed, { execute, signal, publishSuccess });
   }
-  return runFullSuite({
-    ...context,
-    shardOverride: parseShardOverride(process.env.TEST_SHARDS),
-  });
+  return runFullSuite(context);
 }
 
 async function main(signal) {
@@ -656,6 +659,10 @@ async function main(signal) {
   const { head } = printRunContext(root, ACTIONS[mode.kind]);
   const cacheRoot = join(root, "node_modules/.vite/vitest");
   const failedFileList = join(cacheRoot, "test-parallel", "failed.json");
+  const shardOverride =
+    mode.kind === "full" || mode.kind === "rerun"
+      ? parseShardOverride(process.env.TEST_SHARDS)
+      : undefined;
   let lock;
   let runDirectory;
   try {
@@ -683,6 +690,7 @@ async function main(signal) {
       cacheRoot,
       files,
       failedFileList,
+      shardOverride,
       execute,
       signal,
       publishSuccess,

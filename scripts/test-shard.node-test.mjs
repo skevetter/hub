@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,13 +8,15 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { timingEntries } from "./generate-test-timings.mjs";
-import { partitionFiles } from "./test-parallel.mjs";
+import { partitionFiles, weighFiles } from "./test-parallel.mjs";
 import {
   RETRY_CAP,
   UsageError,
   coverageProblems,
+  logFailureHeaders,
   parseShardSelection,
   redactDeep,
+  retryAnnotations,
   retryableFiles,
   runShardJob,
   runWithRetry,
@@ -148,49 +151,108 @@ test("coverage needs every file exactly once", () => {
   );
 });
 
-test("the six real shards plus built-only cover the recorded timings exactly once", () => {
+test("the six real shards plus built-only cover every recorded file exactly once", async () => {
   const files = Object.keys(baselineTimings);
-  const { builtOnly, shardable } = splitBuiltOnly(
-    files,
-    runtimeFiles[".output/server/"].filter((f) => files.includes(f)),
-  );
-  const weighted = shardable.map((path) => ({ path, weight: 1 + path.length, cached: true }));
+  const { builtOnly, shardable } = splitBuiltOnly(files, runtimeFiles[".output/server/"]);
+  const repository = fileURLToPath(new URL("../", import.meta.url));
+  const weighted = await weighFiles(repository, "/nonexistent", shardable, {
+    baselineOnly: true,
+  });
   const groups = partitionFiles(weighted, 6);
   assert.deepEqual(coverageProblems(files, { groups, builtOnly, total: 6 }), []);
   assert.deepEqual(groups, partitionFiles([...weighted].reverse(), 6));
 });
 
-test("only container-start timeouts make a file retryable", () => {
+test("equal weights split by code unit, not by locale", () => {
+  const files = ["z.test.ts", "\u00e4.test.ts", "a.test.ts", "b.test.ts"].map((path) => ({
+    path,
+    weight: 1,
+  }));
+  assert.deepEqual(partitionFiles(files, 2), [
+    ["a.test.ts", "z.test.ts"],
+    ["b.test.ts", "\u00e4.test.ts"],
+  ]);
+});
+
+const logDirectory = mkdtempSync(join(tmpdir(), "hub-shard-logs-"));
+process.on("exit", () => rmSync(logDirectory, { recursive: true, force: true }));
+let logCount = 0;
+
+function logWith(blocks) {
+  const text = blocks
+    .map(
+      ([file, header]) =>
+        `\n\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF Failed Suites 1 \u23AF\u23AF\u23AF\u23AF\n\n \u001B[41m\u001B[1m FAIL \u001B[22m\u001B[49m  ${file} > suite\n${header}\nstack line\n`,
+    )
+    .join("");
+  logCount += 1;
+  const path = join(logDirectory, `first-${logCount}.log`);
+  writeFileSync(path, text);
+  return path;
+}
+
+test("log blocks give each failing file its first error line", () => {
+  const log = logWith([
+    ["a.test.ts", hookTimeout],
+    ["b.test.ts", portTimeout],
+    ["a.test.ts", "AssertionError: nope"],
+  ]);
+  const headers = logFailureHeaders(readFileSync(log, "utf8"));
+  assert.deepEqual(headers.get("a.test.ts"), [hookTimeout, "AssertionError: nope"]);
+  assert.deepEqual(headers.get("b.test.ts"), [portTimeout]);
+});
+
+test("only a container-start header makes a file retryable", () => {
+  const hookFailure = {
+    name: `${root}/e.test.ts`,
+    status: "failed",
+    message: "",
+    assertionResults: [{ status: "skipped", failureMessages: [] }],
+  };
   const report = reportOf(
     failedEntry("a.test.ts", portTimeout, hookTimeout),
     failedEntry("b.test.ts", portTimeout),
     failedEntry("c.test.ts", portTimeout, "AssertionError: expected 1 to be 2"),
     failedEntry("d.test.ts", "Error: Test timed out in 30000ms."),
-    { name: `${root}/e.test.ts`, status: "failed", message: hookTimeout, assertionResults: [] },
-    { name: `${root}/f.test.ts`, status: "failed", assertionResults: [] },
+    failedEntry("q.test.ts", "AssertionError: expected 'Hook timed out in 10000ms' to be null"),
+    { name: `${root}/f.test.ts`, status: "failed", message: "", assertionResults: [] },
+    { ...failedEntry("n.test.ts"), assertionResults: [{ status: "failed", failureMessages: [] }] },
+    {
+      name: `${root}/p.test.ts`,
+      status: "failed",
+      assertionResults: [
+        { status: "failed", failureMessages: [hookTimeout] },
+        { status: "pending" },
+      ],
+    },
+    hookFailure,
     passedEntry("g.test.ts"),
   );
-  assert.deepEqual(retryableFiles(report, ["a.test.ts", "b.test.ts", "e.test.ts"], root), [
-    "a.test.ts",
-    "b.test.ts",
-    "e.test.ts",
-  ]);
-  assert.deepEqual(retryableFiles(report, ["a.test.ts", "c.test.ts"], root), []);
-  assert.deepEqual(retryableFiles(report, ["d.test.ts"], root), []);
-  assert.deepEqual(retryableFiles(report, ["f.test.ts"], root), []);
-  assert.deepEqual(retryableFiles(report, [], root), []);
+  const ready = (files, headers) => retryableFiles(report, files, { root, headers });
+  assert.deepEqual(ready(["a.test.ts", "b.test.ts"]), ["a.test.ts", "b.test.ts"]);
+  for (const file of ["c", "d", "q", "f", "n", "p"]) {
+    assert.deepEqual(ready([`${file}.test.ts`]), [], file);
+  }
+  assert.deepEqual(ready(["a.test.ts", "c.test.ts"]), []);
+  assert.deepEqual(ready([]), []);
+  assert.deepEqual(ready(["e.test.ts"]), []);
+  const hookHeaders = new Map([["e.test.ts", [hookTimeout]]]);
+  assert.deepEqual(ready(["e.test.ts"], hookHeaders), ["e.test.ts"]);
+  const mixed = new Map([["e.test.ts", [hookTimeout, "AssertionError: nope"]]]);
+  assert.deepEqual(ready(["e.test.ts"], mixed), []);
 });
 
 function firstRun(failures, extra = {}) {
   const failed = failures.map(([file]) => file);
   return {
     exitCode: 1,
+    runExit: 1,
     durationMs: 1000,
     counts: { passed: 3, failed: failures.length, skipped: 0 },
     failedFiles: failed,
     incompleteFiles: 0,
     cleanLog: true,
-    log: "/nowhere/first.log",
+    log: logWith(failures),
     report: reportOf(
       passedEntry("ok.test.ts"),
       ...failures.map(([file, message]) => failedEntry(file, message)),
@@ -207,7 +269,9 @@ function retryRun(files, exitCode = 0) {
     failedFiles: exitCode ? files : [],
     incompleteFiles: 0,
     log: "/nowhere/retry.log",
-    report: reportOf(...files.map(passedEntry)),
+    report: exitCode
+      ? reportOf(failedEntry(files[0], "Error: still bad"))
+      : reportOf(...files.map(passedEntry)),
   };
 }
 
@@ -232,23 +296,59 @@ test("a timed-out file is retried once alone and the shard then passes", async (
   });
   assert.deepEqual(calls, [
     { name: "shard-1", files: ["ok.test.ts", "a.test.ts"] },
-    { name: "shard-1 retry", files: ["a.test.ts"] },
+    { name: "shard-1 retry 1", files: ["a.test.ts"] },
   ]);
   assert.equal(result.exitCode, 0);
+  assert.equal(result.report.success, true);
   assert.deepEqual(result.retried, ["a.test.ts"]);
   assert.deepEqual(result.counts, { passed: 2, failed: 0, skipped: 0 });
   assert.equal(result.durationMs, 1500);
 });
 
-test("a file that fails again after the retry fails the shard", async () => {
-  const { execute, calls } = executor(firstRun([["a.test.ts", hookTimeout]]), (files) =>
-    retryRun(files, 1),
+test("each retried file runs in its own process and reports its own outcome", async () => {
+  const failures = [
+    ["a.test.ts", portTimeout],
+    ["b.test.ts", hookTimeout],
+  ];
+  const { execute, calls } = executor(firstRun(failures), (files) =>
+    retryRun(files, files[0] === "b.test.ts" ? 1 : 0),
   );
+  const result = await runWithRetry({
+    label: "shard-1",
+    files: ["a.test.ts", "b.test.ts"],
+    root,
+    execute,
+  });
+  assert.deepEqual(
+    calls.slice(1).map(({ name, files }) => [name, files]),
+    [
+      ["shard-1 retry 1", ["a.test.ts"]],
+      ["shard-1 retry 2", ["b.test.ts"]],
+    ],
+  );
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.report.success, false);
+  assert.deepEqual(result.failedFiles, ["b.test.ts"]);
+  assert.deepEqual(retryAnnotations(result), [
+    "::warning title=Retried after a container-start timeout::a.test.ts passed on a serial retry",
+    "::error title=Failed again after a container-start retry::b.test.ts",
+  ]);
+});
+
+test("a failure the JSON report cannot show is retried from the log header", async () => {
+  const hookOnly = {
+    name: `${root}/a.test.ts`,
+    status: "failed",
+    message: "",
+    assertionResults: [{ status: "skipped", failureMessages: [] }],
+  };
+  const first = firstRun([["a.test.ts", hookTimeout]], {
+    report: reportOf(passedEntry("ok.test.ts"), hookOnly),
+  });
+  const { execute, calls } = executor(first, (files) => retryRun(files));
   const result = await runWithRetry({ label: "shard-1", files: ["a.test.ts"], root, execute });
   assert.equal(calls.length, 2);
-  assert.equal(result.exitCode, 1);
-  assert.equal(result.retryFailed, true);
-  assert.deepEqual(result.failedFiles, ["a.test.ts"]);
+  assert.equal(result.exitCode, 0);
 });
 
 test("other failures, odd exits and unclean logs are never retried", async () => {
@@ -256,8 +356,11 @@ test("other failures, odd exits and unclean logs are never retried", async () =>
   const cases = [
     firstRun([timeout, ["b.test.ts", "AssertionError: nope"]]),
     firstRun([timeout], { processError: "SIGKILL" }),
+    firstRun([timeout], { runExit: 2 }),
     firstRun([timeout], { incompleteFiles: 1 }),
     firstRun([timeout], { cleanLog: false }),
+    firstRun([timeout], { log: "/nowhere/missing.log" }),
+    firstRun([timeout], { log: logWith([timeout, ["a.test.ts", "AssertionError: nope"]]) }),
   ];
   for (const first of cases) {
     const { execute, calls } = executor(first, () => assert.fail("must not retry"));
@@ -294,19 +397,44 @@ test("more than the retry cap fails the shard without retrying", async () => {
   assert.equal(ok.retried.length, RETRY_CAP);
 });
 
-test("artifacts and the summary hide env values and the host name", async (t) => {
+test("workflow command text in file names and diagnostics is escaped", () => {
+  const lines = retryAnnotations({
+    retryOutcomes: [{ file: "a%b\n::add-mask::x.test.ts", passed: true }],
+    tooManyRetries: 6,
+    diagnostic: "six\r\nfiles",
+  });
+  assert.deepEqual(lines, [
+    "::warning title=Retried after a container-start timeout::a%25b%0A::add-mask::x.test.ts passed on a serial retry",
+    "::error title=Too many container-start timeouts::six%0D%0Afiles",
+  ]);
+});
+
+async function artifactText(directory) {
+  const names = (await readdir(directory)).sort();
+  const texts = await Promise.all(names.map((name) => readFile(join(directory, name), "utf8")));
+  return { names, text: texts.join("\n") };
+}
+
+test("artifacts and the summary hide env values, short secrets and the host name", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "hub-shard-artifacts-"));
   t.after(() => rm(directory, { recursive: true }));
   const env = {
     GITHUB_TOKEN: "ghs_supersecrettokenvalue",
     API_KEY: "key-1234567890",
+    DB_PASSWORD: "admin",
+    DATABASE_URL: "postgres://user:pw@db.example/app",
     RUNNER_NAME: "GitHub Actions 42",
+    GITHUB_SERVER_URL: "https://github.com",
     HOME: "/home/runner",
-    SHORT_SECRET: "abc",
+    SHORT_SECRET: "ab",
+    FLAG_TOKEN: "true",
   };
-  const host = "fv-az123-456.internal";
+  const host = "hub01";
   const logPath = join(directory, "in.log");
-  await writeFile(logPath, `token ghs_supersecrettokenvalue on ${host} as GitHub Actions 42\n`);
+  await writeFile(
+    logPath,
+    `token ghs_supersecrettokenvalue on ${host} as GitHub Actions 42 pw admin in ${root}/src/a.test.ts\n`,
+  );
   const first = firstRun([["a.test.ts", `${portTimeout} key-1234567890`]], { log: logPath });
   const { execute } = executor(first, (files) => ({ ...retryRun(files), log: logPath }));
   const summaryPath = join(directory, "summary.md");
@@ -324,24 +452,26 @@ test("artifacts and the summary hide env values and the host name", async (t) =>
     print: (line) => printed.push(line),
   });
   assert.equal(exitCode, 0);
-  assert.deepEqual((await readdir(join(directory, "out"))).sort(), [
+  const { names, text } = await artifactText(join(directory, "out"));
+  assert.deepEqual(names, [
     "shard-1.json",
     "shard-1.summary.json",
     "vitest.log",
-    "vitest.retry.log",
+    "vitest.retry-1.log",
   ]);
-  const everything = [
-    ...(await Promise.all(
-      (
-        await readdir(join(directory, "out"))
-      ).map((name) => readFile(join(directory, "out", name), "utf8")),
-    )),
-    await readFile(summaryPath, "utf8"),
-  ].join("\n");
-  for (const secret of ["ghs_supersecrettokenvalue", "key-1234567890", host, "GitHub Actions 42"]) {
-    assert.ok(!everything.includes(secret), secret);
-  }
+  const everything = `${text}\n${await readFile(summaryPath, "utf8")}`;
+  const secrets = [
+    "ghs_supersecrettokenvalue",
+    "key-1234567890",
+    host,
+    "GitHub Actions 42",
+    "admin",
+    "postgres://",
+  ];
+  for (const secret of secrets) assert.ok(!everything.includes(secret), secret);
+  assert.ok(!everything.includes(`${root}/`));
   assert.match(everything, /\[redacted\]/u);
+  assert.ok(!sensitiveValues(env, host).includes("https://github.com"));
   const saved = JSON.parse(await readFile(join(directory, "out", "shard-1.json"), "utf8"));
   assert.deepEqual(saved.testResults.map(({ name }) => name).sort(), ["a.test.ts", "ok.test.ts"]);
   assert.deepEqual(timingEntries(saved, root).sort(), [
@@ -356,10 +486,48 @@ test("artifacts and the summary hide env values and the host name", async (t) =>
     await readFile(summaryPath, "utf8"),
     /Retried once after a container-start timeout/u,
   );
-  assert.deepEqual(sensitiveValues({ SHORT_SECRET: "abc", PATH: "/usr/bin:/bin" }, "h"), []);
-  assert.deepEqual(redactDeep({ a: ["x-secret-value"] }, ["secret-value"]), {
-    a: ["x-[redacted]"],
+});
+
+test("redaction covers short values and object keys but not trivial values", () => {
+  assert.deepEqual(sensitiveValues({ SHORT_SECRET: "abc", PATH: "/usr/bin:/bin" }, "h"), ["abc"]);
+  assert.deepEqual(sensitiveValues({ A_TOKEN: "ab", B_TOKEN: "true", C_TOKEN: "12345" }, "h"), []);
+  const scrubber = { values: ["secret-value"] };
+  assert.deepEqual(redactDeep({ "k-secret-value": ["x-secret-value"] }, scrubber), {
+    "k-[redacted]": ["x-[redacted]"],
   });
+});
+
+test("a run without a JSON report still writes its log and summary", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hub-shard-noreport-"));
+  t.after(() => rm(directory, { recursive: true }));
+  const logPath = join(directory, "in.log");
+  await writeFile(logPath, "vitest crashed\n");
+  const execute = async () => ({
+    exitCode: 1,
+    durationMs: 10,
+    log: logPath,
+    failedFiles: ["a.test.ts"],
+    incompleteFiles: 1,
+    counts: { passed: 0, failed: 0, skipped: 0 },
+    diagnostic: "Vitest exited without a readable JSON report",
+  });
+  const exitCode = await runShardJob({
+    title: "Shard 1/6",
+    label: "shard-1",
+    files: ["a.test.ts"],
+    root,
+    execute,
+    env: {},
+    host: "h",
+    reportDir: join(directory, "out"),
+    summaryPath: join(directory, "summary.md"),
+    print: () => {},
+  });
+  assert.equal(exitCode, 1);
+  assert.deepEqual((await readdir(join(directory, "out"))).sort(), [
+    "shard-1.summary.json",
+    "vitest.log",
+  ]);
 });
 
 test("bad shard arguments exit 2 before any test runs", () => {

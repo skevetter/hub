@@ -72,15 +72,19 @@ are not in any shard. Run them after `npm run build` with `npm run test:parallel
 built-only suites cover every discovered file exactly once, 1 when they do not, and 2 on bad
 arguments. `TEST_SHARD_TOTAL` sets the shard count for the check, 6 by default.
 
-A file whose failures are all `Port <n>/tcp not bound after <n>ms` or `Hook timed out in <n>ms` is
-retried once, alone, in a second Vitest process. Each retry prints a `::warning::` line and shows
-in the step summary. Any other failure is final. More than 5 such files in one shard fails the
-shard without a retry.
+A file is retried once when every failure in it starts with `Port <n>/tcp not bound after <n>ms` or
+`Hook timed out in <n>ms`. Vitest's JSON report leaves out hook failures, so the runner also reads
+the first error line of each failure block in `vitest.log`. Each such file runs alone in its own
+Vitest process. Each retry prints a `::warning::` line (or `::error::` if it fails again) and shows
+in the step summary. Nothing is retried when the shard has any other failure, a process error, an
+incomplete report or an unhandled error. More than 5 candidate files in one shard fails the shard
+without a retry.
 
 With `TEST_SHARD_REPORT_DIR` set, the run writes `shard-<i>.json` (or `built-only.json`), a
-`.summary.json` next to it, `vitest.log` and, after a retry, `vitest.retry.log`. Values of
-environment variables whose names suggest secrets, plus the host name, are replaced with
-`[redacted]` in those files and in the step summary. To refresh `scripts/test-timings.json`, run
+`.summary.json` next to it, `vitest.log` and, after retries, `vitest.retry-<n>.log`. Values of
+environment variables whose names suggest secrets (token, key, password, URL, DSN and similar) of
+3 or more characters, plus the host name, are replaced with `[redacted]` in those files and in the
+step summary. The repository path becomes `.`. To refresh `scripts/test-timings.json`, run
 `node scripts/generate-test-timings.mjs <dir>`, where `<dir>` holds the downloaded
 `shard-<i>.json` files of one complete run and a copy of `built-only.json` named
 `shard-<n>.json`.
