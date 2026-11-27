@@ -72,13 +72,6 @@ export class TriggerSteps {
     await this.step(position).getByLabel("Run only if", { exact: true }).fill(condition);
   }
 
-  async setProviderOptions(position: number, json: string) {
-    await this.edit(position);
-    const header = this.step(position).getByRole("button", { name: /^Advanced provider options/u });
-    if ((await header.getAttribute("aria-expanded")) !== "true") await header.click();
-    await this.step(position).getByLabel("Provider options (JSON)", { exact: true }).fill(json);
-  }
-
   async setOutputSchema(position: number, schema: string) {
     await this.openConditions(position);
     await this.step(position).getByLabel("Output schema (JSON)", { exact: true }).fill(schema);

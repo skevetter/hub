@@ -236,7 +236,7 @@ function CollapsedStep(
       aria-label={label}
       className="flex min-w-0 items-center gap-3 rounded-sm border bg-card px-6 py-3"
     >
-      <h2 className="shrink-0 text-sm text-foreground">{name}</h2>
+      <h2 className="max-w-[40%] shrink-0 truncate text-sm text-foreground">{name}</h2>
       <p className="min-w-0 flex-1 truncate font-mono text-sm text-muted-foreground">{summary}</p>
       {step.runIf === "" ? null : (
         <span className="shrink-0 text-xs text-muted-foreground">Condition</span>
