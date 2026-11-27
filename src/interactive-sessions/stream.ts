@@ -17,6 +17,11 @@ interface StreamOptions {
   reportFailure?(error: unknown, requestId: string): void;
 }
 
+type OpenSessionStream = Omit<
+  ConstructorParameters<typeof SessionStreamSubscriber>[0],
+  "resumeWithoutAgent" | "release" | "reportFailure"
+> & { requestId: string; lastEventId: string | null };
+
 const failures = {
   not_found: [404, "Not found", "The requested session is unavailable."],
   method_not_allowed: [405, "Method not allowed", "This route only accepts GET requests."],
@@ -77,16 +82,7 @@ export class InteractiveSessionStream {
       const cursor = parseCursor(lastEventId ?? url.searchParams.get("after"));
       if (cursor === undefined) return fail("invalid_request");
       if (this.closing) return fail("shutting_down");
-      const { userId, organizationId } = principal;
-      const userCount = this.users.get(userId) ?? 0;
-      const organizationCount = this.organizations.get(organizationId) ?? 0;
-      if (
-        userCount >= settings.streamMaxPerKey ||
-        organizationCount >= settings.streamMaxPerOrg ||
-        this.activeStreamCount() >= settings.streamMaxTotal
-      )
-        return fail("too_many_streams");
-      const subscriber = new SessionStreamSubscriber({
+      return this.open({
         service,
         bus,
         settings,
@@ -95,36 +91,57 @@ export class InteractiveSessionStream {
         organizationSlug,
         principal,
         cursor,
-        resumeWithoutAgent: cursor.agent === null && (lastEventId !== null || cursor.hubSeq > 0),
-        release: () => {
-          this.subscribers.delete(subscriber);
-          decrement(this.users, userId);
-          decrement(this.organizations, organizationId);
-        },
-        reportFailure: (error) => this.report(error, requestId),
+        requestId,
+        lastEventId,
       });
-      this.subscribers.add(subscriber);
-      this.users.set(userId, userCount + 1);
-      this.organizations.set(organizationId, organizationCount + 1);
-      subscriber.start();
-      return registerResponseLifecycle(
-        new Response(subscriber.body, {
-          headers: {
-            "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache, no-transform",
-            "x-accel-buffering": "no",
-            "x-request-id": requestId,
-          },
-        }),
-        {
-          onFinish: () => subscriber.end(),
-          onAbort: () => subscriber.end(),
-        },
-      );
     } catch (error) {
       this.report(error, requestId);
       return fail("infrastructure_unavailable");
     }
+  }
+
+  private open({ requestId, lastEventId, ...options }: OpenSessionStream): Response {
+    const {
+      principal: { userId, organizationId },
+      settings,
+      cursor,
+    } = options;
+    const userCount = this.users.get(userId) ?? 0;
+    const organizationCount = this.organizations.get(organizationId) ?? 0;
+    if (
+      userCount >= settings.streamMaxPerKey ||
+      organizationCount >= settings.streamMaxPerOrg ||
+      this.activeStreamCount() >= settings.streamMaxTotal
+    )
+      return interactiveSessionStreamFailure(requestId, "too_many_streams");
+    const subscriber = new SessionStreamSubscriber({
+      ...options,
+      resumeWithoutAgent: cursor.agent === null && (lastEventId !== null || cursor.hubSeq > 0),
+      release: () => {
+        this.subscribers.delete(subscriber);
+        decrement(this.users, userId);
+        decrement(this.organizations, organizationId);
+      },
+      reportFailure: (error) => this.report(error, requestId),
+    });
+    this.subscribers.add(subscriber);
+    this.users.set(userId, userCount + 1);
+    this.organizations.set(organizationId, organizationCount + 1);
+    subscriber.start();
+    return registerResponseLifecycle(
+      new Response(subscriber.body, {
+        headers: {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache, no-transform",
+          "x-accel-buffering": "no",
+          "x-request-id": requestId,
+        },
+      }),
+      {
+        onFinish: () => subscriber.end(),
+        onAbort: () => subscriber.end(),
+      },
+    );
   }
 
   private report(error: unknown, requestId: string): void {
@@ -151,10 +168,10 @@ function parseCursor(raw: string | null): SessionStreamCursor | undefined {
   if (epoch === undefined) return { hubSeq, agent: null };
   if (!Number.isSafeInteger(seq) || !validAgentEpoch(epoch)) return undefined;
   const chunkOffset = match[3] === undefined ? undefined : Number(match[3]);
-  if (
-    chunkOffset !== undefined &&
-    (!Number.isSafeInteger(chunkOffset) || chunkOffset < 1 || chunkOffset > 65536)
-  )
-    return undefined;
+  if (!validChunkOffset(chunkOffset)) return undefined;
   return { hubSeq, agent: { seq, epoch, ...(chunkOffset === undefined ? {} : { chunkOffset }) } };
+}
+
+function validChunkOffset(offset: number | undefined): boolean {
+  return offset === undefined || (Number.isSafeInteger(offset) && offset >= 1 && offset <= 65536);
 }

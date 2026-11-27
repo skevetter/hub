@@ -1,5 +1,5 @@
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useEffect, useId, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useState, type SyntheticEvent } from "react";
 import { formValue } from "../../auth/account-actions.js";
 import { useActiveAccount } from "../../auth/active-account.js";
 import { CheckboxField } from "../../components/app/checkbox-field.js";
@@ -46,6 +46,45 @@ export function SessionProfileForm({
   close: () => void;
   save: (data: ProfileFormData) => Promise<string | null>;
 }) {
+  const { title, changeOpen, submit, agent, location, error } = useProfileForm({
+    organizationSlug,
+    profile,
+    busy,
+    close,
+    save,
+  });
+  return (
+    <FormDialog
+      open
+      onOpenChange={changeOpen}
+      title={title}
+      description="These settings apply to sessions started from this profile."
+      label={title}
+      submitLabel={profile === null ? "Create profile" : "Save changes"}
+      busy={busy}
+      onSubmit={submit}
+    >
+      {locationFields({ ...location, profile, busy })}
+      <Section title="Agent settings">
+        <div className="grid gap-4">
+          <AgentFields agent={agent} catalog={location.daemon.catalog} busy={busy} />
+        </div>
+      </Section>
+      {error === undefined ? null : (
+        <FailureAlert
+          title="Could not save profile"
+          error={error}
+          fallback="Try again."
+          focusOnArrival
+        />
+      )}
+    </FormDialog>
+  );
+}
+
+type ProfileFormProps = Parameters<typeof SessionProfileForm>[0];
+
+function useProfileForm({ organizationSlug, profile, busy, close, save }: ProfileFormProps) {
   const fieldId = useId();
   const [daemonId, setDaemonId] = useState(profile?.daemonId ?? "");
   const [cwd, setCwd] = useState(profile?.cwd ?? "");
@@ -71,7 +110,7 @@ export function SessionProfileForm({
   );
 
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       const form = new FormData(event.currentTarget);
       const name = formValue(form, "name").trim();
@@ -86,7 +125,7 @@ export function SessionProfileForm({
         setError(undefined);
         void submitProfile(
           save,
-          profileData(profile, form, name, daemonId, directory, agent.settings),
+          profileData({ profile, form, name, daemonId, cwd: directory, settings: agent.settings }),
           close,
           setError,
         );
@@ -95,63 +134,53 @@ export function SessionProfileForm({
     [agent, close, daemon.available, daemonId, directory, profile, save],
   );
 
+  const location = { fieldId, daemonId, cwd, setCwd, daemon, chooseDaemon };
+  return { location, changeOpen, title, submit, error, agent };
+}
+
+function locationFields({
+  fieldId,
+  daemonId,
+  cwd,
+  setCwd,
+  daemon,
+  chooseDaemon,
+  profile,
+  busy,
+}: ReturnType<typeof useProfileForm>["location"] & Pick<ProfileFormProps, "profile" | "busy">) {
   return (
-    <FormDialog
-      open
-      onOpenChange={changeOpen}
-      title={title}
-      description="These settings apply to sessions started from this profile."
-      label={title}
-      submitLabel={profile === null ? "Create profile" : "Save changes"}
-      busy={busy}
-      onSubmit={submit}
-    >
-      <Section title="Where it runs">
-        <div className="grid gap-4">
-          <FormField
-            id={fieldId + "-name"}
-            label="Name"
-            kind="text"
-            name="name"
-            required
-            maxLength={80}
-            defaultValue={profile?.name ?? ""}
-          />
-          <DaemonField
-            id={fieldId + "-daemon"}
-            value={daemonId}
-            daemon={daemon}
-            onChange={chooseDaemon}
-            disabled={busy}
-          />
-          <FormField
-            id={fieldId + "-cwd"}
-            label="Working directory"
-            description="An absolute folder on the daemon. The agent starts here."
-            kind="text"
-            name="cwd"
-            required
-            maxLength={1024}
-            value={cwd}
-            onChange={setCwd}
-          />
-          <WorktreeFields profile={profile} />
-        </div>
-      </Section>
-      <Section title="Agent settings">
-        <div className="grid gap-4">
-          <AgentFields agent={agent} catalog={daemon.catalog} busy={busy} />
-        </div>
-      </Section>
-      {error === undefined ? null : (
-        <FailureAlert
-          title="Could not save profile"
-          error={error}
-          fallback="Try again."
-          focusOnArrival
+    <Section title="Where it runs">
+      <div className="grid gap-4">
+        <FormField
+          id={fieldId + "-name"}
+          label="Name"
+          kind="text"
+          name="name"
+          required
+          maxLength={80}
+          defaultValue={profile?.name ?? ""}
         />
-      )}
-    </FormDialog>
+        <DaemonField
+          id={fieldId + "-daemon"}
+          value={daemonId}
+          daemon={daemon}
+          onChange={chooseDaemon}
+          disabled={busy}
+        />
+        <FormField
+          id={fieldId + "-cwd"}
+          label="Working directory"
+          description="An absolute folder on the daemon. The agent starts here."
+          kind="text"
+          name="cwd"
+          required
+          maxLength={1024}
+          value={cwd}
+          onChange={setCwd}
+        />
+        <WorktreeFields profile={profile} />
+      </div>
+    </Section>
   );
 }
 
@@ -166,23 +195,31 @@ async function submitProfile(
   else setError(refusal);
 }
 
-function profileData(
-  profile: ProfileView | null,
-  form: FormData,
-  name: string,
-  daemonId: string,
-  cwd: string,
-  settings: typeof EMPTY_SETTINGS,
-): ProfileFormData {
-  const base = form.has("base") ? formValue(form, "base").trim() : "";
-  const worktree = form.has("branch") ? { mode: "branch-off" as const } : null;
+interface ProfileDataOptions {
+  profile: ProfileView | null;
+  form: FormData;
+  name: string;
+  daemonId: string;
+  cwd: string;
+  settings: typeof EMPTY_SETTINGS;
+}
+
+function profileData({
+  profile,
+  form,
+  name,
+  daemonId,
+  cwd,
+  settings,
+}: ProfileDataOptions): ProfileFormData {
+  const worktree = profileWorktree(form);
   return {
     id: profile?.id ?? null,
     version: profile?.version ?? null,
     name,
     daemonId,
     cwd,
-    worktree: worktree !== null && base !== "" ? { ...worktree, base } : worktree,
+    worktree,
     provider: settings.provider,
     model: settings.model || null,
     mode: settings.mode || null,
@@ -190,6 +227,12 @@ function profileData(
     fullAccessAcknowledged: settings.acknowledged,
     status: profile?.status ?? "active",
   };
+}
+
+function profileWorktree(form: FormData): ProfileFormData["worktree"] {
+  const base = form.has("base") ? formValue(form, "base").trim() : "";
+  const worktree = form.has("branch") ? { mode: "branch-off" as const } : null;
+  return worktree !== null && base !== "" ? { ...worktree, base } : worktree;
 }
 
 function useProfileDaemon(organizationSlug: string, daemonId: string, directory: string) {
@@ -367,14 +410,19 @@ function WorktreeFields({ profile }: { profile: ProfileView | null }) {
   );
 }
 
+function profileSettings(profile: ProfileView | null): typeof EMPTY_SETTINGS {
+  if (profile == null) return { ...EMPTY_SETTINGS };
+  return {
+    provider: profile.provider ?? "",
+    model: profile.model ?? "",
+    mode: profile.mode ?? "",
+    thinking: profile.thinkingOptionId ?? "",
+    acknowledged: profile.fullAccessAcknowledged ?? false,
+  };
+}
+
 function useProfileAgent(profile: ProfileView | null, catalog: HubProviderSnapshot | undefined) {
-  const [settings, setSettings] = useState({
-    provider: profile?.provider ?? "",
-    model: profile?.model ?? "",
-    mode: profile?.mode ?? "",
-    thinking: profile?.thinkingOptionId ?? "",
-    acknowledged: profile?.fullAccessAcknowledged ?? false,
-  });
+  const [settings, setSettings] = useState(profileSettings(profile));
   const available = useMemo(
     () => (catalog?.entries ?? EMPTY_OPTIONS).filter(isReadyProvider),
     [catalog],
@@ -434,13 +482,21 @@ function agentSettingsError(agent: ReturnType<typeof useProfileAgent>) {
   if (
     provider === undefined ||
     (settings.model !== "" && model === undefined) ||
-    ((explicitMode || settings.mode !== "") && !modes.some(({ id }) => id === settings.mode)) ||
+    invalidAgentMode({ explicitMode, settings, modes }) ||
     (settings.thinking !== "" && !thinking.some(({ id }) => id === settings.thinking))
   )
     return "Choose provider settings available for this directory.";
   if (settings.mode === "full" && !settings.acknowledged)
     return "Confirm full access before saving.";
   return null;
+}
+
+function invalidAgentMode({
+  explicitMode,
+  settings,
+  modes,
+}: Pick<ReturnType<typeof useProfileAgent>, "explicitMode" | "settings" | "modes">): boolean {
+  return (explicitMode || settings.mode !== "") && !modes.some(({ id }) => id === settings.mode);
 }
 
 function AgentFields({
@@ -496,20 +552,28 @@ function AgentFields({
           disabled={disabled}
         />
       </div>
-      {settings.mode === "full" ? (
-        <>
-          <WarningAlert title="Full access">
-            The agent can run tools without asking for permission.
-          </WarningAlert>
-          <CheckboxField
-            id={fieldId + "-acknowledge"}
-            label="Run every tool without asking"
-            required
-            checked={settings.acknowledged}
-            onChange={agent.acknowledge}
-          />
-        </>
-      ) : null}
+      {settings.mode === "full" ? fullAccessFields(fieldId, settings, agent) : null}
+    </>
+  );
+}
+
+function fullAccessFields(
+  fieldId: string,
+  settings: typeof EMPTY_SETTINGS,
+  agent: ReturnType<typeof useProfileAgent>,
+) {
+  return (
+    <>
+      <WarningAlert title="Full access">
+        The agent can run tools without asking for permission.
+      </WarningAlert>
+      <CheckboxField
+        id={fieldId + "-acknowledge"}
+        label="Run every tool without asking"
+        required
+        checked={settings.acknowledged}
+        onChange={agent.acknowledge}
+      />
     </>
   );
 }
