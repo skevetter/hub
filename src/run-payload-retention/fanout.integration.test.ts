@@ -396,7 +396,12 @@ it("uses an indexed revision lookup for 50 candidates among 12,001 revisions", a
         return runtime.query(sql, params);
       },
     };
-    const candidatePage = await scanRunPayloads(observed, null, CUTOFF, 50, false);
+    const candidatePage = await scanRunPayloads(observed, {
+      after: null,
+      cutoff: CUTOFF,
+      limit: 50,
+      countOnly: false,
+    });
     assert.equal(candidatePage.length, 50);
     assert.ok(candidatePage.every((candidate) => candidate.disposition === "eligible"));
     const revisionPlan = plans.find((plan) => plan.includes("project_configuration_revisions"));

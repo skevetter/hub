@@ -152,12 +152,16 @@ export function runExecutions(run: string, projection: string) {
       and execution.organization_id = ${run}.organization_id and execution.project_id = ${run}.project_id`;
 }
 
+export interface RunPayloadScanOptions {
+  after: string | null;
+  cutoff: Date;
+  limit: number;
+  countOnly: boolean;
+}
+
 export async function scanRunPayloads(
   database: QueryHandle,
-  after: string | null,
-  cutoff: Date,
-  limit: number,
-  countOnly: boolean,
+  { after, cutoff, limit, countOnly }: RunPayloadScanOptions,
 ): Promise<RunPayloadCandidate[]> {
   const result = await database.query<
     RunPayloadCandidate & { receiptId: string; organizationId: string } & Record<string, unknown>

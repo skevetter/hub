@@ -143,8 +143,9 @@ describe("PostgreSQL run cancellation", () => {
     assert.ok(result?.run.completedAt);
     const cutoff = new Date(result.run.completedAt.getTime() + 1000);
     const disposition = async () =>
-      (await scanRunPayloads(pg.runtime, null, cutoff, 100, false)).find(({ id }) => id === run.id)
-        ?.disposition;
+      (
+        await scanRunPayloads(pg.runtime, { after: null, cutoff, limit: 100, countOnly: false })
+      ).find(({ id }) => id === run.id)?.disposition;
     assert.equal(await disposition(), "cleanup_blocked");
     assert.equal(
       (await pg.database.readRunStopDetails(run.organizationId, run.id))?.cleanupState,

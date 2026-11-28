@@ -605,7 +605,7 @@ class PgDatabase implements Database {
     expireGitHubCursorDiagnostic(this.pool, source, cutoff, now);
 
   scanRunPayloads: Database["scanRunPayloads"] = (after, cutoff, limit, countOnly) =>
-    scanRunPayloads(this.pool, after, cutoff, limit, countOnly);
+    scanRunPayloads(this.pool, { after, cutoff, limit, countOnly });
   async expireRunPayloadChunk(id: string, cutoff: Date, now: Date) {
     const fanout = await prepareRunPayloadFanout(this.pool, id, cutoff);
     if (fanout?.expected === undefined) return "skipped";
