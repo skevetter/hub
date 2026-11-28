@@ -51,8 +51,8 @@ packing, and publishing. Publish attests the verified tarball. Manual deployment
 the downloaded checksum and attestation for the requested main commit.
 
 Push path classification compares against the latest reachable stable-form `v*` tag, or the
-previous push SHA if none exists. Changes limited
-to the [no-ship paths](scripts/cd/ship-paths.mjs) skip the tag and deploy. If the last release was
+previous push SHA if none exists. Changes limited to the [no-ship paths](scripts/cd/ship-paths.mjs),
+such as docs, tests, and repository tooling, skip publishing and deploying. If the last release was
 paused or failed after tagging, a no-ship push does not retry it. Start the published release
 manually from `main` with its exact SHA.
 
