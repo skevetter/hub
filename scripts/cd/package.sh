@@ -100,7 +100,7 @@ confirm_checksum() {
 
 publish() {
   local version="$1" output="$2" file="getpaseo-hub-$1.tgz"
-  local -a options=()
+  local -a options=(--latest=false)
   [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
   confirm_publish_order "$version"
   confirm_checksum "$output/$file"
