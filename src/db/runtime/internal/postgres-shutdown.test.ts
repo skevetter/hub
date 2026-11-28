@@ -44,7 +44,7 @@ async function setup() {
 // count is not reliable. Track only the deadline that close() arms.
 type Timer = NodeJS.Timeout;
 let setTimeoutSpy: MockInstance<(handler: () => void, delay?: number) => Timer>;
-let clearTimeoutSpy: MockInstance<(timer?: Timer) => void>;
+let clearTimeoutSpy: MockInstance<typeof globalThis.clearTimeout>;
 
 function closeWithDeadline(runtime: { close(): Promise<void> }) {
   const before = setTimeoutSpy.mock.results.length;
@@ -60,15 +60,16 @@ function closeWithDeadline(runtime: { close(): Promise<void> }) {
 describe("PostgreSQL shutdown", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
-    clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+    setTimeoutSpy = vi.fn(globalThis.setTimeout);
+    clearTimeoutSpy = vi.fn(globalThis.clearTimeout);
+    vi.stubGlobal("setTimeout", setTimeoutSpy);
+    vi.stubGlobal("clearTimeout", clearTimeoutSpy);
     vi.clearAllMocks();
     mocks.createPool.mockReset();
   });
 
   afterEach(() => {
-    setTimeoutSpy.mockRestore();
-    clearTimeoutSpy.mockRestore();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
   });
 
