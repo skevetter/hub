@@ -135,7 +135,12 @@ describe("Stop interrupt delivery over the daemon wire", () => {
     const details = () => pg.database.readRunStopDetails(run.organizationId, run.id);
     const eligibility = async () =>
       (
-        await scanRunPayloads(pg.runtime, null, new Date(Date.now() + 90 * 86_400_000), 100, false)
+        await scanRunPayloads(pg.runtime, {
+          after: null,
+          cutoff: new Date(Date.now() + 90 * 86_400_000),
+          limit: 100,
+          countOnly: false,
+        })
       ).find((candidate) => candidate.id === run.id)?.disposition;
     return { run, id, details, eligibility, cancel };
   }

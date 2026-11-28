@@ -483,9 +483,19 @@ describe("run payload expiry", () => {
           return runtime.query<Row>(sql, params);
         },
       };
-      const first = await scanRunPayloads(explained, null, CUTOFF, 50, false);
+      const first = await scanRunPayloads(explained, {
+        after: null,
+        cutoff: CUTOFF,
+        limit: 50,
+        countOnly: false,
+      });
       assert.equal(first.length, 50);
-      const second = await scanRunPayloads(explained, first.at(-1)!.id, CUTOFF, 50, false);
+      const second = await scanRunPayloads(explained, {
+        after: first.at(-1)!.id,
+        cutoff: CUTOFF,
+        limit: 50,
+        countOnly: false,
+      });
       assert.equal(second.length, 50);
       assert.ok(second[0]!.id > first.at(-1)!.id);
       assert.ok(plan.some((line) => line.includes("trigger_runs_pkey")));
