@@ -228,10 +228,37 @@ test("two successive main pushes plan against the previous publish and tag their
     calls.map((args) => args[args.indexOf("--target") + 1]),
     targets,
   );
+  for (const args of calls) {
+    assert.ok(
+      args.includes("--latest=false"),
+      "a published release is never latest before its deploy",
+    );
+    assert.ok(!args.includes("--prerelease"));
+  }
   git("checkout", "--detach", targets[0]);
   const stale = run("package", ["publish", "1.0.1", dir], { BASE_TAG: "v1.0.0", HELD: "false" });
   assert.equal(stale.status, 1);
   assert.match(stale.stdout, /rerun packaging/u);
+});
+
+test("marks a release latest only in promote, after a successful deploy on push and dispatch", () => {
+  const workflow = readFileSync(join(root, ".github/workflows/main.yml"), "utf8");
+  const promote = workflow.slice(workflow.indexOf("\n  promote:"), workflow.indexOf("\n  notify:"));
+  assert.match(promote, /needs: \[package, dispatch-guard, deploy\]/u);
+  assert.match(
+    promote,
+    /needs\.deploy\.result == 'success' && needs\.deploy\.outputs\.deployed == 'true'/u,
+  );
+  assert.match(
+    promote,
+    /github\.event_name == 'push' && needs\.package\.outputs\.held == 'false'/u,
+  );
+  assert.match(
+    promote,
+    /github\.event_name == 'workflow_dispatch' && needs\.dispatch-guard\.result == 'success'/u,
+  );
+  assert.match(promote, /--prerelease=false --latest$/mu);
+  assert.equal(workflow.match(/--latest\b/gu).length, 1);
 });
 
 test("carries a migration hold across real tags until the prerelease is promoted", (t) => {
@@ -248,6 +275,7 @@ test("carries a migration hold across real tags until the prerelease is promoted
   });
   assert.equal(held.status, 0, held.stderr);
   assert.match(readFileSync(join(dir, "published"), "utf8"), /--prerelease/u);
+  assert.match(readFileSync(join(dir, "published"), "utf8"), /--latest=false/u);
   push("another fix");
   const listing = (prerelease) =>
     JSON.stringify([

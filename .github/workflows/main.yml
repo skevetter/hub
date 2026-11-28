@@ -215,12 +215,12 @@ jobs:
 
   promote:
     name: promote
-    needs: [dispatch-guard, deploy]
+    needs: [package, dispatch-guard, deploy]
     if: >-
-      !cancelled() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
-      github.repository == 'skevetter/hub' && needs.dispatch-guard.result == 'success' &&
+      !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'skevetter/hub' &&
       needs.deploy.result == 'success' && needs.deploy.outputs.deployed == 'true' &&
-      needs.dispatch-guard.outputs.prerelease == 'true'
+      ((github.event_name == 'workflow_dispatch' && needs.dispatch-guard.result == 'success') ||
+      (github.event_name == 'push' && needs.package.outputs.held == 'false'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -232,9 +232,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
-      - name: Promote the verified prerelease
+      - name: Mark the deployed release as latest
         env:
-          VERSION: ${{ needs.dispatch-guard.outputs.version }}
+          VERSION: ${{ needs.dispatch-guard.outputs.version || needs.package.outputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
 
