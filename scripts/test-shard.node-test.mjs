@@ -204,6 +204,9 @@ test("log blocks give each failing file its first error line", () => {
   assert.deepEqual(headers.get("b.test.ts"), [portTimeout]);
 });
 
+const HOOK_HINT =
+  'If this is a long-running hook, pass a timeout value as the last argument or configure it globally with "hookTimeout".';
+
 test("the default reporter's real hook failure output is understood", () => {
   const rule = "\u23AF".repeat(6);
   const log = [
@@ -215,7 +218,7 @@ test("the default reporter's real hook failure output is understood", () => {
     "",
     " FAIL  src/x.test.ts > slow hook",
     "Error: Hook timed out in 100ms.",
-    "If this is a long-running hook, pass a timeout value as the last argument.",
+    HOOK_HINT,
     " \u276F src/x.test.ts:3:3",
     "",
     `${rule}[1/2]${"\u23AF"}`,
@@ -229,6 +232,11 @@ test("the default reporter's real hook failure output is understood", () => {
     "Error: Hook timed out in 100ms.",
     "Error: Port 5432/tcp not bound after 20000ms",
   ]);
+  const custom = logFailureHeaders(
+    log.replace(HOOK_HINT, "If this is a long-running hook, check the fixture."),
+  );
+  assert.deepEqual(custom.get("src/x.test.ts")[0], "Error: Hook timed out in 100ms.");
+  assert.equal(custom.get("src/x.test.ts").length, 3);
 });
 
 test("file-level failures, shared errors and extra error lines in one block", () => {
@@ -245,7 +253,7 @@ test("file-level failures, shared errors and extra error lines in one block", ()
     "",
     " FAIL  c.test.ts > suite",
     "Error: Hook timed out in 100ms.",
-    "If this is a long-running hook, pass a timeout value as the last argument.",
+    HOOK_HINT,
     " \u276F c.test.ts:3:3",
     "Error: cleanup failed",
     " \u276F c.test.ts:9:3",
@@ -269,7 +277,371 @@ test("file-level failures, shared errors and extra error lines in one block", ()
   assert.deepEqual(retryableFiles(report, ["c.test.ts"], { root, headers }), []);
 });
 
-test("only a container-start header makes a file retryable", () => {
+const SLOW_DATABASE_LOG = [
+  " ✓ src/runtime-files.test.ts (1 test) 0ms",
+  "",
+  "\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF Failed Suites 1 \u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF",
+  "",
+  " FAIL  src/db/activity-paging.integration.test.ts > activity page SQL on postgres",
+  "DatabaseUnavailableError: database query timed out",
+  " \u276F Timeout.<anonymous> src/db/runtime/internal/pool.ts:112:27",
+  "    110|         new Promise<never>((_, reject) => {",
+  "",
+  "\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF[1/1]\u23AF",
+].join("\n");
+
+function suiteFailure(file, message, assertionResults) {
+  return { name: `${root}/${file}`, status: "failed", message, assertionResults };
+}
+
+test("a suite that cannot start on a slow database is retried", () => {
+  const file = "src/db/activity-paging.integration.test.ts";
+  const skipped = Array.from({ length: 9 }, () => ({ status: "skipped", failureMessages: [] }));
+  const passed = Array.from({ length: 7 }, () => ({ status: "passed", failureMessages: [] }));
+  const report = reportOf(suiteFailure(file, "", [...skipped, ...passed]));
+  const headers = logFailureHeaders(SLOW_DATABASE_LOG);
+  assert.deepEqual(headers.get(file), ["DatabaseUnavailableError: database query timed out"]);
+  assert.deepEqual(retryableFiles(report, [file], { root, headers }), [file]);
+  assert.deepEqual(retryableFiles(report, [file], { root }), []);
+});
+
+function failureLog(file, header, ...rest) {
+  return [" FAIL  " + file + " [ " + file + " ]", header, " \u276F " + file + ":2:7", ...rest].join(
+    "\n",
+  );
+}
+
+test("a suite that fails to load is retried when the log names the start timeout", () => {
+  const typed = [
+    ["database query timed out", "DatabaseUnavailableError: database query timed out"],
+    ["timeout exceeded when trying to connect", "Error: timeout exceeded when trying to connect"],
+    ["the database system is starting up", "error: the database system is starting up"],
+    [
+      "Connection terminated due to connection timeout",
+      "Error: Connection terminated due to connection timeout",
+    ],
+  ];
+  for (const [message, header] of typed) {
+    const report = reportOf(suiteFailure("a.test.ts", message, []));
+    const headers = logFailureHeaders(failureLog("a.test.ts", header));
+    assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root, headers }), ["a.test.ts"]);
+    assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root }), [], message);
+  }
+});
+
+test("a bare JSON message needs a matching log header", () => {
+  const report = reportOf(suiteFailure("a.test.ts", "database query timed out", []));
+  const other = logFailureHeaders(failureLog("a.test.ts", "AssertionError: nope"));
+  assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root, headers: other }), []);
+  const typed = reportOf(
+    suiteFailure("a.test.ts", "DatabaseUnavailableError: database query timed out", []),
+  );
+  assert.deepEqual(retryableFiles(typed, ["a.test.ts"], { root }), ["a.test.ts"]);
+});
+
+test("the log must name the same timeout and the whole message must be that timeout", () => {
+  const log = (header) => logFailureHeaders(failureLog("a.test.ts", header));
+  const retryable = (message, headers) =>
+    retryableFiles(reportOf(suiteFailure("a.test.ts", message, [])), ["a.test.ts"], {
+      root,
+      headers,
+    });
+  const query = "database query timed out";
+  assert.deepEqual(retryable(query, log("Error: timeout exceeded when trying to connect")), []);
+  assert.deepEqual(retryable(query, log("DatabaseUnavailableError: database query timed out")), [
+    "a.test.ts",
+  ]);
+  const extra = "timeout exceeded when trying to connect\n  Configuration error: wrong endpoint";
+  assert.deepEqual(retryable(extra, log("Error: timeout exceeded when trying to connect")), []);
+});
+
+test("a start timeout with more message text is not retried from a test or a hook", () => {
+  const message = "timeout exceeded when trying to connect";
+  const extra = "  Configuration error: wrong endpoint";
+  const log = ["hook", "body"]
+    .map((name) =>
+      [
+        ` FAIL  ${name}.test.ts > ${name}`,
+        `Error: ${message}`,
+        extra,
+        ` \u276F ${name}.test.ts:4:11`,
+        '      2| describe("hook", () => {',
+        "",
+      ].join("\n"),
+    )
+    .join("\n");
+  const headers = logFailureHeaders(log);
+  assert.deepEqual(headers.get("body.test.ts"), [`Error: ${message}\n${extra}`]);
+  const report = reportOf(
+    failedEntry("body.test.ts", `Error: ${message}\n${extra}\n    at body.test.ts:3:9`),
+    suiteFailure("hook.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  for (const file of ["body.test.ts", "hook.test.ts"]) {
+    assert.deepEqual(retryableFiles(report, [file], { root, headers }), [], file);
+  }
+  const plain = reportOf(failedEntry("body.test.ts", `Error: ${message}\n    at body.test.ts:3:9`));
+  const plainHeaders = logFailureHeaders(failureLog("body.test.ts", `Error: ${message}`));
+  assert.deepEqual(retryableFiles(plain, ["body.test.ts"], { root, headers: plainHeaders }), [
+    "body.test.ts",
+  ]);
+});
+
+test("message text after a blank line or starting with at still blocks the retry", () => {
+  const message = "timeout exceeded when trying to connect";
+  const block = (name, ...lines) =>
+    [
+      ` FAIL  ${name}.test.ts > ${name}`,
+      `Error: ${message}`,
+      ...lines,
+      ` \u276F ${name}.test.ts:4:11`,
+      "",
+    ].join("\n");
+  const log = [
+    block("blank", "", "  Configuration error: wrong endpoint"),
+    block("athook", "  at startup: wrong endpoint"),
+    block("atbody", "  at startup: wrong endpoint"),
+  ].join("\n");
+  const headers = logFailureHeaders(log);
+  assert.deepEqual(headers.get("blank.test.ts"), [
+    `Error: ${message}\n  Configuration error: wrong endpoint`,
+  ]);
+  const frame = "    at /repo/atbody.test.ts:3:9";
+  const report = reportOf(
+    failedEntry("atbody.test.ts", `Error: ${message}\n  at startup: wrong endpoint\n${frame}`),
+    suiteFailure("athook.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+    suiteFailure("blank.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  for (const file of ["atbody", "athook", "blank"]) {
+    const name = `${file}.test.ts`;
+    assert.deepEqual(retryableFiles(report, [name], { root, headers }), [], name);
+  }
+});
+
+test("reporter text that looks like a stack frame still counts as message text", () => {
+  const message = "timeout exceeded when trying to connect";
+  const extra = ["  at config/startup.yaml:12:7", "  Configuration error: wrong endpoint"];
+  const block = (name) =>
+    [
+      ` FAIL  ${name}.test.ts > ${name}`,
+      `Error: ${message}`,
+      ...extra,
+      ` \u276F ${name}.test.ts:4:11`,
+      "",
+    ].join("\n");
+  const headers = logFailureHeaders([block("hook"), block("body")].join("\n"));
+  const report = reportOf(
+    failedEntry(
+      "body.test.ts",
+      `Error: ${message}\n${extra.join("\n")}\n    at /repo/body.test.ts:3:9`,
+    ),
+    suiteFailure("hook.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  for (const name of ["body.test.ts", "hook.test.ts"]) {
+    assert.deepEqual(retryableFiles(report, [name], { root, headers }), [], name);
+  }
+});
+
+test("an anonymous V8 frame ends a JSON failure message", () => {
+  const message = "timeout exceeded when trying to connect";
+  const stack = `Error: ${message}\n    at new Promise (<anonymous>)\n    at run (/repo/a.test.ts:3:9)`;
+  const report = reportOf(failedEntry("a.test.ts", stack));
+  const headers = logFailureHeaders(failureLog("a.test.ts", `Error: ${message}`));
+  assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root, headers }), ["a.test.ts"]);
+});
+
+test("each failure entry of one test is classified on its own", () => {
+  const start = "timeout exceeded when trying to connect";
+  const second = "Connection terminated due to connection timeout";
+  const withEntries = (...failureMessages) =>
+    reportOf({
+      name: `${root}/a.test.ts`,
+      status: "failed",
+      assertionResults: [{ status: "failed", failureMessages }],
+    });
+  const frame = "\n    at run (/repo/a.test.ts:3:9)";
+  const retry = (report) => retryableFiles(report, ["a.test.ts"], { root });
+  assert.deepEqual(retry(withEntries(`Error: ${start}${frame}`, `Error: ${second}${frame}`)), [
+    "a.test.ts",
+  ]);
+  assert.deepEqual(retry(withEntries(`Error: ${start}${frame}`, `Error: nope${frame}`)), []);
+  assert.deepEqual(retry(withEntries(`Error: ${start}${frame}`, "")), []);
+  assert.deepEqual(retry(withEntries()), []);
+});
+
+test("reporter message lines that start with the frame glyph are kept", () => {
+  const message = "timeout exceeded when trying to connect";
+  const log = [
+    " FAIL  hook.test.ts > hook",
+    `Error: ${message}`,
+    "  \u276F config/startup.yaml:12:7",
+    "  Configuration error: wrong endpoint",
+    " \u276F hook.test.ts:4:11",
+    "",
+  ].join("\n");
+  const headers = logFailureHeaders(log);
+  assert.equal(headers.get("hook.test.ts").length, 1);
+  assert.match(headers.get("hook.test.ts")[0], /Configuration error/u);
+  const report = reportOf(
+    suiteFailure("hook.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  assert.deepEqual(retryableFiles(report, ["hook.test.ts"], { root, headers }), []);
+});
+
+test("message text after a line that imitates a frame still blocks the retry", () => {
+  const message = "timeout exceeded when trying to connect";
+  const log = [
+    " FAIL  hook.test.ts > hook",
+    `Error: ${message}`,
+    " \u276F config/startup.yaml:12:7",
+    "  Configuration error: wrong endpoint",
+    " \u276F hook.test.ts:4:11",
+    '      2| describe("hook", () => {',
+    "       |           ^",
+    "",
+  ].join("\n");
+  const headers = logFailureHeaders(log);
+  assert.deepEqual(headers.get("hook.test.ts"), [
+    `Error: ${message}\n  Configuration error: wrong endpoint`,
+  ]);
+  const report = reportOf(
+    suiteFailure("hook.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  assert.deepEqual(retryableFiles(report, ["hook.test.ts"], { root, headers }), []);
+  const clean = log
+    .replace("  Configuration error: wrong endpoint\n", "")
+    .replace(" \u276F config/startup.yaml:12:7\n", "");
+  assert.deepEqual(
+    retryableFiles(report, ["hook.test.ts"], { root, headers: logFailureHeaders(clean) }),
+    ["hook.test.ts"],
+  );
+});
+
+test("only Vitest's own frame and excerpt formats are skipped", () => {
+  const message = "timeout exceeded when trying to connect";
+  const headersOf = (...lines) =>
+    logFailureHeaders(
+      [" FAIL  hook.test.ts > hook", `Error: ${message}`, ...lines, ""].join("\n"),
+    ).get("hook.test.ts");
+  const frame = " \u276F hook.test.ts:4:11";
+  assert.deepEqual(headersOf(frame, '      2| describe("hook", () => {', "       |   ^"), [
+    `Error: ${message}`,
+  ]);
+  assert.deepEqual(headersOf(frame, "    100| it(1)", "    1200| it(2)"), [`Error: ${message}`]);
+  const wrongHost = headersOf(" \u276F config/startup.yaml:12:7", "  12| endpoint: wrong-host");
+  assert.deepEqual(wrongHost, [`Error: ${message}\n  12| endpoint: wrong-host`]);
+  for (const line of ["    1  | endpoint: wrong-host", "       | endpoint: wrong-host"]) {
+    const found = headersOf(" \u276F config/startup.yaml:12:7", line);
+    assert.deepEqual(found, [`Error: ${message}\n${line}`]);
+  }
+  const noLocation = headersOf(" \u276F Configuration error: wrong endpoint", frame);
+  assert.deepEqual(noLocation, [`Error: ${message}\n \u276F Configuration error: wrong endpoint`]);
+});
+
+test("a connection timeout shared by several failures is not retried", () => {
+  const block = (...names) =>
+    [
+      ...names.map((name) => ` FAIL  ${name}.test.ts > ${name}`),
+      "Error: Connection terminated due to connection timeout",
+      " \u276F a.test.ts:7:11",
+      "",
+      "Caused by: Error: Connection terminated unexpectedly",
+      " \u276F a.test.ts:5:17",
+      "",
+    ].join("\n");
+  const entry = (name) =>
+    suiteFailure(`${name}.test.ts`, "", [{ status: "skipped", failureMessages: [] }]);
+  const report = reportOf(entry("a"), entry("b"));
+  const retry = (text, files) =>
+    retryableFiles(report, files, { root, headers: logFailureHeaders(text) });
+  assert.deepEqual(retry(block("a"), ["a.test.ts"]), ["a.test.ts"]);
+  assert.deepEqual(retry(block("a", "b"), ["a.test.ts", "b.test.ts"]), []);
+});
+
+test("only a one-line serialized error summary is skipped", () => {
+  const rule = "\u23AF".repeat(14);
+  const log = (...after) =>
+    [
+      " FAIL  a.test.ts > a",
+      "Error: Connection terminated due to connection timeout",
+      " \u276F a.test.ts:7:11",
+      "      7|   throw new Error(1);",
+      "       |           ^",
+      "",
+      "Caused by: Error: Connection terminated unexpectedly",
+      " \u276F a.test.ts:5:17",
+      "",
+      rule,
+      "Serialized Error: { connectionClosed: true, detail: 'long' }",
+      ...after,
+      `${"\u23AF".repeat(8)}[1/1]${"\u23AF"}`,
+      "",
+    ].join("\n");
+  const report = reportOf(
+    suiteFailure("a.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  const retry = (text) =>
+    retryableFiles(report, ["a.test.ts"], { root, headers: logFailureHeaders(text) });
+  assert.deepEqual(retry(log()), ["a.test.ts"]);
+  const nested = log("Caused by: Error: password authentication failed", " \u276F a.test.ts:4:19");
+  assert.deepEqual(retry(nested), []);
+  assert.equal(
+    logFailureHeaders(nested).get("a.test.ts").at(-1),
+    "Caused by: Error: password authentication failed",
+  );
+  const unexpected = [
+    ["Serialized Error: invalid payload from server"],
+    ["{", "  name: 'Caused by: Error',", "  code: '28P01'", "}"],
+    ["Serialized Error: {", "  detail: 'long'", "}"],
+  ];
+  for (const lines of unexpected) assert.deepEqual(retry(log(...lines)), [], lines[0]);
+});
+
+test("the cause pg-pool attaches to a connection timeout is part of that failure", () => {
+  const timeout = "Error: Connection terminated due to connection timeout";
+  const log = (cause) =>
+    [
+      " FAIL  a.test.ts > hook cause",
+      timeout,
+      " \u276F a.test.ts:4:11",
+      "      3|   beforeAll(() => {",
+      "",
+      cause,
+      " \u276F a.test.ts:5:14",
+      "",
+    ].join("\n");
+  const report = reportOf(
+    suiteFailure("a.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  const retryable = (cause) =>
+    retryableFiles(report, ["a.test.ts"], { root, headers: logFailureHeaders(log(cause)) });
+  assert.deepEqual(retryable("Caused by: Error: Connection terminated unexpectedly"), [
+    "a.test.ts",
+  ]);
+  assert.deepEqual(retryable("Caused by: Error: connect ECONNREFUSED 127.0.0.1:5432"), []);
+  const alone = "Caused by: Error: Connection terminated unexpectedly";
+  const standalone = logFailureHeaders(` FAIL  a.test.ts > s\nAssertionError: nope\n${alone}\n`);
+  assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root, headers: standalone }), []);
+});
+
+test("other database errors and a mixed failure are not retried", () => {
+  const messages = [
+    "DatabaseUnavailableError: database unavailable",
+    "Error: connect ECONNREFUSED 127.0.0.1:5432",
+    'error: relation "runs" does not exist',
+    "AssertionError: expected 'database query timed out' to be null",
+  ];
+  for (const message of messages) {
+    const report = reportOf(suiteFailure("a.test.ts", message, []));
+    assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root }), [], message);
+  }
+  const mixed = reportOf(
+    suiteFailure("a.test.ts", "DatabaseUnavailableError: database query timed out", []),
+    failedEntry("b.test.ts", "AssertionError: nope"),
+  );
+  assert.deepEqual(retryableFiles(mixed, ["a.test.ts", "b.test.ts"], { root }), []);
+});
+
+test("only a start timeout header makes a file retryable", () => {
   const hookFailure = {
     name: `${root}/e.test.ts`,
     status: "failed",
@@ -372,6 +744,27 @@ test("a timed-out file is retried once alone and the shard then passes", async (
   assert.equal(result.durationMs, 1500);
 });
 
+test("a slow database start counts as a retry and toward the per-shard limit", async () => {
+  const slow = "DatabaseUnavailableError: database query timed out";
+  const { execute, calls } = executor(firstRun([["a.test.ts", slow]]), (files) => retryRun(files));
+  const result = await runWithRetry({ label: "shard-1", files: ["a.test.ts"], root, execute });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(result.retried, ["a.test.ts"]);
+  assert.equal(result.exitCode, 0);
+
+  const many = Array.from({ length: RETRY_CAP + 1 }, (_, index) => [`f${index}.test.ts`, slow]);
+  const capped = executor(firstRun(many), (files) => retryRun(files));
+  const refused = await runWithRetry({
+    label: "shard-1",
+    files: many.map(([file]) => file),
+    root,
+    execute: capped.execute,
+  });
+  assert.equal(capped.calls.length, 1);
+  assert.equal(refused.exitCode, 1);
+  assert.match(retryAnnotations(refused).join("\n"), /Too many start timeouts/u);
+});
+
 test("each retried file runs in its own process and reports its own outcome", async () => {
   const failures = [
     ["a.test.ts", portTimeout],
@@ -397,8 +790,8 @@ test("each retried file runs in its own process and reports its own outcome", as
   assert.equal(result.report.success, false);
   assert.deepEqual(result.failedFiles, ["b.test.ts"]);
   assert.deepEqual(retryAnnotations(result), [
-    "::warning title=Retried after a container-start timeout::a.test.ts passed on a serial retry",
-    "::error title=Failed again after a container-start retry::b.test.ts",
+    "::warning title=Retried after a start timeout::a.test.ts passed on a serial retry",
+    "::error title=Failed again after a start timeout retry::b.test.ts",
   ]);
 });
 
@@ -471,8 +864,8 @@ test("workflow command text in file names and diagnostics is escaped", () => {
     diagnostic: "six\r\nfiles",
   });
   assert.deepEqual(lines, [
-    "::warning title=Retried after a container-start timeout::a%25b%0A::add-mask::x.test.ts passed on a serial retry",
-    "::error title=Too many container-start timeouts::six%0D%0Afiles",
+    "::warning title=Retried after a start timeout::a%25b%0A::add-mask::x.test.ts passed on a serial retry",
+    "::error title=Too many start timeouts::six%0D%0Afiles",
   ]);
 });
 
@@ -545,14 +938,8 @@ test("artifacts and the summary hide env values, short secrets and the host name
     ["a.test.ts", 1500],
     ["ok.test.ts", 1500],
   ]);
-  assert.match(
-    printed.join("\n"),
-    /::warning title=Retried after a container-start timeout::a\.test\.ts/u,
-  );
-  assert.match(
-    await readFile(summaryPath, "utf8"),
-    /Retried once after a container-start timeout/u,
-  );
+  assert.match(printed.join("\n"), /::warning title=Retried after a start timeout::a\.test\.ts/u);
+  assert.match(await readFile(summaryPath, "utf8"), /Retried once after a start timeout/u);
 });
 
 test("a short env value cannot rewrite file names or report keys", async (t) => {

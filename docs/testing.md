@@ -72,9 +72,22 @@ are not in any shard. Run them after `npm run build` with `npm run test:parallel
 built-only suites cover every discovered file exactly once, 1 when they do not, and 2 on bad
 arguments. `TEST_SHARD_TOTAL` sets the shard count for the check, 6 by default.
 
-A file is retried once when every failure in it starts with `Port <n>/tcp not bound after <n>ms` or
-`Hook timed out in <n>ms`. Vitest's JSON report leaves out hook failures, so the runner also reads
-the first error line of each failure block in `vitest.log`. Each such file runs alone in its own
+A file is retried once when every failure in it starts with `Port <n>/tcp not bound after <n>ms`,
+`Hook timed out in <n>ms` or a database start timeout: `DatabaseUnavailableError: database query
+timed out`, `Connection terminated due to connection timeout`, `timeout exceeded when trying to
+connect` or `the database system is starting up`. This covers a suite that cannot start as well as
+a failing test, including a query deadline hit inside a test. Vitest's JSON report leaves out hook
+failures and keeps only the bare message of a suite that fails to start, so the runner also reads
+the error message of each failure block in `vitest.log`. The whole message must be that
+timeout: extra message lines block the retry. Only Vitest's own frame
+lines (the reporter's marker, then a path ending in `:line:column`) and code excerpt lines are
+skipped. The log cannot tell message text
+that copies those formats exactly from the real thing, so a message whose only extra text is one
+such frame line still retries. A bare message counts only when the log names the
+same timeout. The `Caused by: Error: Connection terminated unexpectedly` line that follows
+a connection timeout belongs to it; any other cause blocks the retry. A connection timeout that
+Vitest prints once for several failures is not retried, because the cause shown may belong to only
+one of them. Each such file runs alone in its own
 Vitest process. Each retry prints a `::warning::` line (or `::error::` if it fails again) and shows
 in the step summary. Nothing is retried when the shard has any other failure, a process error, an
 incomplete report or an unhandled error. More than 5 candidate files in one shard fails the shard

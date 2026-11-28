@@ -22,9 +22,27 @@ const SENSITIVE_NAME =
   /TOKEN|SECRET|KEY|PASS|CREDENTIAL|PRIVATE|AUTH|COOKIE|SESSION|URL|URI|DSN|JWT|BEARER|SALT|SIG|CONN|WEBHOOK|CERT|SEED/iu;
 const PUBLIC_NAMES = new Set(["GITHUB_SERVER_URL", "GITHUB_API_URL", "GITHUB_GRAPHQL_URL"]);
 const HOST_NAMES = ["HOSTNAME", "RUNNER_NAME", "COMPUTERNAME"];
-const CONTAINER_START_PATTERNS = [
+// Vitest's JSON report keeps only error.message for a suite that fails to start, so the log's
+// typed header has to corroborate these bare messages.
+const BARE_START_TIMEOUTS = new Map([
+  ["database query timed out", /^DatabaseUnavailableError: database query timed out$/u],
+  [
+    "Connection terminated due to connection timeout",
+    /^Error: Connection terminated due to connection timeout$/u,
+  ],
+  ["timeout exceeded when trying to connect", /^Error: timeout exceeded when trying to connect$/u],
+  ["the database system is starting up", /^\w*[Ee]rror: the database system is starting up$/u],
+]);
+const CONNECTION_TIMEOUT = /^Error: Connection terminated due to connection timeout$/u;
+// pg-pool attaches the error that ended the client as the cause of a connection timeout.
+const CONNECTION_TIMEOUT_CAUSE = /^Caused by: Error: Connection terminated unexpectedly$/u;
+const START_TIMEOUT_PATTERNS = [
   /^(?:\w*Error: )?Port \d+\/tcp not bound after \d+ ?ms\b/u,
   /^(?:\w*Error: )?Hook timed out in \d+ ?ms\b/u,
+  /^DatabaseUnavailableError: database query timed out$/u,
+  /^Error: Connection terminated due to connection timeout$/u,
+  /^Error: timeout exceeded when trying to connect$/u,
+  /^\w*[Ee]rror: the database system is starting up$/u,
 ];
 
 /** A bad command line or environment: the process exits 2 instead of 1. */
@@ -140,48 +158,98 @@ const ANSI_PATTERN = /\u001B\[[0-9;]*m/gu;
 const FAIL_LINE =
   /^\s*FAIL\s+(?:(?:\[[^\]]*\]|\|[^|]*\|)\s*)?(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+(?:>|\[).*)?\s*$/u;
 const SEPARATOR_LINE = /^\s*\u23AF{3,}/u;
-const HINT_LINE = /^If this is a long-running (?:test|hook)/u;
+const DIVIDER_LINE = /^\s*\u23AF+$/u;
+const SERIALIZED_LINE = /^Serialized Error: \{.*\}$/u;
+const HINT_LINE =
+  /^If this is a long-running (?:test|hook), pass a timeout value as the last argument or configure it globally with "(?:testTimeout|hookTimeout)"\.$/u;
+const FRAME_LINE = /^\s+at\s.+(?::\d+:\d+|\(<anonymous>\))\)?\s*$/u;
+const REPORTER_FRAME = /^ \u276F \S.*:\d+:\d+$/u;
+const EXCERPT_LINE = /^ {4}(?:(?: {2}[1-9]| [1-9]\d|[1-9]\d{2,})\|(?: |$)| {3}\| +\^+$)/u;
 
-function firstLine(text) {
+/** A JSON failure message cut at its first V8 stack frame. Reporter text never goes through this. */
+function withoutStack(text) {
+  const lines = String(text).split("\n");
+  const stack = lines.findIndex((line, index) => index > 0 && FRAME_LINE.test(line));
+  return (stack === -1 ? lines : lines.slice(0, stack)).join("\n");
+}
+
+/** The message lines without blanks and Vitest's timeout hint. */
+function messageLines(text) {
+  return String(text)
+    .split("\n")
+    .filter((line) => line.trim() !== "" && !HINT_LINE.test(line.trim()));
+}
+
+function isStartTimeoutHeader(text) {
+  const lines = messageLines(text);
   return (
-    String(text)
-      .split("\n")
-      .find((line) => line.trim() !== "")
-      ?.trim() ?? ""
+    lines.length === 1 && START_TIMEOUT_PATTERNS.some((pattern) => pattern.test(lines[0].trim()))
   );
 }
 
-function isContainerStartHeader(text) {
-  const header = firstLine(text);
-  return CONTAINER_START_PATTERNS.some((pattern) => pattern.test(header));
+/** Vitest prints one cause for a group of failures, so a shared connection timeout cannot be vouched for. */
+function sharedHeader(line, fileCount) {
+  const hidden = fileCount > 1 && CONNECTION_TIMEOUT.test(line);
+  return hidden
+    ? `${line}\n[shared by ${fileCount} failures, causes are not shown for each]`
+    : line;
 }
 
 function addHeader(headers, files, line) {
   for (const file of files) headers.set(file, [...(headers.get(file) ?? []), line]);
 }
 
+function extendHeader(headers, files, line) {
+  for (const file of files) {
+    const list = headers.get(file);
+    list[list.length - 1] += `\n${line}`;
+  }
+}
+
+function indentedKind(line, mode) {
+  if (REPORTER_FRAME.test(line)) return "frame";
+  if (mode === "message") return "continuation";
+  if (mode === "frames" && !EXCERPT_LINE.test(line)) return "continuation";
+  return "ignored";
+}
+
+function lineKind(line, { files, mode }) {
+  if (FAIL_LINE.test(line)) return "fail";
+  if (DIVIDER_LINE.test(line)) return "ignored";
+  if (SEPARATOR_LINE.test(line)) return "separator";
+  if (files.length === 0 || line === "" || HINT_LINE.test(line)) return "ignored";
+  if (SERIALIZED_LINE.test(line)) return "ignored";
+  return /^\s/u.test(line) ? indentedKind(line, mode) : "header";
+}
+
 /**
  * Error lines the default reporter printed for each failing test file, keyed by file.
  * A failure block starts with one or more FAIL lines. Every unindented line after them, up
- * to the next rule line, is an error header for all of those files.
+ * to the next rule line, is an error header for all of those files. Indented lines after a
+ * header are more of that message. Once a frame line appeared, an indented line that is not
+ * another frame or a code excerpt line is treated as message text too, so text that imitates a
+ * frame cannot hide what follows it. A bare rule line does not end the failure, and a
+ * one-line `Serialized Error: {...}` summary is skipped. Any other line stays in the failure.
  */
 export function logFailureHeaders(logText) {
   const headers = new Map();
-  let files = [];
-  let inErrors = false;
+  const state = { files: [], inErrors: false, mode: "none" };
   for (const raw of logText.replace(ANSI_PATTERN, "").split("\n")) {
     const line = raw.trimEnd();
-    const failed = FAIL_LINE.exec(line);
-    if (failed) {
-      if (inErrors) files = [];
-      files.push(failed[1]);
-      inErrors = false;
-    } else if (SEPARATOR_LINE.test(line)) {
-      files = [];
-      inErrors = false;
-    } else if (files.length > 0 && line !== "" && !/^\s/u.test(line) && !HINT_LINE.test(line)) {
-      addHeader(headers, files, line);
-      inErrors = true;
+    const kind = lineKind(line, state);
+    if (kind === "fail") {
+      if (state.inErrors) state.files = [];
+      state.files.push(FAIL_LINE.exec(line)[1]);
+      Object.assign(state, { inErrors: false, mode: "none" });
+    } else if (kind === "separator") {
+      Object.assign(state, { files: [], inErrors: false, mode: "none" });
+    } else if (kind === "continuation") {
+      extendHeader(headers, state.files, line);
+    } else if (kind === "header") {
+      addHeader(headers, state.files, sharedHeader(line, state.files.length));
+      Object.assign(state, { inErrors: true, mode: "message" });
+    } else if (kind === "frame") {
+      state.mode = "frames";
     }
   }
   return headers;
@@ -190,32 +258,55 @@ export function logFailureHeaders(logText) {
 function reportedFailures(file) {
   const assertions = file.assertionResults ?? [];
   const failed = assertions.filter(({ status }) => status === "failed");
-  const texts = failed.map(({ failureMessages }) => (failureMessages ?? []).join("\n"));
+  const texts = failed.flatMap(({ failureMessages }) => {
+    const entries =
+      Array.isArray(failureMessages) && failureMessages.length > 0 ? failureMessages : [""];
+    return entries.map((entry) => withoutStack(entry ?? ""));
+  });
+  const unexplained = texts.some((text) => text.trim() === "");
   const fileMessage = typeof file.message === "string" ? file.message : "";
-  if (fileMessage.trim() !== "") texts.push(fileMessage);
-  return { texts, unexplained: failed.some((_, index) => texts[index].trim() === "") };
+  return { texts, fileMessage, unexplained };
+}
+
+/** Drops each expected cause line that follows the connection timeout it explains. */
+function withoutExpectedCauses(headers) {
+  return headers.filter(
+    (header, index) =>
+      !(CONNECTION_TIMEOUT_CAUSE.test(header) && CONNECTION_TIMEOUT.test(headers[index - 1] ?? "")),
+  );
+}
+
+function fileMessageHeaders(fileMessage, logHeaders) {
+  if (fileMessage.trim() === "") return [];
+  const typed = BARE_START_TIMEOUTS.get(fileMessage.trim());
+  const corroborated = typed !== undefined && logHeaders.some((header) => typed.test(header));
+  return corroborated ? [] : [fileMessage];
 }
 
 /**
- * True when every failure of the file starts with a container-start timeout header.
+ * True when every failure of the file starts with a container or database start timeout header.
  * Vitest's JSON report omits hook failures, so the log blocks count as evidence too.
  */
-export function containerStartFailure(file, logHeaders = []) {
-  const { texts, unexplained } = reportedFailures(file);
+export function startTimeoutFailure(file, logHeaders = []) {
+  const { texts, fileMessage, unexplained } = reportedFailures(file);
   const pending = (file.assertionResults ?? []).some(({ status }) => status === "pending");
   if (pending || unexplained) return false;
-  const headers = [...texts, ...logHeaders];
-  return headers.length > 0 && headers.every(isContainerStartHeader);
+  const headers = withoutExpectedCauses([
+    ...texts,
+    ...fileMessageHeaders(fileMessage, logHeaders),
+    ...logHeaders,
+  ]);
+  return headers.length > 0 && headers.every(isStartTimeoutHeader);
 }
 
-/** The failed files, when every one of them failed only on a container start. Otherwise empty. */
+/** The failed files, when every one of them failed only on a container or database start timeout. Otherwise empty. */
 export function retryableFiles(report, failedFiles, { root, headers = new Map() }) {
   if (failedFiles.length === 0) return [];
   const failed = new Set(failedFiles);
   const results = report.testResults.filter(({ name }) => failed.has(relative(root, name)));
   const retryable =
     results.length === failed.size &&
-    results.every((file) => containerStartFailure(file, headers.get(relative(root, file.name))));
+    results.every((file) => startTimeoutFailure(file, headers.get(relative(root, file.name))));
   return retryable ? failedFiles : [];
 }
 export function countAssertions(testResults) {
@@ -387,11 +478,7 @@ export function stepSummary({ title, line, report, root, retried }) {
     ...rows,
   ];
   if (retried.length > 0) {
-    lines.push(
-      "",
-      "Retried once after a container-start timeout:",
-      ...retried.map((f) => `- \`${f}\``),
-    );
+    lines.push("", "Retried once after a start timeout:", ...retried.map((f) => `- \`${f}\``));
   }
   return `${lines.join("\n")}\n`;
 }
@@ -496,14 +583,14 @@ function singleRun(first, retried = []) {
   };
 }
 
-/** Runs the files once. Retries the failed ones once each, serially, only after container-start timeouts. */
+/** Runs the files once. Retries the failed ones once each, serially, only after start timeouts. */
 export async function runWithRetry({ label, files, root, execute }) {
   const first = await execute(label, files);
   if (first.exitCode === 0) return singleRun(first);
   const candidates = await retryCandidates(first, root);
   if (candidates.length === 0) return singleRun(first);
   if (candidates.length > RETRY_CAP) {
-    const diagnostic = `${candidates.length} files failed on container-start timeouts, more than ${RETRY_CAP}. Not retried.`;
+    const diagnostic = `${candidates.length} files failed on start timeouts, more than ${RETRY_CAP}. Not retried.`;
     return { ...singleRun(first), tooManyRetries: candidates.length, diagnostic };
   }
   return afterRetries(first, await retryEachFile(candidates, { label, execute }));
@@ -512,11 +599,11 @@ export async function runWithRetry({ label, files, root, execute }) {
 export function retryAnnotations(result) {
   const lines = (result.retryOutcomes ?? []).map(({ file, passed }) =>
     passed
-      ? `::warning title=Retried after a container-start timeout::${escapeData(file)} passed on a serial retry`
-      : `::error title=Failed again after a container-start retry::${escapeData(file)}`,
+      ? `::warning title=Retried after a start timeout::${escapeData(file)} passed on a serial retry`
+      : `::error title=Failed again after a start timeout retry::${escapeData(file)}`,
   );
   if (result.tooManyRetries) {
-    lines.push(`::error title=Too many container-start timeouts::${escapeData(result.diagnostic)}`);
+    lines.push(`::error title=Too many start timeouts::${escapeData(result.diagnostic)}`);
   }
   return lines;
 }
