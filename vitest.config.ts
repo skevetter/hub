@@ -12,6 +12,8 @@ export default defineConfig({
     pool: "forks",
     poolOptions: {
       forks: {
+        // Node 24 V8 frees wasm import wrappers twice under PGlite churn: https://github.com/nodejs/node/issues/66366
+        execArgv: ["--no-wasm-code-gc"],
         singleFork: true,
         minForks: 1,
         maxForks: 1,
