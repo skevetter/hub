@@ -236,7 +236,7 @@ jobs:
         env:
           VERSION: ${{ needs.dispatch-guard.outputs.version }}
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --prerelease=false
+        run: gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
 
   notify:
     name: notify
