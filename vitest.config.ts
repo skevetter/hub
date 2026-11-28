@@ -12,6 +12,8 @@ export default defineConfig({
     pool: "forks",
     poolOptions: {
       forks: {
+        // Suspected Node 24 wasm code GC crash under PGlite churn: https://github.com/nodejs/node/issues/66366
+        execArgv: ["--no-wasm-code-gc"],
         singleFork: true,
         minForks: 1,
         maxForks: 1,
